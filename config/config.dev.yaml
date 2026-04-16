@@ -1,0 +1,51 @@
+server:
+  port: "8080"
+  mode: debug
+
+database:
+  mysql:
+    host: 127.0.0.1
+    port: 13306
+    username: root
+    password: "synapse123"
+    database: synapse
+    max_open_conns: 25
+    max_idle_conns: 10
+    conn_max_lifetime: "1h"
+
+redis:
+  host: 127.0.0.1
+  port: 6379
+  password: ""
+  db: 0
+
+log:
+  level: debug
+  format: text
+  output: stdout
+
+jwt:
+  secret_key: "synapse-dev-secret-change-me"
+  access_token_duration: 2h
+  refresh_token_duration: 168h
+  issuer: synapse
+
+snowflake:
+  datacenter_id: 0
+  worker_id: 0
+
+organization:
+  max_owned_orgs: 5
+  max_joined_orgs: 20
+  invitation_expires_days: 7
+
+agent:
+  hmac_timestamp_skew_seconds: 300
+  hmac_nonce_cache_seconds: 600
+  audit_base_retention_days: 90
+  audit_payload_retention_days: 30
+
+ratelimit:
+  user_global_per_minute: 1000
+  org_global_per_minute: 10000
+  user_agent_per_minute: 30

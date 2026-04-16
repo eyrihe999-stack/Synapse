@@ -1,0 +1,38 @@
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Project binaries
+synapse
+nexus
+sayso-lint
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+
+# Dependencies
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code tmp
+.claude/tmp/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+bin/
+synapse
+sayso-lint
+.env
+.env.*
+!.env.example
+.git/
+.idea/
+.vscode/
+.claude/
+.DS_Store
+*.swp
+*.swo
