@@ -38,8 +38,13 @@ func (r *gormRepository) FindPendingByOrgInvitee(ctx context.Context, orgID, inv
 	return &inv, nil
 }
 
-// ListPendingByInvitee 列出某用户收到的所有 pending 邀请,分页。
+// ListPendingByInvitee 列出某用户收到的 pending 邀请,分页。
 func (r *gormRepository) ListPendingByInvitee(ctx context.Context, inviteeUserID uint64, page, size int) ([]*model.OrgInvitation, int64, error) {
+	return r.ListByInvitee(ctx, inviteeUserID, model.InvitationStatusPending, page, size)
+}
+
+// ListByInvitee 列出某用户收到的邀请,按状态过滤(空字符串=全部),分页。
+func (r *gormRepository) ListByInvitee(ctx context.Context, inviteeUserID uint64, status string, page, size int) ([]*model.OrgInvitation, int64, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -50,7 +55,10 @@ func (r *gormRepository) ListPendingByInvitee(ctx context.Context, inviteeUserID
 
 	q := r.db.WithContext(ctx).
 		Model(&model.OrgInvitation{}).
-		Where("invitee_user_id = ? AND status = ?", inviteeUserID, model.InvitationStatusPending)
+		Where("invitee_user_id = ?", inviteeUserID)
+	if status != "" {
+		q = q.Where("status = ?", status)
+	}
 
 	var total int64
 	if err := q.Count(&total).Error; err != nil {
@@ -69,8 +77,13 @@ func (r *gormRepository) ListPendingByInvitee(ctx context.Context, inviteeUserID
 	return list, total, nil
 }
 
-// ListPendingByOrg 列出某 org 的所有 pending 邀请,分页。
+// ListPendingByOrg 列出某 org 的 pending 邀请,分页。
 func (r *gormRepository) ListPendingByOrg(ctx context.Context, orgID uint64, page, size int) ([]*model.OrgInvitation, int64, error) {
+	return r.ListByOrg(ctx, orgID, model.InvitationStatusPending, page, size)
+}
+
+// ListByOrg 列出某 org 的邀请,按状态过滤(空字符串=全部),分页。
+func (r *gormRepository) ListByOrg(ctx context.Context, orgID uint64, status string, page, size int) ([]*model.OrgInvitation, int64, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -81,7 +94,10 @@ func (r *gormRepository) ListPendingByOrg(ctx context.Context, orgID uint64, pag
 
 	q := r.db.WithContext(ctx).
 		Model(&model.OrgInvitation{}).
-		Where("org_id = ? AND status = ?", orgID, model.InvitationStatusPending)
+		Where("org_id = ?", orgID)
+	if status != "" {
+		q = q.Where("status = ?", status)
+	}
 
 	var total int64
 	if err := q.Count(&total).Error; err != nil {

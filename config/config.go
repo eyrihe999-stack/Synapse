@@ -20,7 +20,6 @@ type Config struct {
 	Snowflake    SnowflakeConfig    `yaml:"snowflake"`
 	Organization OrganizationConfig `yaml:"organization"`
 	Agent        AgentConfig        `yaml:"agent"`
-	Ratelimit    RatelimitConfig    `yaml:"ratelimit"`
 }
 
 type ServerConfig struct {
@@ -70,6 +69,7 @@ type JWTConfig struct {
 	AccessTokenDuration  time.Duration `yaml:"access_token_duration"`
 	RefreshTokenDuration time.Duration `yaml:"refresh_token_duration"`
 	Issuer               string        `yaml:"issuer"`
+	MaxSessionsPerUser   int           `yaml:"max_sessions_per_user"`
 }
 
 type SnowflakeConfig struct {
@@ -89,20 +89,9 @@ type OrganizationConfig struct {
 // 0 值表示走 agent/service.DefaultConfig 的默认值。
 // AES-GCM master key 从环境变量 SYNAPSE_AGENT_SECRET_KEY 读取,不放 yaml。
 type AgentConfig struct {
-	HealthCheckIntervalSeconds int `yaml:"health_check_interval_seconds"`
-	HealthFailThreshold        int `yaml:"health_fail_threshold"`
-	HealthCheckConcurrency     int `yaml:"health_check_concurrency"`
-	HMACTimestampSkewSeconds   int `yaml:"hmac_timestamp_skew_seconds"`
-	HMACNonceCacheSeconds      int `yaml:"hmac_nonce_cache_seconds"`
-	AuditBaseRetentionDays     int `yaml:"audit_base_retention_days"`
-	AuditPayloadRetentionDays  int `yaml:"audit_payload_retention_days"`
-}
-
-// RatelimitConfig agent 调用限流配置。
-type RatelimitConfig struct {
-	UserGlobalPerMinute int `yaml:"user_global_per_minute"`
-	OrgGlobalPerMinute  int `yaml:"org_global_per_minute"`
-	UserAgentPerMinute  int `yaml:"user_agent_per_minute"`
+	DefaultMaxContextRounds int `yaml:"default_max_context_rounds"`
+	ChatRateLimitPerMinute  int `yaml:"chat_rate_limit_per_minute"`
+	MaxTimeoutSeconds       int `yaml:"max_timeout_seconds"`
 }
 
 // Load loads configuration from YAML file and environment variables
@@ -203,6 +192,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.JWT.RefreshTokenDuration == 0 {
 		cfg.JWT.RefreshTokenDuration = 168 * time.Hour
+	}
+	if cfg.JWT.MaxSessionsPerUser == 0 {
+		cfg.JWT.MaxSessionsPerUser = 5
 	}
 }
 

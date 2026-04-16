@@ -74,6 +74,8 @@ type Repository interface {
 	FindMemberWithRole(ctx context.Context, orgID, userID uint64) (*MemberWithRole, error)
 	// ListMembersByOrg 分页列出 org 的所有成员(JOIN roles)。
 	ListMembersByOrg(ctx context.Context, orgID uint64, page, size int) ([]*MemberWithRole, int64, error)
+	// CountMembersByOrg 统计某 org 的成员数。
+	CountMembersByOrg(ctx context.Context, orgID uint64) (int64, error)
 	// CountMembersByUser 统计某用户加入的 org 数。
 	CountMembersByUser(ctx context.Context, userID uint64) (int64, error)
 	// UpdateMemberRole 变更成员角色。
@@ -93,8 +95,12 @@ type Repository interface {
 	FindPendingByOrgInvitee(ctx context.Context, orgID, inviteeUserID uint64) (*model.OrgInvitation, error)
 	// ListPendingByInvitee 列出某用户收到的 pending 邀请。
 	ListPendingByInvitee(ctx context.Context, inviteeUserID uint64, page, size int) ([]*model.OrgInvitation, int64, error)
+	// ListByInvitee 列出某用户收到的邀请,按状态过滤(空字符串=全部)。
+	ListByInvitee(ctx context.Context, inviteeUserID uint64, status string, page, size int) ([]*model.OrgInvitation, int64, error)
 	// ListPendingByOrg 列出某 org 的 pending 邀请。
 	ListPendingByOrg(ctx context.Context, orgID uint64, page, size int) ([]*model.OrgInvitation, int64, error)
+	// ListByOrg 列出某 org 的邀请,按状态过滤(空字符串=全部)。
+	ListByOrg(ctx context.Context, orgID uint64, status string, page, size int) ([]*model.OrgInvitation, int64, error)
 	// UpdateInvitationStatus 更新邀请状态并记录 responded_at。
 	UpdateInvitationStatus(ctx context.Context, id uint64, status string) error
 	// ExpirePendingInvitations 将所有 expires_at < now 的 pending 邀请标记为 expired,返回受影响行数。
@@ -111,9 +117,9 @@ type Repository interface {
 
 	// FindUserProfileByID 按 user_id 查找,不存在返回 nil。
 	FindUserProfileByID(ctx context.Context, userID uint64) (*UserProfile, error)
-	// FindUserProfileByEmail 按邮箱精确查找。
-	FindUserProfileByEmail(ctx context.Context, email string) (*UserProfile, error)
-	// SearchUserProfilesByDisplayName 按昵称精确查找(昵称不唯一,返回候选列表)。
+	// FindUserProfilesByEmail 按邮箱模糊查找,返回候选列表。
+	FindUserProfilesByEmail(ctx context.Context, email string, limit int) ([]*UserProfile, error)
+	// SearchUserProfilesByDisplayName 按昵称模糊查找(返回候选列表)。
 	SearchUserProfilesByDisplayName(ctx context.Context, name string, limit int) ([]*UserProfile, error)
 }
 

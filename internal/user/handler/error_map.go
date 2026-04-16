@@ -35,7 +35,18 @@ func (h *Handler) handleServiceError(c *gin.Context, err error) {
 		h.log.WarnCtx(ctx, "refresh token 无效", nil)
 		c.JSON(http.StatusOK, response.BaseResponse{Code: user.CodeInvalidRefreshToken, Message: "Invalid refresh token"})
 
+	case errors.Is(err, user.ErrSessionLimitReached):
+		h.log.WarnCtx(ctx, "设备数量已达上限", nil)
+		c.JSON(http.StatusOK, response.BaseResponse{Code: user.CodeSessionLimitReached, Message: "Session limit reached, please logout from another device first"})
+
+	case errors.Is(err, user.ErrSessionRevoked):
+		h.log.WarnCtx(ctx, "session 已被吊销", nil)
+		c.JSON(http.StatusOK, response.BaseResponse{Code: user.CodeSessionRevoked, Message: "Session revoked"})
+
 	// ─── 404 段 ─────
+	case errors.Is(err, user.ErrSessionNotFound):
+		h.log.WarnCtx(ctx, "session 不存在", nil)
+		c.JSON(http.StatusOK, response.BaseResponse{Code: user.CodeSessionNotFound, Message: "Session not found"})
 	case errors.Is(err, user.ErrUserNotFound):
 		h.log.WarnCtx(ctx, "用户不存在", nil)
 		c.JSON(http.StatusOK, response.BaseResponse{Code: user.CodeUserNotFound, Message: "User not found"})

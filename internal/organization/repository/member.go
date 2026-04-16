@@ -107,6 +107,18 @@ func (r *gormRepository) ListMembersByOrg(ctx context.Context, orgID uint64, pag
 	return out, total, nil
 }
 
+// CountMembersByOrg 统计某 org 的成员数。
+func (r *gormRepository) CountMembersByOrg(ctx context.Context, orgID uint64) (int64, error) {
+	var count int64
+	if err := r.db.WithContext(ctx).
+		Model(&model.OrgMember{}).
+		Where("org_id = ?", orgID).
+		Count(&count).Error; err != nil {
+		return 0, fmt.Errorf("count members by org: %w", err)
+	}
+	return count, nil
+}
+
 // CountMembersByUser 统计某用户加入的 active org 数量。
 // 通过 JOIN orgs 过滤掉 dissolved org。
 func (r *gormRepository) CountMembersByUser(ctx context.Context, userID uint64) (int64, error) {

@@ -85,7 +85,8 @@ func (h *OrgHandler) ListOrgInvitations(c *gin.Context) {
 		return
 	}
 	page, size := parsePagination(c)
-	resp, err := h.inviteSvc.ListByOrg(c.Request.Context(), org.ID, page, size)
+	status := c.Query("status") // 可选: pending/accepted/rejected/expired/revoked, 空=全部
+	resp, err := h.inviteSvc.ListByOrg(c.Request.Context(), org.ID, status, page, size)
 	if err != nil {
 		h.handleServiceError(c, err)
 		return
@@ -139,7 +140,8 @@ func (h *OrgHandler) ListMyInvitations(c *gin.Context) {
 		return
 	}
 	page, size := parsePagination(c)
-	resp, err := h.inviteSvc.ListMine(c.Request.Context(), userID, page, size)
+	status := c.Query("status") // 可选: pending/accepted/rejected/expired/revoked, 空=全部
+	resp, err := h.inviteSvc.ListMine(c.Request.Context(), userID, status, page, size)
 	if err != nil {
 		h.handleServiceError(c, err)
 		return

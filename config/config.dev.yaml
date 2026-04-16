@@ -29,6 +29,7 @@ jwt:
   access_token_duration: 2h
   refresh_token_duration: 168h
   issuer: synapse
+  max_sessions_per_user: 5
 
 snowflake:
   datacenter_id: 0
@@ -40,12 +41,6 @@ organization:
   invitation_expires_days: 7
 
 agent:
-  hmac_timestamp_skew_seconds: 300
-  hmac_nonce_cache_seconds: 600
-  audit_base_retention_days: 90
-  audit_payload_retention_days: 30
-
-ratelimit:
-  user_global_per_minute: 1000
-  org_global_per_minute: 10000
-  user_agent_per_minute: 30
+  default_max_context_rounds: 20
+  chat_rate_limit_per_minute: 60
+  max_timeout_seconds: 300

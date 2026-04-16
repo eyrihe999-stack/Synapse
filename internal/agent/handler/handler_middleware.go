@@ -1,12 +1,4 @@
-// middleware.go agent 模块的 gin 中间件。
-//
-// 由于 agent 模块的 org context 逻辑与 organization 模块相同,但我们不能直接
-// import organization/handler 的同名中间件(那是另一个模块的内部实现),这里
-// 写一个等价实现,通过 OrgPort 完成 org 解析和成员校验。
-//
-// 注入点:
-//   - ctxKeyOrg:*service.OrgInfo
-//   - ctxKeyMembership:*service.OrgMembership
+// handler_middleware.go agent 模块的 gin 中间件。
 package handler
 
 import (
@@ -27,7 +19,8 @@ const (
 	ctxKeyMembership = "agent_membership"
 )
 
-// OrgContextMiddleware 从 URL :slug 或 X-Org-ID header 解析 org,校验成员身份。
+// OrgContextMiddleware 从 URL :slug 或 X-Org-ID header 解析 org,校验成员身份,
+// 并将 OrgInfo 和 Membership 注入 gin context。
 func OrgContextMiddleware(orgPort service.OrgPort, log logger.LoggerInterface) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID, ok := middleware.GetUserID(c)
@@ -48,7 +41,7 @@ func OrgContextMiddleware(orgPort service.OrgPort, log logger.LoggerInterface) g
 				log.WarnCtx(c.Request.Context(), "missing org context", map[string]any{"user_id": userID})
 				c.JSON(http.StatusOK, response.BaseResponse{Code: agent.CodeAgentInvalidRequest, Message: "X-Org-ID header or org slug required"})
 				//sayso-lint:ignore gin-no-return
-				c.Abort() // return 紧跟下一行
+				c.Abort()
 				return
 			}
 			if id, parseErr := strconv.ParseUint(headerVal, 10, 64); parseErr == nil {
@@ -58,14 +51,14 @@ func OrgContextMiddleware(orgPort service.OrgPort, log logger.LoggerInterface) g
 			}
 		}
 		if err != nil {
-			log.WarnCtx(c.Request.Context(), "org 解析失败", map[string]any{"user_id": userID, "error": err.Error()})
+			log.WarnCtx(c.Request.Context(), "org resolve failed", map[string]any{"user_id": userID, "error": err.Error()})
 			c.JSON(http.StatusOK, response.BaseResponse{Code: agent.CodeAgentInvalidRequest, Message: "Org not found"})
 			c.Abort()
 			return
 		}
 		membership, err := orgPort.GetMembership(c.Request.Context(), org.ID, userID)
 		if err != nil {
-			log.WarnCtx(c.Request.Context(), "成员身份校验失败", map[string]any{"org_id": org.ID, "user_id": userID, "error": err.Error()})
+			log.WarnCtx(c.Request.Context(), "membership check failed", map[string]any{"org_id": org.ID, "user_id": userID, "error": err.Error()})
 			c.JSON(http.StatusOK, response.BaseResponse{Code: agent.CodeAgentPermissionDenied, Message: "Not a member of this organization"})
 			c.Abort()
 			return
@@ -76,18 +69,18 @@ func OrgContextMiddleware(orgPort service.OrgPort, log logger.LoggerInterface) g
 	}
 }
 
-// PermissionMiddleware 校验 membership 持有指定权限点。必须在 OrgContextMiddleware 之后。
+// PermissionMiddleware 校验 membership 持有指定权限点,不满足则返回权限拒绝响应。
 func PermissionMiddleware(permission string, log logger.LoggerInterface) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		m, ok := GetMembership(c)
 		if !ok {
-			log.ErrorCtx(c.Request.Context(), "permission middleware 缺少 membership", errors.New("missing membership"), nil)
+			log.ErrorCtx(c.Request.Context(), "permission middleware missing membership", errors.New("missing membership"), nil)
 			response.InternalServerError(c, "Internal server error", "")
 			c.Abort()
 			return
 		}
 		if !m.Has(permission) {
-			log.WarnCtx(c.Request.Context(), "权限不足", map[string]any{
+			log.WarnCtx(c.Request.Context(), "permission denied", map[string]any{
 				"user_id":    m.UserID,
 				"org_id":     m.OrgID,
 				"permission": permission,
@@ -100,7 +93,8 @@ func PermissionMiddleware(permission string, log logger.LoggerInterface) gin.Han
 	}
 }
 
-// GetOrg 从 gin context 取出已注入的 OrgInfo。
+// GetOrg 从 gin context 取出已注入的 OrgInfo,未找到时返回 false。
+//
 //sayso-lint:ignore handler-no-response
 func GetOrg(c *gin.Context) (*service.OrgInfo, bool) {
 	v, ok := c.Get(ctxKeyOrg)
@@ -111,7 +105,8 @@ func GetOrg(c *gin.Context) (*service.OrgInfo, bool) {
 	return m, ok
 }
 
-// GetMembership 从 gin context 取出已注入的 Membership。
+// GetMembership 从 gin context 取出已注入的 Membership,未找到时返回 false。
+//
 //sayso-lint:ignore handler-no-response
 func GetMembership(c *gin.Context) (*service.OrgMembership, bool) {
 	v, ok := c.Get(ctxKeyMembership)

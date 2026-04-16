@@ -1,9 +1,4 @@
 // service.go agent 模块 service 层共享类型、配置与转换工具。
-//
-// 包含:
-//   - Config:service 层需要的配置项
-//   - OrgPort:agent → organization 的跨模块接口(依赖倒置)
-//   - model → dto 的转换工具
 package service
 
 import (
@@ -16,56 +11,25 @@ import (
 	"gorm.io/datatypes"
 )
 
-// Config agent 模块 service 层配置(从 yaml 装填)。
+// Config agent 模块 service 层配置，包含默认上下文轮数、聊天限流和超时上限。
 type Config struct {
-	// HealthCheckIntervalSeconds 健康检查间隔
-	HealthCheckIntervalSeconds int
-	// HealthFailThreshold 连续失败阈值
-	HealthFailThreshold int
-	// HealthCheckConcurrency 健康检查并发
-	HealthCheckConcurrency int
-	// HMACTimestampSkewSeconds 签名时间戳允许偏差
-	HMACTimestampSkewSeconds int
-	// HMACNonceCacheSeconds nonce 缓存时长
-	HMACNonceCacheSeconds int
-	// AuditBaseRetentionDays 基础审计保留
-	AuditBaseRetentionDays int
-	// AuditPayloadRetentionDays payload 保留
-	AuditPayloadRetentionDays int
-	// UserGlobalRatePerMinute 用户全局限流
-	UserGlobalRatePerMinute int
-	// OrgGlobalRatePerMinute org 全局限流
-	OrgGlobalRatePerMinute int
-	// UserAgentRatePerMinute 用户+agent 组合限流
-	UserAgentRatePerMinute int
+	DefaultMaxContextRounds int
+	ChatRateLimitPerMinute  int
+	MaxTimeoutSeconds       int
 }
 
-// DefaultConfig 返回默认配置,供测试或主流程缺省使用。
+// DefaultConfig 返回默认配置。
 func DefaultConfig() Config {
 	return Config{
-		HealthCheckIntervalSeconds: agent.DefaultHealthCheckIntervalSeconds,
-		HealthFailThreshold:        agent.DefaultHealthFailThreshold,
-		HealthCheckConcurrency:     agent.DefaultHealthCheckConcurrency,
-		HMACTimestampSkewSeconds:   agent.DefaultHMACTimestampSkewSeconds,
-		HMACNonceCacheSeconds:      agent.DefaultHMACNonceCacheSeconds,
-		AuditBaseRetentionDays:     agent.DefaultAuditBaseRetentionDays,
-		AuditPayloadRetentionDays:  agent.DefaultAuditPayloadRetentionDays,
-		UserGlobalRatePerMinute:    agent.DefaultUserGlobalRatePerMinute,
-		OrgGlobalRatePerMinute:     agent.DefaultOrgGlobalRatePerMinute,
-		UserAgentRatePerMinute:     agent.DefaultUserAgentRatePerMinute,
+		DefaultMaxContextRounds: agent.DefaultMaxContextRounds,
+		ChatRateLimitPerMinute:  agent.DefaultChatRateLimitPerMinute,
+		MaxTimeoutSeconds:       agent.MaxTimeoutSeconds,
 	}
 }
 
-// ─── OrgPort:agent → organization 的跨模块接口 ───────────────────────────────
-//
-// agent 模块的 service 不能直接 import organization/service,而是通过本地接口
-// 定义所需能力,由 main.go 注入实现(adapter 模式)。
-// 这样可以:
-//   - 让 agent 独立编译和单元测试(mock 此接口)
-//   - 保持依赖方向单向(agent → organization)
-//   - 让 organization 不需要暴露 service 包给 agent
+// ─── OrgPort:agent → organization 的跨模块接口 ──────────────────────────────
 
-// OrgMembership 是 agent 模块需要的成员快照(子集,比 organization.Membership 简化)。
+// OrgMembership 是 agent 模块需要的成员快照，包含角色和权限点集合。
 type OrgMembership struct {
 	OrgID       uint64
 	UserID      uint64
@@ -82,7 +46,7 @@ func (m *OrgMembership) Has(perm string) bool {
 	return ok
 }
 
-// OrgInfo 是 agent 模块需要的 org 关键字段快照。
+// OrgInfo 是 agent 模块需要的 org 关键字段快照，包含审核与日志配置。
 type OrgInfo struct {
 	ID                 uint64
 	Slug               string
@@ -92,66 +56,45 @@ type OrgInfo struct {
 	RecordFullPayload  bool
 }
 
-// OrgPort agent 模块访问 organization 模块的端口。
-//
-// 在 main.go 里由 adapter 实现,包装 organization 的 OrgService + RoleService。
+// UserProfile agent 模块需要的用户公开信息快照。
+type UserProfile struct {
+	ID          uint64
+	DisplayName string
+}
+
+// OrgPort agent 模块访问 organization 模块的端口，用于获取 org 信息、成员关系和用户公开信息。
 type OrgPort interface {
-	// GetOrgBySlug 按 slug 查 org(active 才返回)。
 	GetOrgBySlug(ctx context.Context, slug string) (*OrgInfo, error)
-	// GetOrgByID 按 ID 查 org。
 	GetOrgByID(ctx context.Context, orgID uint64) (*OrgInfo, error)
-	// GetMembership 返回用户在 org 内的成员/权限快照,非成员返回非 nil error。
 	GetMembership(ctx context.Context, orgID, userID uint64) (*OrgMembership, error)
+	GetUserDisplayName(ctx context.Context, userID uint64) string
 }
 
 // ─── model → dto 转换 ───────────────────────────────────────────────────────
 
-// agentToDTO 把 model.Agent 转为 dto.AgentResponse。
+// agentToDTO 将 model.Agent 转换为 dto.AgentResponse。
 func agentToDTO(a *model.Agent) dto.AgentResponse {
-	resp := dto.AgentResponse{
-		ID:                 a.ID,
-		OwnerUserID:        a.OwnerUserID,
-		Slug:               a.Slug,
-		DisplayName:        a.DisplayName,
-		Description:        a.Description,
-		Protocol:           a.Protocol,
-		EndpointURL:        a.EndpointURL,
-		IconURL:            a.IconURL,
-		Tags:               unmarshalTags(a.Tags),
-		HomepageURL:        a.HomepageURL,
-		PriceTag:           a.PriceTag,
-		Developer:          a.DeveloperContact,
-		Version:            a.Version,
-		TimeoutSeconds:     a.TimeoutSeconds,
-		RateLimitPerMinute: a.RateLimitPerMinute,
-		MaxConcurrent:      a.MaxConcurrent,
-		Status:             a.Status,
-		HealthStatus:       a.HealthStatus,
-		CreatedAt:          a.CreatedAt.Unix(),
-		UpdatedAt:          a.UpdatedAt.Unix(),
-	}
-	if a.HealthCheckedAt != nil {
-		resp.HealthCheckedAt = a.HealthCheckedAt.Unix()
-	}
-	return resp
-}
-
-// methodToDTO 把 model.AgentMethod 转为 dto.MethodResponse。
-func methodToDTO(m *model.AgentMethod) dto.MethodResponse {
-	return dto.MethodResponse{
-		ID:          m.ID,
-		AgentID:     m.AgentID,
-		MethodName:  m.MethodName,
-		DisplayName: m.DisplayName,
-		Description: m.Description,
-		Transport:   m.Transport,
-		Visibility:  m.Visibility,
-		CreatedAt:   m.CreatedAt.Unix(),
-		UpdatedAt:   m.UpdatedAt.Unix(),
+	return dto.AgentResponse{
+		ID:               a.ID,
+		OwnerUserID:      a.OwnerUserID,
+		Slug:             a.Slug,
+		DisplayName:      a.DisplayName,
+		Description:      a.Description,
+		AgentType:        a.AgentType,
+		EndpointURL:      a.EndpointURL,
+		ContextMode:      a.ContextMode,
+		MaxContextRounds: a.MaxContextRounds,
+		HasAuthToken:     len(a.AuthTokenEncrypted) > 0,
+		TimeoutSeconds:   a.TimeoutSeconds,
+		IconURL:          a.IconURL,
+		Tags:             unmarshalTags(a.Tags),
+		Status:           a.Status,
+		CreatedAt:        a.CreatedAt.Unix(),
+		UpdatedAt:        a.UpdatedAt.Unix(),
 	}
 }
 
-// publishToDTO 把 model.AgentPublish 转为 dto.PublishResponse。
+// publishToDTO 将 model.AgentPublish 转换为 dto.PublishResponse。
 func publishToDTO(p *model.AgentPublish) dto.PublishResponse {
 	resp := dto.PublishResponse{
 		ID:                p.ID,
@@ -173,43 +116,42 @@ func publishToDTO(p *model.AgentPublish) dto.PublishResponse {
 	if p.RevokedAt != nil {
 		resp.RevokedAt = p.RevokedAt.Unix()
 	}
-	return resp
-}
-
-// invocationToDTO 把 model.AgentInvocation 转为 dto.InvocationResponse。
-func invocationToDTO(inv *model.AgentInvocation) dto.InvocationResponse {
-	resp := dto.InvocationResponse{
-		InvocationID:     inv.InvocationID,
-		TraceID:          inv.TraceID,
-		OrgID:            inv.OrgID,
-		CallerUserID:     inv.CallerUserID,
-		CallerRoleName:   inv.CallerRoleName,
-		AgentID:          inv.AgentID,
-		AgentOwnerUserID: inv.AgentOwnerUserID,
-		MethodName:       inv.MethodName,
-		Transport:        inv.Transport,
-		StartedAt:        inv.StartedAt.UnixMilli(),
-		Status:           inv.Status,
-		ErrorCode:        inv.ErrorCode,
-		ErrorMessage:     inv.ErrorMessage,
-		ClientIP:         inv.ClientIP,
-	}
-	if inv.FinishedAt != nil {
-		resp.FinishedAt = inv.FinishedAt.UnixMilli()
-	}
-	if inv.LatencyMs != nil {
-		resp.LatencyMs = *inv.LatencyMs
-	}
-	if inv.RequestSizeBytes != nil {
-		resp.RequestSizeBytes = *inv.RequestSizeBytes
-	}
-	if inv.ResponseSizeBytes != nil {
-		resp.ResponseSizeBytes = *inv.ResponseSizeBytes
+	if p.Agent != nil {
+		resp.AgentSlug = p.Agent.Slug
+		resp.AgentDisplayName = p.Agent.DisplayName
+		resp.AgentOwnerUID = p.Agent.OwnerUserID
+		resp.AgentType = p.Agent.AgentType
+		resp.AgentDescription = p.Agent.Description
+		resp.AgentIconURL = p.Agent.IconURL
+		resp.AgentContextMode = p.Agent.ContextMode
+		resp.AgentTags = unmarshalTags(p.Agent.Tags)
 	}
 	return resp
 }
 
-// marshalTags 把 []string tags 序列化为 JSON。
+// sessionToDTO 将 model.AgentSession 转换为 dto.SessionResponse。
+func sessionToDTO(s *model.AgentSession) dto.SessionResponse {
+	return dto.SessionResponse{
+		SessionID:   s.SessionID,
+		AgentID:     s.AgentID,
+		Title:       s.Title,
+		ContextMode: s.ContextMode,
+		CreatedAt:   s.CreatedAt.Unix(),
+		UpdatedAt:   s.UpdatedAt.Unix(),
+	}
+}
+
+// messageToDTO 将 model.AgentMessage 转换为 dto.MessageResponse。
+func messageToDTO(m *model.AgentMessage) dto.MessageResponse {
+	return dto.MessageResponse{
+		ID:        m.ID,
+		Role:      m.Role,
+		Content:   m.Content,
+		CreatedAt: m.CreatedAt.Unix(),
+	}
+}
+
+// marshalTags 将字符串切片序列化为 JSON 存储格式；空切片返回 "[]"。
 func marshalTags(tags []string) datatypes.JSON {
 	if len(tags) == 0 {
 		return datatypes.JSON([]byte("[]"))
@@ -221,7 +163,7 @@ func marshalTags(tags []string) datatypes.JSON {
 	return datatypes.JSON(b)
 }
 
-// unmarshalTags 把 JSON tags 字段反序列化为 []string。
+// unmarshalTags 将 JSON 存储格式反序列化为字符串切片；数据为空或解析失败返回 nil。
 func unmarshalTags(data datatypes.JSON) []string {
 	if len(data) == 0 {
 		return nil

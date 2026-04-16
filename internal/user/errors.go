@@ -27,6 +27,10 @@ const (
 	CodeInvalidCredentials = 401010010
 	// CodeInvalidRefreshToken refresh token 无效或已过期
 	CodeInvalidRefreshToken = 401010011
+	// CodeSessionLimitReached 设备数量已达上限
+	CodeSessionLimitReached = 403010010
+	// CodeSessionRevoked session 已被吊销(设备被踢下线)
+	CodeSessionRevoked = 401010012
 )
 
 // ─── 404 段:资源不存在 ──────────────────────────────────────────────────────
@@ -34,6 +38,8 @@ const (
 const (
 	// CodeUserNotFound 用户不存在
 	CodeUserNotFound = 404010010
+	// CodeSessionNotFound session 不存在
+	CodeSessionNotFound = 404010011
 )
 
 // ─── 409 段:冲突 ─────────────────────────────────────────────────────────────
@@ -65,6 +71,12 @@ var (
 	ErrUserNotFound = errors.New("user: not found")
 	// ErrEmailAlreadyRegistered 邮箱已注册
 	ErrEmailAlreadyRegistered = errors.New("user: email already registered")
+	// ErrSessionLimitReached 设备数量已达上限
+	ErrSessionLimitReached = errors.New("user: session limit reached")
+	// ErrSessionRevoked session 已被吊销
+	ErrSessionRevoked = errors.New("user: session revoked")
+	// ErrSessionNotFound session 不存在
+	ErrSessionNotFound = errors.New("user: session not found")
 	// ErrUserInternal 内部错误
 	ErrUserInternal = errors.New("user: internal error")
 )

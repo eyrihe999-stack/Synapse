@@ -56,7 +56,7 @@ IMAGE_TAG="${TIMESTAMP}-${GIT_SHA}"
 
 ```bash
 docker network create synapse-net 2>/dev/null || true
-docker network connect synapse-net nexus-mysql 2>/dev/null || true
+docker network connect synapse-net synapse-mysql 2>/dev/null || true
 docker network connect synapse-net redis 2>/dev/null || true
 ```
 

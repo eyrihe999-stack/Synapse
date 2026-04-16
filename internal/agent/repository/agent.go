@@ -8,7 +8,7 @@ import (
 	"github.com/eyrihe999-stack/Synapse/internal/agent/model"
 )
 
-// CreateAgent 创建一条 agent 记录。
+// CreateAgent 将新的 agent 记录写入数据库。
 func (r *gormRepository) CreateAgent(ctx context.Context, agent *model.Agent) error {
 	if err := r.db.WithContext(ctx).Create(agent).Error; err != nil {
 		return fmt.Errorf("create agent: %w", err)
@@ -16,7 +16,7 @@ func (r *gormRepository) CreateAgent(ctx context.Context, agent *model.Agent) er
 	return nil
 }
 
-// FindAgentByID 按主键查 agent。
+// FindAgentByID 根据主键 ID 查找 agent。
 func (r *gormRepository) FindAgentByID(ctx context.Context, id uint64) (*model.Agent, error) {
 	var a model.Agent
 	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&a).Error; err != nil {
@@ -25,7 +25,7 @@ func (r *gormRepository) FindAgentByID(ctx context.Context, id uint64) (*model.A
 	return &a, nil
 }
 
-// FindAgentByOwnerSlug 按 (owner_user_id, slug) 查 agent。
+// FindAgentByOwnerSlug 根据作者 ID 和 slug 查找 agent。
 func (r *gormRepository) FindAgentByOwnerSlug(ctx context.Context, ownerUserID uint64, slug string) (*model.Agent, error) {
 	var a model.Agent
 	if err := r.db.WithContext(ctx).
@@ -36,7 +36,7 @@ func (r *gormRepository) FindAgentByOwnerSlug(ctx context.Context, ownerUserID u
 	return &a, nil
 }
 
-// ListAgentsByOwner 列出作者的所有 agent。
+// ListAgentsByOwner 列出指定用户拥有的所有 agent,按创建时间降序排列。
 func (r *gormRepository) ListAgentsByOwner(ctx context.Context, ownerUserID uint64) ([]*model.Agent, error) {
 	var out []*model.Agent
 	if err := r.db.WithContext(ctx).
@@ -48,21 +48,7 @@ func (r *gormRepository) ListAgentsByOwner(ctx context.Context, ownerUserID uint
 	return out, nil
 }
 
-// ListAgentsByIDs 批量按 ID 查 agent。
-func (r *gormRepository) ListAgentsByIDs(ctx context.Context, ids []uint64) ([]*model.Agent, error) {
-	if len(ids) == 0 {
-		return []*model.Agent{}, nil
-	}
-	var out []*model.Agent
-	if err := r.db.WithContext(ctx).
-		Where("id IN ?", ids).
-		Find(&out).Error; err != nil {
-		return nil, fmt.Errorf("list agents by ids: %w", err)
-	}
-	return out, nil
-}
-
-// UpdateAgentFields 部分更新 agent。
+// UpdateAgentFields 按字段名批量更新 agent 记录。
 func (r *gormRepository) UpdateAgentFields(ctx context.Context, id uint64, updates map[string]any) error {
 	if len(updates) == 0 {
 		return nil
@@ -76,7 +62,7 @@ func (r *gormRepository) UpdateAgentFields(ctx context.Context, id uint64, updat
 	return nil
 }
 
-// DeleteAgent 删除 agent 记录(不级联,调用方在事务里显式处理 method/secret/publish)。
+// DeleteAgent 根据 ID 删除 agent 记录。
 func (r *gormRepository) DeleteAgent(ctx context.Context, id uint64) error {
 	if err := r.db.WithContext(ctx).
 		Where("id = ?", id).
@@ -86,16 +72,68 @@ func (r *gormRepository) DeleteAgent(ctx context.Context, id uint64) error {
 	return nil
 }
 
-// ListActiveAgentsForHealthCheck 取 status=active 的 agent 列表供健康检查使用。
-// limit=0 表示不限制。
-func (r *gormRepository) ListActiveAgentsForHealthCheck(ctx context.Context, limit int) ([]*model.Agent, error) {
-	q := r.db.WithContext(ctx).Where("status = ?", model.AgentStatusActive)
-	if limit > 0 {
-		q = q.Limit(limit)
+// DeletePublishesByAgent 删除指定 agent 的所有发布记录。
+func (r *gormRepository) DeletePublishesByAgent(ctx context.Context, agentID uint64) error {
+	if err := r.db.WithContext(ctx).
+		Where("agent_id = ?", agentID).
+		Delete(&model.AgentPublish{}).Error; err != nil {
+		return fmt.Errorf("delete publishes by agent: %w", err)
 	}
-	var out []*model.Agent
-	if err := q.Find(&out).Error; err != nil {
-		return nil, fmt.Errorf("list active agents: %w", err)
+	return nil
+}
+
+// DeleteSessionsByAgent 删除指定 agent 的所有 session 记录。
+func (r *gormRepository) DeleteSessionsByAgent(ctx context.Context, agentID uint64) error {
+	if err := r.db.WithContext(ctx).
+		Where("agent_id = ?", agentID).
+		Delete(&model.AgentSession{}).Error; err != nil {
+		return fmt.Errorf("delete sessions by agent: %w", err)
 	}
-	return out, nil
+	return nil
+}
+
+// DeleteMessagesByAgent 删除指定 agent 所有 session 下的消息。
+func (r *gormRepository) DeleteMessagesByAgent(ctx context.Context, agentID uint64) error {
+	if err := r.db.WithContext(ctx).
+		Where("session_id IN (?)",
+			r.db.Model(&model.AgentSession{}).Select("session_id").Where("agent_id = ?", agentID),
+		).
+		Delete(&model.AgentMessage{}).Error; err != nil {
+		return fmt.Errorf("delete messages by agent: %w", err)
+	}
+	return nil
+}
+
+// DeleteMethodsByAgent 删除指定 agent 的所有方法定义。
+func (r *gormRepository) DeleteMethodsByAgent(ctx context.Context, agentID uint64) error {
+	if err := r.db.WithContext(ctx).Exec("DELETE FROM agent_methods WHERE agent_id = ?", agentID).Error; err != nil {
+		return fmt.Errorf("delete methods by agent: %w", err)
+	}
+	return nil
+}
+
+// DeleteSecretsByAgent 删除指定 agent 的所有密钥记录。
+func (r *gormRepository) DeleteSecretsByAgent(ctx context.Context, agentID uint64) error {
+	if err := r.db.WithContext(ctx).Exec("DELETE FROM agent_secrets WHERE agent_id = ?", agentID).Error; err != nil {
+		return fmt.Errorf("delete secrets by agent: %w", err)
+	}
+	return nil
+}
+
+// DeleteInvocationPayloadsByAgent 删除指定 agent 所有调用的 payload 记录。
+func (r *gormRepository) DeleteInvocationPayloadsByAgent(ctx context.Context, agentID uint64) error {
+	if err := r.db.WithContext(ctx).Exec(
+		"DELETE FROM agent_invocation_payloads WHERE invocation_id IN (SELECT invocation_id FROM agent_invocations WHERE agent_id = ?)", agentID,
+	).Error; err != nil {
+		return fmt.Errorf("delete invocation payloads by agent: %w", err)
+	}
+	return nil
+}
+
+// DeleteInvocationsByAgent 删除指定 agent 的所有调用记录。
+func (r *gormRepository) DeleteInvocationsByAgent(ctx context.Context, agentID uint64) error {
+	if err := r.db.WithContext(ctx).Exec("DELETE FROM agent_invocations WHERE agent_id = ?", agentID).Error; err != nil {
+		return fmt.Errorf("delete invocations by agent: %w", err)
+	}
+	return nil
 }

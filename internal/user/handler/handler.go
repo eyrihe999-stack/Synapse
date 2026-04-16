@@ -31,6 +31,11 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
+	req.LoginIP = c.ClientIP()
+	if req.DeviceID == "" {
+		req.DeviceID = "default"
+	}
+
 	resp, err := h.svc.Register(c.Request.Context(), req)
 	if err != nil {
 		h.handleServiceError(c, err)
@@ -46,6 +51,11 @@ func (h *Handler) Login(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Invalid request", err.Error())
 		return
+	}
+
+	req.LoginIP = c.ClientIP()
+	if req.DeviceID == "" {
+		req.DeviceID = "default"
 	}
 
 	resp, err := h.svc.Login(c.Request.Context(), req)
@@ -65,7 +75,9 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.svc.RefreshToken(c.Request.Context(), req.RefreshToken)
+	req.LoginIP = c.ClientIP()
+
+	resp, err := h.svc.RefreshToken(c.Request.Context(), req)
 	if err != nil {
 		h.handleServiceError(c, err)
 		return
@@ -112,4 +124,59 @@ func (h *Handler) UpdateProfile(c *gin.Context) {
 	}
 
 	response.Success(c, "Profile updated", profile)
+}
+
+// ListSessions 查看当前用户的活跃设备列表。GET /api/v1/users/me/sessions
+func (h *Handler) ListSessions(c *gin.Context) {
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		response.Unauthorized(c, "Authentication required", "")
+		return
+	}
+
+	sessions, err := h.svc.ListSessions(c.Request.Context(), userID)
+	if err != nil {
+		h.handleServiceError(c, err)
+		return
+	}
+
+	response.Success(c, "ok", sessions)
+}
+
+// KickSession 踢掉指定设备。DELETE /api/v1/users/me/sessions/:device_id
+func (h *Handler) KickSession(c *gin.Context) {
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		response.Unauthorized(c, "Authentication required", "")
+		return
+	}
+
+	deviceID := c.Param("device_id")
+	if deviceID == "" {
+		response.BadRequest(c, "Missing device_id", "")
+		return
+	}
+
+	if err := h.svc.KickSession(c.Request.Context(), userID, deviceID); err != nil {
+		h.handleServiceError(c, err)
+		return
+	}
+
+	response.Success(c, "Session kicked", nil)
+}
+
+// LogoutAll 退出所有设备。POST /api/v1/users/me/sessions/logout-all
+func (h *Handler) LogoutAll(c *gin.Context) {
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		response.Unauthorized(c, "Authentication required", "")
+		return
+	}
+
+	if err := h.svc.LogoutAll(c.Request.Context(), userID); err != nil {
+		h.handleServiceError(c, err)
+		return
+	}
+
+	response.Success(c, "All sessions logged out", nil)
 }

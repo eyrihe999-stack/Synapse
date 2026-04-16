@@ -39,11 +39,11 @@ type InvitationService interface {
 	// InitiateOwnershipTransfer 发起所有权转让(生成 ownership_transfer 类型邀请)。
 	InitiateOwnershipTransfer(ctx context.Context, inviterUserID, orgID, targetUserID uint64) (*dto.InvitationResponse, error)
 
-	// ListByOrg 列出 org 的 pending 邀请。
-	ListByOrg(ctx context.Context, orgID uint64, page, size int) (*dto.ListInvitationsResponse, error)
+	// ListByOrg 列出 org 的邀请,status 为空则查全部。
+	ListByOrg(ctx context.Context, orgID uint64, status string, page, size int) (*dto.ListInvitationsResponse, error)
 
-	// ListMine 列出当前用户收到的 pending 邀请。
-	ListMine(ctx context.Context, userID uint64, page, size int) (*dto.ListInvitationsResponse, error)
+	// ListMine 列出当前用户收到的邀请,status 为空则查全部。
+	ListMine(ctx context.Context, userID uint64, status string, page, size int) (*dto.ListInvitationsResponse, error)
 
 	// Accept 接受邀请(普通成员 or 所有权转让)。
 	Accept(ctx context.Context, userID, invitationID uint64) error
@@ -72,26 +72,12 @@ func NewInvitationService(cfg Config, repo repository.Repository, log logger.Log
 	return &invitationService{cfg: cfg, repo: repo, logger: log}
 }
 
-// SearchInvitees 按 user_id / 昵称 / 手机号 / 邮箱 查找已注册用户候选人。
-// 昵称不唯一时返回候选列表(最多 MaxInviteeCandidates)。查询参数缺失返回 ErrOrgInvalidRequest,数据库错误返回 ErrOrgInternal。
+// SearchInvitees 按昵称或邮箱模糊查找已注册用户候选人。
+// 返回候选列表(最多 MaxInviteeCandidates)。查询参数缺失返回 ErrOrgInvalidRequest,数据库错误返回 ErrOrgInternal。
 func (s *invitationService) SearchInvitees(ctx context.Context, req dto.SearchInviteesRequest) (*dto.SearchInviteesResponse, error) {
 	resp := &dto.SearchInviteesResponse{Candidates: []dto.InviteeCandidate{}}
 
 	switch dto.InviteQueryType(req.QueryType) {
-	case dto.InviteQueryByUserID:
-		if req.UserID == 0 {
-			s.logger.WarnCtx(ctx, "缺少 user_id", nil)
-			return nil, fmt.Errorf("missing user_id: %w", organization.ErrOrgInvalidRequest)
-		}
-		p, err := s.repo.FindUserProfileByID(ctx, req.UserID)
-		if err != nil {
-			s.logger.ErrorCtx(ctx, "查询用户失败", err, map[string]any{"user_id": req.UserID})
-			return nil, fmt.Errorf("find user: %w: %w", err, organization.ErrOrgInternal)
-		}
-		if p != nil {
-			resp.Candidates = append(resp.Candidates, userProfileToCandidate(p))
-		}
-
 	case dto.InviteQueryByNickname:
 		if strings.TrimSpace(req.Nickname) == "" {
 			s.logger.WarnCtx(ctx, "缺少昵称", nil)
@@ -111,12 +97,12 @@ func (s *invitationService) SearchInvitees(ctx context.Context, req dto.SearchIn
 			s.logger.WarnCtx(ctx, "缺少邮箱", nil)
 			return nil, fmt.Errorf("missing email: %w", organization.ErrOrgInvalidRequest)
 		}
-		p, err := s.repo.FindUserProfileByEmail(ctx, req.Email)
+		list, err := s.repo.FindUserProfilesByEmail(ctx, req.Email, organization.MaxInviteeCandidates)
 		if err != nil {
 			s.logger.ErrorCtx(ctx, "按邮箱查询失败", err, nil)
-			return nil, fmt.Errorf("find by email: %w: %w", err, organization.ErrOrgInternal)
+			return nil, fmt.Errorf("search by email: %w: %w", err, organization.ErrOrgInternal)
 		}
-		if p != nil {
+		for _, p := range list {
 			resp.Candidates = append(resp.Candidates, userProfileToCandidate(p))
 		}
 
@@ -278,15 +264,15 @@ func (s *invitationService) InitiateOwnershipTransfer(ctx context.Context, invit
 	return &resp, nil
 }
 
-// ListByOrg 分页列出某 org 的所有 pending 邀请。数据库错误返回 ErrOrgInternal。
-func (s *invitationService) ListByOrg(ctx context.Context, orgID uint64, page, size int) (*dto.ListInvitationsResponse, error) {
+// ListByOrg 分页列出某 org 的邀请,status 为空查全部。数据库错误返回 ErrOrgInternal。
+func (s *invitationService) ListByOrg(ctx context.Context, orgID uint64, status string, page, size int) (*dto.ListInvitationsResponse, error) {
 	if size <= 0 || size > organization.MaxPageSize {
 		size = organization.DefaultPageSize
 	}
 	if page <= 0 {
 		page = 1
 	}
-	list, total, err := s.repo.ListPendingByOrg(ctx, orgID, page, size)
+	list, total, err := s.repo.ListByOrg(ctx, orgID, status, page, size)
 	if err != nil {
 		s.logger.ErrorCtx(ctx, "列出 org 邀请失败", err, map[string]any{"org_id": orgID})
 		return nil, fmt.Errorf("list org invitations: %w: %w", err, organization.ErrOrgInternal)
@@ -294,15 +280,15 @@ func (s *invitationService) ListByOrg(ctx context.Context, orgID uint64, page, s
 	return s.buildListResponse(ctx, list, total, page, size), nil
 }
 
-// ListMine 分页列出当前用户收到的 pending 邀请。数据库错误返回 ErrOrgInternal。
-func (s *invitationService) ListMine(ctx context.Context, userID uint64, page, size int) (*dto.ListInvitationsResponse, error) {
+// ListMine 分页列出当前用户收到的邀请,status 为空查全部。数据库错误返回 ErrOrgInternal。
+func (s *invitationService) ListMine(ctx context.Context, userID uint64, status string, page, size int) (*dto.ListInvitationsResponse, error) {
 	if size <= 0 || size > organization.MaxPageSize {
 		size = organization.DefaultPageSize
 	}
 	if page <= 0 {
 		page = 1
 	}
-	list, total, err := s.repo.ListPendingByInvitee(ctx, userID, page, size)
+	list, total, err := s.repo.ListByInvitee(ctx, userID, status, page, size)
 	if err != nil {
 		s.logger.ErrorCtx(ctx, "列出我的邀请失败", err, map[string]any{"user_id": userID})
 		return nil, fmt.Errorf("list my invitations: %w: %w", err, organization.ErrOrgInternal)
@@ -328,10 +314,25 @@ func (s *invitationService) invitationToDTO(ctx context.Context, inv *model.OrgI
 	if org, err := s.repo.FindOrgByID(ctx, inv.OrgID); err == nil && org != nil {
 		resp.OrgSlug = org.Slug
 		resp.OrgDisplayName = org.DisplayName
+		resp.OrgDescription = org.Description
+		if ownerProfile, err := s.repo.FindUserProfileByID(ctx, org.OwnerUserID); err == nil && ownerProfile != nil {
+			resp.OrgOwnerName = ownerProfile.DisplayName
+		}
+		if count, err := s.repo.CountMembersByOrg(ctx, org.ID); err == nil {
+			resp.OrgMemberCount = count
+		}
 	}
 	if role, err := s.repo.FindRoleByID(ctx, inv.RoleID); err == nil && role != nil {
 		r := roleToSummary(role)
 		resp.Role = &r
+	}
+	if p, err := s.repo.FindUserProfileByID(ctx, inv.InviterUserID); err == nil && p != nil {
+		resp.InviterName = p.DisplayName
+		resp.InviterEmail = p.MaskedEmail
+	}
+	if p, err := s.repo.FindUserProfileByID(ctx, inv.InviteeUserID); err == nil && p != nil {
+		resp.InviteeName = p.DisplayName
+		resp.InviteeEmail = p.MaskedEmail
 	}
 	return resp
 }

@@ -43,8 +43,11 @@ func (r *gormRepository) FindUserProfileByID(ctx context.Context, userID uint64)
 	return buildUserProfile(rr.ID, rr.DisplayName, rr.AvatarURL, rr.Email, rr.Status), nil
 }
 
-// FindUserProfileByEmail 按邮箱精确查找 active 用户。
-func (r *gormRepository) FindUserProfileByEmail(ctx context.Context, email string) (*UserProfile, error) {
+// FindUserProfilesByEmail 按邮箱模糊查找 active 用户,返回候选列表。
+func (r *gormRepository) FindUserProfilesByEmail(ctx context.Context, email string, limit int) ([]*UserProfile, error) {
+	if limit <= 0 {
+		limit = 20
+	}
 	type row struct {
 		ID          uint64
 		DisplayName *string
@@ -52,23 +55,25 @@ func (r *gormRepository) FindUserProfileByEmail(ctx context.Context, email strin
 		Email       *string
 		Status      int32
 	}
-	var rr row
+	var rows []row
 	err := r.db.WithContext(ctx).Raw(`
 		SELECT id, display_name, avatar_url, email, status
 		FROM users
-		WHERE email = ? AND status = 1 AND deleted_at IS NULL
-		LIMIT 1
-	`, email).Scan(&rr).Error
+		WHERE email LIKE ? AND status = 1 AND deleted_at IS NULL
+		ORDER BY id ASC
+		LIMIT ?
+	`, "%"+email+"%", limit).Scan(&rows).Error
 	if err != nil {
-		return nil, fmt.Errorf("find user by email: %w", err)
+		return nil, fmt.Errorf("search users by email: %w", err)
 	}
-	if rr.ID == 0 {
-		return nil, nil
+	out := make([]*UserProfile, 0, len(rows))
+	for _, rr := range rows {
+		out = append(out, buildUserProfile(rr.ID, rr.DisplayName, rr.AvatarURL, rr.Email, rr.Status))
 	}
-	return buildUserProfile(rr.ID, rr.DisplayName, rr.AvatarURL, rr.Email, rr.Status), nil
+	return out, nil
 }
 
-// SearchUserProfilesByDisplayName 按昵称精确查找 active 用户,返回候选列表。
+// SearchUserProfilesByDisplayName 按昵称模糊查找 active 用户,返回候选列表。
 func (r *gormRepository) SearchUserProfilesByDisplayName(ctx context.Context, name string, limit int) ([]*UserProfile, error) {
 	if limit <= 0 {
 		limit = 20
@@ -84,10 +89,10 @@ func (r *gormRepository) SearchUserProfilesByDisplayName(ctx context.Context, na
 	err := r.db.WithContext(ctx).Raw(`
 		SELECT id, display_name, avatar_url, email, status
 		FROM users
-		WHERE display_name = ? AND status = 1 AND deleted_at IS NULL
+		WHERE display_name LIKE ? AND status = 1 AND deleted_at IS NULL
 		ORDER BY id ASC
 		LIMIT ?
-	`, name, limit).Scan(&rows).Error
+	`, "%"+name+"%", limit).Scan(&rows).Error
 	if err != nil {
 		return nil, fmt.Errorf("search users by name: %w", err)
 	}

@@ -170,8 +170,15 @@ type InvitationResponse struct {
 	OrgID          uint64       `json:"org_id,string"`
 	OrgSlug        string       `json:"org_slug,omitempty"`
 	OrgDisplayName string       `json:"org_display_name,omitempty"`
+	OrgDescription string       `json:"org_description,omitempty"`
+	OrgOwnerName   string       `json:"org_owner_name,omitempty"`
+	OrgMemberCount int64        `json:"org_member_count,omitempty"`
 	InviterUserID  uint64       `json:"inviter_user_id,string"`
 	InviteeUserID  uint64       `json:"invitee_user_id,string"`
+	InviterName    string       `json:"inviter_name,omitempty"`
+	InviterEmail   string       `json:"inviter_email,omitempty"`
+	InviteeName    string       `json:"invitee_name,omitempty"`
+	InviteeEmail   string       `json:"invitee_email,omitempty"`
 	Role           *RoleSummary `json:"role,omitempty"`
 	Type           string       `json:"type"`
 	Status         string       `json:"status"`

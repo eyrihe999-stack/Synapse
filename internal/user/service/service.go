@@ -22,17 +22,26 @@ type RegisterRequest struct {
 	Email       string `json:"email" binding:"required"`
 	Password    string `json:"password" binding:"required"`
 	DisplayName string `json:"display_name"`
+	DeviceID    string `json:"device_id"`
+	DeviceName  string `json:"device_name"`
+	LoginIP     string `json:"-"` // handler 层设置,不从 JSON 读取
 }
 
 // LoginRequest 用户登录请求。
 type LoginRequest struct {
-	Email    string `json:"email" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	Email      string `json:"email" binding:"required"`
+	Password   string `json:"password" binding:"required"`
+	DeviceID   string `json:"device_id"`
+	DeviceName string `json:"device_name"`
+	LoginIP    string `json:"-"` // handler 层设置,不从 JSON 读取
 }
 
 // RefreshRequest 刷新 token 请求。
 type RefreshRequest struct {
 	RefreshToken string `json:"refresh_token" binding:"required"`
+	DeviceID     string `json:"device_id"`
+	DeviceName   string `json:"device_name"`
+	LoginIP      string `json:"-"`
 }
 
 // UpdateProfileRequest 更新个人信息请求。
@@ -51,11 +60,13 @@ type AuthResponse struct {
 
 // UserProfile 用户公开资料。
 type UserProfile struct {
-	ID          uint64    `json:"id"`
-	Email       string    `json:"email"`
-	DisplayName string    `json:"display_name"`
-	AvatarURL   string    `json:"avatar_url"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID          uint64     `json:"id"`
+	Email       string     `json:"email"`
+	DisplayName string     `json:"display_name"`
+	AvatarURL   string     `json:"avatar_url"`
+	Status      int32      `json:"status"`
+	LastLoginAt *time.Time `json:"last_login_at"`
+	CreatedAt   time.Time  `json:"created_at"`
 }
 
 // UserService 定义用户模块的业务操作接口。
@@ -64,18 +75,23 @@ type UserService interface {
 	Login(ctx context.Context, req LoginRequest) (*AuthResponse, error)
 	GetProfile(ctx context.Context, userID uint64) (*UserProfile, error)
 	UpdateProfile(ctx context.Context, userID uint64, req UpdateProfileRequest) (*UserProfile, error)
-	RefreshToken(ctx context.Context, refreshToken string) (*AuthResponse, error)
+	RefreshToken(ctx context.Context, req RefreshRequest) (*AuthResponse, error)
+	ListSessions(ctx context.Context, userID uint64) ([]user.SessionEntry, error)
+	KickSession(ctx context.Context, userID uint64, deviceID string) error
+	LogoutAll(ctx context.Context, userID uint64) error
 }
 
 type userService struct {
-	repo       repository.Repository
-	jwtManager *utils.JWTManager
-	log        logger.LoggerInterface
+	repo               repository.Repository
+	jwtManager         *utils.JWTManager
+	sessionStore       user.SessionStore
+	maxSessionsPerUser int
+	log                logger.LoggerInterface
 }
 
 // NewUserService 构造一个 UserService 实例。
-func NewUserService(repo repository.Repository, jwtManager *utils.JWTManager, log logger.LoggerInterface) UserService {
-	return &userService{repo: repo, jwtManager: jwtManager, log: log}
+func NewUserService(repo repository.Repository, jwtManager *utils.JWTManager, sessionStore user.SessionStore, maxSessionsPerUser int, log logger.LoggerInterface) UserService {
+	return &userService{repo: repo, jwtManager: jwtManager, sessionStore: sessionStore, maxSessionsPerUser: maxSessionsPerUser, log: log}
 }
 
 // Register 注册新用户并返回认证凭证。
@@ -128,8 +144,13 @@ func (s *userService) Register(ctx context.Context, req RegisterRequest) (*AuthR
 		return nil, fmt.Errorf("create user: %w: %w", err, user.ErrUserInternal)
 	}
 
+	deviceID := req.DeviceID
+	if deviceID == "" {
+		deviceID = "default"
+	}
+
 	//sayso-lint:ignore sentinel-wrap
-	return s.generateAuthResponse(ctx, u) // generateAuthResponse 内部已包装 ErrUserInternal
+	return s.generateAuthResponse(ctx, u, deviceID, req.DeviceName, req.LoginIP)
 }
 
 // Login 用户登录,校验邮箱密码后返回认证凭证。
@@ -151,8 +172,13 @@ func (s *userService) Login(ctx context.Context, req LoginRequest) (*AuthRespons
 	//sayso-lint:ignore err-swallow
 	_ = s.repo.UpdateFields(ctx, u.ID, map[string]any{"last_login_at": now}) // best-effort 更新登录时间,失败不阻塞
 
+	deviceID := req.DeviceID
+	if deviceID == "" {
+		deviceID = "default"
+	}
+
 	//sayso-lint:ignore sentinel-wrap
-	return s.generateAuthResponse(ctx, u) // generateAuthResponse 内部已包装 ErrUserInternal
+	return s.generateAuthResponse(ctx, u, deviceID, req.DeviceName, req.LoginIP)
 }
 
 // GetProfile 按用户 ID 查询公开资料。
@@ -191,12 +217,34 @@ func (s *userService) UpdateProfile(ctx context.Context, userID uint64, req Upda
 
 // RefreshToken 用 refresh token 换取新的认证凭证。
 //
-// 返回 ErrInvalidRefreshToken / ErrUserNotFound / ErrUserInternal。
-func (s *userService) RefreshToken(ctx context.Context, refreshToken string) (*AuthResponse, error) {
-	claims, err := s.jwtManager.ValidateRefreshToken(refreshToken)
+// 校验 refresh token 签名后,检查 Redis 中 JTI 是否匹配,
+// 匹配则签发新 token 对并更新 session。
+// 返回 ErrInvalidRefreshToken / ErrSessionRevoked / ErrUserNotFound / ErrUserInternal。
+func (s *userService) RefreshToken(ctx context.Context, req RefreshRequest) (*AuthResponse, error) {
+	claims, err := s.jwtManager.ValidateRefreshToken(req.RefreshToken)
 	if err != nil {
 		s.log.WarnCtx(ctx, "refresh token 无效", map[string]any{"error": err.Error()})
 		return nil, fmt.Errorf("invalid refresh token: %w: %w", err, user.ErrInvalidRefreshToken)
+	}
+
+	deviceID := claims.DeviceID
+	if deviceID == "" {
+		deviceID = "default"
+	}
+
+	// 校验 Redis session 中的 JTI 是否匹配
+	session, err := s.sessionStore.Get(ctx, claims.UserID, deviceID)
+	if err != nil {
+		s.log.WarnCtx(ctx, "session 不存在,可能已被踢下线", map[string]any{
+			"user_id": claims.UserID, "device_id": deviceID,
+		})
+		return nil, fmt.Errorf("session revoked: %w", user.ErrSessionRevoked)
+	}
+	if session.JTI != claims.ID {
+		s.log.WarnCtx(ctx, "refresh token JTI 不匹配,可能已被替换", map[string]any{
+			"user_id": claims.UserID, "device_id": deviceID,
+		})
+		return nil, fmt.Errorf("jti mismatch: %w", user.ErrSessionRevoked)
 	}
 
 	u, err := s.repo.FindByID(ctx, claims.UserID)
@@ -205,24 +253,107 @@ func (s *userService) RefreshToken(ctx context.Context, refreshToken string) (*A
 		return nil, fmt.Errorf("find user: %w", user.ErrUserNotFound)
 	}
 
+	// 使用请求中的 device_name(如果有),否则保留原 session 的
+	deviceName := req.DeviceName
+	if deviceName == "" {
+		deviceName = session.DeviceName
+	}
+	loginIP := req.LoginIP
+	if loginIP == "" {
+		loginIP = session.LoginIP
+	}
+
 	//sayso-lint:ignore sentinel-wrap
-	return s.generateAuthResponse(ctx, u) // generateAuthResponse 内部已包装 ErrUserInternal
+	return s.generateAuthResponse(ctx, u, deviceID, deviceName, loginIP)
 }
 
-// generateAuthResponse 生成 access/refresh token 对并组装响应。
-func (s *userService) generateAuthResponse(ctx context.Context, u *model.User) (*AuthResponse, error) {
+// ListSessions 返回用户的所有活跃设备 session。
+func (s *userService) ListSessions(ctx context.Context, userID uint64) ([]user.SessionEntry, error) {
+	entries, err := s.sessionStore.List(ctx, userID)
+	if err != nil {
+		s.log.ErrorCtx(ctx, "查询 session 列表失败", err, map[string]any{"user_id": userID})
+		return nil, fmt.Errorf("list sessions: %w: %w", err, user.ErrUserInternal)
+	}
+	return entries, nil
+}
+
+// KickSession 踢掉指定设备的 session。
+//
+// 返回 ErrSessionNotFound / ErrUserInternal。
+func (s *userService) KickSession(ctx context.Context, userID uint64, deviceID string) error {
+	// 先检查 session 是否存在
 	//sayso-lint:ignore err-swallow
-	accessToken, _, err := s.jwtManager.GenerateAccessToken(u.ID, u.Email, "") // 丢弃 expiry,仅需 token 字符串
+	if _, err := s.sessionStore.Get(ctx, userID, deviceID); err != nil { // 丢弃 session 信息,仅检查是否存在
+		s.log.WarnCtx(ctx, "session 不存在", map[string]any{"user_id": userID, "device_id": deviceID})
+		return fmt.Errorf("session not found: %w", user.ErrSessionNotFound)
+	}
+	if err := s.sessionStore.Delete(ctx, userID, deviceID); err != nil {
+		s.log.ErrorCtx(ctx, "踢设备失败", err, map[string]any{"user_id": userID, "device_id": deviceID})
+		return fmt.Errorf("kick session: %w: %w", err, user.ErrUserInternal)
+	}
+	return nil
+}
+
+// LogoutAll 退出用户的所有设备。
+//
+// 返回 ErrUserInternal。
+func (s *userService) LogoutAll(ctx context.Context, userID uint64) error {
+	if err := s.sessionStore.DeleteAll(ctx, userID); err != nil {
+		s.log.ErrorCtx(ctx, "退出所有设备失败", err, map[string]any{"user_id": userID})
+		return fmt.Errorf("logout all: %w: %w", err, user.ErrUserInternal)
+	}
+	return nil
+}
+
+// generateAuthResponse 生成 access/refresh token 对,保存 session 到 Redis,并组装响应。
+func (s *userService) generateAuthResponse(ctx context.Context, u *model.User, deviceID, deviceName, loginIP string) (*AuthResponse, error) {
+	//sayso-lint:ignore err-swallow
+	accessToken, _, err := s.jwtManager.GenerateAccessToken(u.ID, u.Email, deviceID)
 	if err != nil {
 		s.log.ErrorCtx(ctx, "生成 access token 失败", err, map[string]any{"user_id": u.ID})
 		return nil, fmt.Errorf("generate access token: %w: %w", err, user.ErrUserInternal)
 	}
 
 	//sayso-lint:ignore err-swallow
-	refreshToken, _, err := s.jwtManager.GenerateRefreshToken(u.ID, u.Email, "") // 丢弃 expiry,仅需 token 字符串
+	refreshToken, _, err := s.jwtManager.GenerateRefreshToken(u.ID, u.Email, deviceID)
 	if err != nil {
 		s.log.ErrorCtx(ctx, "生成 refresh token 失败", err, map[string]any{"user_id": u.ID})
 		return nil, fmt.Errorf("generate refresh token: %w: %w", err, user.ErrUserInternal)
+	}
+
+	// 解析 refresh token 取 JTI
+	refreshClaims, err := s.jwtManager.ValidateRefreshToken(refreshToken)
+	if err != nil {
+		s.log.ErrorCtx(ctx, "解析 refresh token JTI 失败", err, map[string]any{"user_id": u.ID})
+		return nil, fmt.Errorf("parse refresh jti: %w: %w", err, user.ErrUserInternal)
+	}
+
+	// 检查设备数量限制(同一设备重新登录不计入)
+	if s.maxSessionsPerUser > 0 {
+		//sayso-lint:ignore err-swallow
+		existing, _ := s.sessionStore.Get(ctx, u.ID, deviceID) // 丢弃 error,Get 失败视为新设备
+		if existing == nil { // 新设备
+			//sayso-lint:ignore err-shadow
+			sessions, err := s.sessionStore.List(ctx, u.ID)
+			if err == nil && len(sessions) >= s.maxSessionsPerUser {
+				s.log.WarnCtx(ctx, "设备数量已达上限", map[string]any{
+					"user_id": u.ID, "limit": s.maxSessionsPerUser, "current": len(sessions),
+				})
+				return nil, fmt.Errorf("session limit: %w", user.ErrSessionLimitReached)
+			}
+		}
+	}
+
+	// 保存 session 到 Redis
+	sessionInfo := user.SessionInfo{
+		JTI:        refreshClaims.ID,
+		DeviceName: deviceName,
+		LoginIP:    loginIP,
+		LoginAt:    time.Now().UTC().Unix(),
+	}
+	if err := s.sessionStore.Save(ctx, u.ID, deviceID, sessionInfo, s.jwtManager.RefreshTokenDuration()); err != nil {
+		s.log.ErrorCtx(ctx, "保存 session 失败", err, map[string]any{"user_id": u.ID, "device_id": deviceID})
+		return nil, fmt.Errorf("save session: %w: %w", err, user.ErrUserInternal)
 	}
 
 	return &AuthResponse{
@@ -240,6 +371,8 @@ func toUserProfile(u *model.User) *UserProfile {
 		Email:       u.Email,
 		DisplayName: u.DisplayName,
 		AvatarURL:   u.AvatarURL,
+		Status:      u.Status,
+		LastLoginAt: u.LastLoginAt,
 		CreatedAt:   u.CreatedAt,
 	}
 }
