@@ -13,9 +13,20 @@ import (
 	"github.com/eyrihe999-stack/Synapse/internal/user/repository"
 	"github.com/eyrihe999-stack/Synapse/pkg/logger"
 	"github.com/eyrihe999-stack/Synapse/pkg/utils"
+	"github.com/go-sql-driver/mysql"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
+
+// mysqlErrDupEntry MySQL 唯一索引冲突错误码。Register 并发竞争时,
+// FindByEmail 没查到但 CreateUser 撞 unique 索引,需要把它映射回 ErrEmailAlreadyRegistered。
+const mysqlErrDupEntry = 1062
+
+// isDupEntryErr 判断是否为 MySQL 唯一索引冲突。
+func isDupEntryErr(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == mysqlErrDupEntry
+}
 
 // RegisterRequest 用户注册请求。
 type RegisterRequest struct {
@@ -60,7 +71,7 @@ type AuthResponse struct {
 
 // UserProfile 用户公开资料。
 type UserProfile struct {
-	ID          uint64     `json:"id"`
+	ID          uint64     `json:"id,string"`
 	Email       string     `json:"email"`
 	DisplayName string     `json:"display_name"`
 	AvatarURL   string     `json:"avatar_url"`
@@ -140,6 +151,12 @@ func (s *userService) Register(ctx context.Context, req RegisterRequest) (*AuthR
 	}
 
 	if err := s.repo.CreateUser(ctx, u); err != nil {
+		// 兜底:FindByEmail 与 CreateUser 之间有 TOCTOU 窗口,
+		// 并发注册同邮箱时这里会撞 unique 索引,需要把 sentinel 映射回去。
+		if isDupEntryErr(err) {
+			s.log.WarnCtx(ctx, "邮箱已注册(并发竞争)", map[string]any{"email": req.Email})
+			return nil, fmt.Errorf("email taken: %w", user.ErrEmailAlreadyRegistered)
+		}
 		s.log.ErrorCtx(ctx, "创建用户失败", err, map[string]any{"email": req.Email})
 		return nil, fmt.Errorf("create user: %w: %w", err, user.ErrUserInternal)
 	}

@@ -49,22 +49,26 @@ const PublishStatusRevoked = "revoked"
 // EndpointURL 允许 HTTP 和 HTTPS。
 // ContextMode 决定上下文管理方式:stateless 由 Synapse 管,stateful 由 Agent 管。
 type Agent struct {
-	ID                   uint64         `gorm:"primaryKey;autoIncrement"`
-	OwnerUserID          uint64         `gorm:"not null;index:idx_agents_owner;uniqueIndex:uk_agents_owner_slug,priority:1"`
-	Slug                 string         `gorm:"size:64;not null;uniqueIndex:uk_agents_owner_slug,priority:2"`
-	DisplayName          string         `gorm:"size:128;not null"`
-	Description          string         `gorm:"size:1000"`
-	AgentType            string         `gorm:"size:16;not null;default:chat"`
-	EndpointURL          string         `gorm:"size:512;not null"`
-	ContextMode          string         `gorm:"size:16;not null;default:stateless"`
-	MaxContextRounds     int            `gorm:"not null;default:20"`
-	AuthTokenEncrypted   []byte         `gorm:"type:varbinary(512)"`
-	TimeoutSeconds       int            `gorm:"not null;default:30"`
-	IconURL              string         `gorm:"size:512"`
-	Tags                 datatypes.JSON `gorm:"type:json"`
-	Status               string         `gorm:"size:16;not null;default:active;index:idx_agents_status"`
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	ID                 uint64         `gorm:"primaryKey;autoIncrement"`
+	OwnerUserID        uint64         `gorm:"not null;index:idx_agents_owner;uniqueIndex:uk_agents_owner_slug,priority:1"`
+	Slug               string         `gorm:"size:64;not null;uniqueIndex:uk_agents_owner_slug,priority:2"`
+	DisplayName        string         `gorm:"size:128;not null"`
+	Description        string         `gorm:"size:1000"`
+	AgentType          string         `gorm:"size:16;not null;default:chat"`
+	EndpointURL        string         `gorm:"size:512;not null"`
+	ContextMode        string         `gorm:"size:16;not null;default:stateless"`
+	MaxContextRounds   int            `gorm:"not null;default:20"`
+	AuthTokenEncrypted []byte         `gorm:"type:varbinary(512)"`
+	TimeoutSeconds     int            `gorm:"not null;default:30"`
+	IconURL            string         `gorm:"size:512"`
+	Tags               datatypes.JSON `gorm:"type:json"`
+	// DataSources 仅 AgentType=knowledge 有效,JSON 数组格式,例如 ["documents"]。
+	// Synapse 在转发每次 chat 请求前会按此列表做前置检索并把结果塞进 system 消息。
+	DataSources datatypes.JSON `gorm:"type:json"`
+	Version     string         `gorm:"size:32;not null;default:'0.1.0'"`
+	Status      string         `gorm:"size:16;not null;default:active;index:idx_agents_status"`
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // TableName 返回 Agent 模型对应的数据库表名。

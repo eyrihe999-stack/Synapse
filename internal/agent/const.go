@@ -17,13 +17,21 @@ const (
 // ─── Agent 类型 ──────────────────────────────────────────────────────────────
 
 const (
-	// AgentTypeChat 交互式对话 agent(v1 唯一支持)
+	// AgentTypeChat 交互式对话 agent(Synapse 自定义 JSON + SSE 协议)。
 	AgentTypeChat = "chat"
+	// AgentTypeTool 工具型 agent,自包含完成特定任务(同 chat 协议)。
+	AgentTypeTool = "tool"
+	// AgentTypeMCP endpoint 说 MCP 协议(JSON-RPC 2.0 over HTTP)。
+	// Synapse 作为透明代理把调用方的 MCP 请求转发到 agent.endpoint_url,响应回传。
+	// 调用方(Claude.ai / Cursor / 其它 agent)只要讲 MCP 就行,不用理会 Synapse 私有 chat 协议。
+	AgentTypeMCP = "mcp"
 )
 
-// ValidAgentTypes 当前系统支持的 agent 类型集合，用于创建/更新时校验。
+// ValidAgentTypes 当前系统支持的 agent 类型集合,用于创建/更新时校验。
 var ValidAgentTypes = map[string]struct{}{
 	AgentTypeChat: {},
+	AgentTypeTool: {},
+	AgentTypeMCP:  {},
 }
 
 // ─── Context 模式 ────────────────────────────────────────────────────────────
@@ -108,6 +116,11 @@ const (
 	// MaxPageSize 最大分页大小。
 	MaxPageSize = 100
 
+	// MaxTagsCount 单个 agent 最多标签数。
+	MaxTagsCount = 20
+	// MaxTagLength 单个标签最大字符数。
+	MaxTagLength = 50
+
 	// MinAgentSlugLength agent slug 最小长度。
 	MinAgentSlugLength = 3
 	// MaxAgentSlugLength agent slug 最大长度。
@@ -118,6 +131,23 @@ const (
 	MaxAgentDescriptionLength = 1000
 	// MaxSessionTitleLength session 标题最大长度。
 	MaxSessionTitleLength = 256
+
+	// MaxUpstreamResponseBytes 上游非流式响应体最大读取字节数(10MB)。
+	MaxUpstreamResponseBytes = 10 * 1024 * 1024
+
+	// MaxChatMessageLength 单条对话消息最大字符数。
+	MaxChatMessageLength = 8000
+
+	// MaxChatRequestBodyBytes chat 路由单请求 body 上限(128KB)。
+	// 计算依据:MaxChatMessageLength=8000 runes × 最多 4 bytes/rune ≈ 32KB,再预留 4 倍给
+	// JSON 开销和将来字段扩展。比全局 1MB 限制更严,避免恶意请求在 service 层 rune 校验前
+	// 吃掉大量 IO + JSON 解析 CPU。
+	MaxChatRequestBodyBytes = 128 * 1024
+
+	// MaxSSELineBytes SSE 单行最大字节数(128KB)。
+	MaxSSELineBytes = 128 * 1024
+	// MaxStreamContentBytes 流式响应累计 content 最大字节数(1MB)。
+	MaxStreamContentBytes = 1024 * 1024
 )
 
 // ─── 正则 ────────────────────────────────────────────────────────────────────

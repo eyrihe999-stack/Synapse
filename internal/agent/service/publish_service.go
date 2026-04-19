@@ -42,58 +42,79 @@ func NewPublishService(repo repository.Repository, orgPort OrgPort, log logger.L
 
 // Submit 提交 agent 发布请求到指定 org；若 org 开启审核则进入 pending 状态。
 // 可能返回 ErrAgentInvalidRequest、ErrAgentNotFound、ErrAgentNotAuthor、ErrPublishAlreadyExists、ErrAgentInternal。
+//
+// 并发保护:整个"查 agent → 校验 → 查重 → 写入"流程在一个事务内完成,
+// 入口先对 agent 行加 SELECT ... FOR UPDATE,串行化同一 agent 的并发 Submit,
+// 避免两个请求同时通过查重后双写 active publish。
 func (s *publishService) Submit(ctx context.Context, userID uint64, org *OrgInfo, requireReview bool, req dto.PublishAgentRequest) (*dto.PublishResponse, error) {
 	if org == nil {
 		s.logger.WarnCtx(ctx, "submit publish with nil org", map[string]any{"user_id": userID})
 		return nil, fmt.Errorf("org nil: %w", agent.ErrAgentInvalidRequest)
 	}
-	a, err := s.repo.FindAgentByID(ctx, req.AgentID)
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			s.logger.WarnCtx(ctx, "agent not found for publish", map[string]any{"agent_id": req.AgentID})
-			return nil, fmt.Errorf("agent not found: %w", agent.ErrAgentNotFound)
+
+	var created *model.AgentPublish
+	txErr := s.repo.WithTx(ctx, func(tx repository.Repository) error {
+		a, err := tx.LockAgentByID(ctx, req.AgentID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				s.logger.WarnCtx(ctx, "agent not found for publish", map[string]any{"agent_id": req.AgentID})
+				return fmt.Errorf("agent not found: %w", agent.ErrAgentNotFound)
+			}
+			s.logger.ErrorCtx(ctx, "lock agent for publish failed", err, map[string]any{"agent_id": req.AgentID})
+			return fmt.Errorf("lock agent: %w: %w", err, agent.ErrAgentInternal)
 		}
-		s.logger.ErrorCtx(ctx, "find agent failed", err, map[string]any{"agent_id": req.AgentID})
-		return nil, fmt.Errorf("find agent: %w: %w", err, agent.ErrAgentInternal)
+		if a.OwnerUserID != userID {
+			s.logger.WarnCtx(ctx, "publish submit denied, not author", map[string]any{"agent_id": req.AgentID, "user_id": userID})
+			return fmt.Errorf("not author: %w", agent.ErrAgentNotAuthor)
+		}
+		if a.Status != model.AgentStatusActive {
+			s.logger.WarnCtx(ctx, "publish submit denied, agent not active", map[string]any{"agent_id": req.AgentID, "status": a.Status})
+			return fmt.Errorf("agent not active: %w", agent.ErrAgentInvalidRequest)
+		}
+		if existing, fErr := tx.FindActivePublish(ctx, a.ID, org.ID); fErr == nil && existing != nil {
+			s.logger.WarnCtx(ctx, "publish already exists", map[string]any{"agent_id": a.ID, "org_id": org.ID})
+			return fmt.Errorf("publish exists: %w", agent.ErrPublishAlreadyExists)
+		} else if fErr != nil && !errors.Is(fErr, gorm.ErrRecordNotFound) {
+			s.logger.ErrorCtx(ctx, "find active publish failed", fErr, nil)
+			return fmt.Errorf("find active publish: %w: %w", fErr, agent.ErrAgentInternal)
+		}
+		status := model.PublishStatusApproved
+		if requireReview {
+			status = model.PublishStatusPending
+		}
+		p := &model.AgentPublish{
+			AgentID:           a.ID,
+			OrgID:             org.ID,
+			SubmittedByUserID: userID,
+			Status:            status,
+			ReviewNote:        req.Note,
+		}
+		if err := tx.CreatePublish(ctx, p); err != nil {
+			s.logger.ErrorCtx(ctx, "create publish failed", err, nil)
+			return fmt.Errorf("create publish: %w: %w", err, agent.ErrAgentInternal)
+		}
+		created = p
+		return nil
+	})
+	if txErr != nil {
+		//sayso-lint:ignore sentinel-wrap
+		return nil, txErr
 	}
-	if a.OwnerUserID != userID {
-		s.logger.WarnCtx(ctx, "publish submit denied, not author", map[string]any{"agent_id": req.AgentID, "user_id": userID})
-		return nil, fmt.Errorf("not author: %w", agent.ErrAgentNotAuthor)
-	}
-	if a.Status != model.AgentStatusActive {
-		s.logger.WarnCtx(ctx, "publish submit denied, agent not active", map[string]any{"agent_id": req.AgentID, "status": a.Status})
-		return nil, fmt.Errorf("agent not active: %w", agent.ErrAgentInvalidRequest)
-	}
-	if existing, fErr := s.repo.FindActivePublish(ctx, a.ID, org.ID); fErr == nil && existing != nil {
-		s.logger.WarnCtx(ctx, "publish already exists", map[string]any{"agent_id": a.ID, "org_id": org.ID})
-		return nil, fmt.Errorf("publish exists: %w", agent.ErrPublishAlreadyExists)
-	} else if fErr != nil && !errors.Is(fErr, gorm.ErrRecordNotFound) {
-		s.logger.ErrorCtx(ctx, "find active publish failed", fErr, nil)
-		return nil, fmt.Errorf("find active publish: %w: %w", fErr, agent.ErrAgentInternal)
-	}
-	status := model.PublishStatusApproved
-	if requireReview {
-		status = model.PublishStatusPending
-	}
-	p := &model.AgentPublish{
-		AgentID:           a.ID,
-		OrgID:             org.ID,
-		SubmittedByUserID: userID,
-		Status:            status,
-		ReviewNote:        req.Note,
-	}
-	if err := s.repo.CreatePublish(ctx, p); err != nil {
-		s.logger.ErrorCtx(ctx, "create publish failed", err, nil)
-		return nil, fmt.Errorf("create publish: %w: %w", err, agent.ErrAgentInternal)
-	}
-	s.logger.InfoCtx(ctx, "publish submitted", map[string]any{"publish_id": p.ID, "status": status})
-	resp := publishToDTO(p)
+
+	s.logger.InfoCtx(ctx, "publish submitted", map[string]any{"publish_id": created.ID, "status": created.Status})
+	resp := publishToDTO(created)
 	return &resp, nil
 }
 
 // ListByOrg 分页列出指定 org 下的发布记录，可按 status 过滤。
 // 可能返回 ErrAgentInternal。
 func (s *publishService) ListByOrg(ctx context.Context, orgID uint64, status string, page, size int) ([]dto.PublishResponse, int64, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if size <= 0 || size > agent.MaxPageSize {
+		size = agent.DefaultPageSize
+	}
 	list, total, err := s.repo.ListPublishesByOrg(ctx, orgID, status, page, size)
 	if err != nil {
 		s.logger.ErrorCtx(ctx, "list publishes failed", err, nil)

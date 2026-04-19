@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,14 +55,14 @@ type ChatServiceRequest struct {
 }
 
 type chatService struct {
-	cfg         Config
-	registrySvc RegistryService
-	publishSvc  PublishService
-	repo        repository.Repository
+	cfg          Config
+	registrySvc  RegistryService
+	publishSvc   PublishService
+	repo         repository.Repository
 	rateLimitSvc RateLimitService
-	orgPort     OrgPort
-	logger      logger.LoggerInterface
-	httpClient  *http.Client
+	orgPort      OrgPort
+	logger       logger.LoggerInterface
+	httpClient   *http.Client
 }
 
 // NewChatService 构造 ChatService。
@@ -82,7 +83,15 @@ func NewChatService(
 		rateLimitSvc: rateLimitSvc,
 		orgPort:      orgPort,
 		logger:       log,
-		httpClient:   &http.Client{Timeout: 5 * time.Minute},
+		httpClient: &http.Client{
+			// 不设全局 Timeout,超时由每次请求的 context deadline 控制(ag.TimeoutSeconds)。
+			// Transport 由 agent.NewGuardedTransport 构造,内置 SSRF 防护:
+			//   - Dialer.ControlContext 在 DNS 解析后、connect 前拦禁用 IP(防 DNS rebinding)。
+			//   - 连接池参数(MaxIdleConns/PerHost/MaxConnsPerHost)沿用原默认值。
+			// CheckRedirect 禁所有 redirect,避免 upstream 返回 302 指向元数据地址绕过校验。
+			Transport:     agent.NewGuardedTransport(cfg.AllowPrivateEndpoints),
+			CheckRedirect: agent.NoRedirectPolicy,
+		},
 	}
 }
 
@@ -116,7 +125,7 @@ func (s *chatService) Chat(ctx context.Context, req ChatServiceRequest) (*dto.Ch
 	}
 
 	// 构建 HTTP 请求
-	upstreamReq, err := s.buildHTTPRequest(ctx, ag, session, messages, false)
+	upstreamReq, err := s.buildHTTPRequest(ctx, ag, session, messages, false, req)
 	if err != nil {
 		//sayso-lint:ignore sentinel-wrap
 		return nil, err
@@ -146,18 +155,21 @@ func (s *chatService) Chat(ctx context.Context, req ChatServiceRequest) (*dto.Ch
 		return nil, err
 	}
 
-	// 存储 assistant 消息
+	// 存储 assistant 消息。client 可能在收到上游响应后立刻断开,
+	// 此时 ctx 已 cancel,落库要走 detached ctx,否则 GORM 会立刻 fail 丢消息。
+	saveCtx, saveCancel := detachedDBCtx(ctx)
+	defer saveCancel()
 	assistantMsg := &model.AgentMessage{
 		SessionID: session.SessionID,
 		Role:      agent.RoleAssistant,
 		Content:   content,
 	}
-	if err := s.repo.CreateMessage(ctx, assistantMsg); err != nil {
+	if err := s.repo.CreateMessage(saveCtx, assistantMsg); err != nil {
 		s.logger.ErrorCtx(ctx, "save assistant message failed", err, nil)
 	}
 
 	// 自动设置 session title
-	s.autoSetTitle(ctx, session, req.Message)
+	s.autoSetTitle(saveCtx, session, req.Message)
 
 	return &dto.ChatResponse{
 		SessionID: session.SessionID,
@@ -197,7 +209,8 @@ func (s *chatService) ChatStream(ctx context.Context, req ChatServiceRequest, wr
 		return "", err
 	}
 
-	upstreamReq, err := s.buildHTTPRequest(ctx, ag, session, messages, true)
+
+	upstreamReq, err := s.buildHTTPRequest(ctx, ag, session, messages, true, req)
 	if err != nil {
 		//sayso-lint:ignore sentinel-wrap
 		return "", err
@@ -227,14 +240,25 @@ func (s *chatService) ChatStream(ctx context.Context, req ChatServiceRequest, wr
 
 	// 流式转发 SSE
 	var contentBuf bytes.Buffer
+	clientGone := false
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 4096), agent.MaxSSELineBytes)
 	for scanner.Scan() {
+		// 客户端断开(请求 ctx 被 cancel)时立即退出,避免继续消耗上游 token。
+		if err := ctx.Err(); err != nil {
+			s.logger.WarnCtx(ctx, "client disconnected during stream, aborting upstream", map[string]any{
+				"session_id": session.SessionID, "error": err.Error(),
+			})
+			clientGone = true
+			break
+		}
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
+			//sayso-lint:ignore err-swallow
 			writer.WriteEvent("done", "{}")
 			writer.Flush()
 			break
@@ -242,26 +266,45 @@ func (s *chatService) ChatStream(ctx context.Context, req ChatServiceRequest, wr
 		// 解析 delta content
 		content := extractDeltaContent(data)
 		if content != "" {
-			contentBuf.WriteString(content)
+			if contentBuf.Len()+len(content) > agent.MaxStreamContentBytes {
+				s.logger.WarnCtx(ctx, "stream content exceeds limit, truncating", map[string]any{
+					"session_id": session.SessionID, "limit": agent.MaxStreamContentBytes,
+				})
+			} else {
+				contentBuf.WriteString(content)
+			}
 		}
-		// 原样转发 SSE 给客户端
-		writer.WriteEvent("chunk", data)
+		// 原样转发 SSE 给客户端;写失败意味着客户端已断开,停止继续读取上游。
+		if err := writer.WriteEvent("chunk", data); err != nil {
+			s.logger.WarnCtx(ctx, "write chunk failed, aborting stream", map[string]any{
+				"session_id": session.SessionID, "error": err.Error(),
+			})
+			
+			clientGone = true
+			break
+		}
 		writer.Flush()
 	}
+	if err := scanner.Err(); err != nil && !clientGone {
+		s.logger.WarnCtx(ctx, "SSE scanner error", map[string]any{"session_id": session.SessionID, "error": err.Error()})
+	}
 
-	// 存储完整 assistant 消息
+	// 存储完整 assistant 消息。client 中途断开时 ctx 已 cancel,
+	// 落库切到 detached ctx,避免已生成的回答因 ctx 取消被丢掉。
+	saveCtx, saveCancel := detachedDBCtx(ctx)
+	defer saveCancel()
 	if contentBuf.Len() > 0 {
 		assistantMsg := &model.AgentMessage{
 			SessionID: session.SessionID,
 			Role:      agent.RoleAssistant,
 			Content:   contentBuf.String(),
 		}
-		if err := s.repo.CreateMessage(ctx, assistantMsg); err != nil {
+		if err := s.repo.CreateMessage(saveCtx, assistantMsg); err != nil {
 			s.logger.ErrorCtx(ctx, "save streamed assistant message failed", err, nil)
 		}
 	}
 
-	s.autoSetTitle(ctx, session, req.Message)
+	s.autoSetTitle(saveCtx, session, req.Message)
 	return session.SessionID, nil
 }
 
@@ -270,6 +313,12 @@ func (s *chatService) ChatStream(ctx context.Context, req ChatServiceRequest, wr
 // ListSessions 分页列出指定用户在某 agent 下的所有对话 session。
 // 返回 ErrAgentInternal 当数据库查询失败时。
 func (s *chatService) ListSessions(ctx context.Context, orgID, userID, agentID uint64, page, size int) ([]dto.SessionResponse, int64, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if size <= 0 || size > agent.MaxPageSize {
+		size = agent.DefaultPageSize
+	}
 	list, total, err := s.repo.ListSessionsByUserAgent(ctx, orgID, userID, agentID, page, size)
 	if err != nil {
 		s.logger.ErrorCtx(ctx, "list sessions failed", err, map[string]any{"org_id": orgID, "user_id": userID, "agent_id": agentID})
@@ -301,6 +350,12 @@ func (s *chatService) GetSession(ctx context.Context, sessionID string, userID u
 // GetSessionMessages 分页获取某 session 下的消息列表。
 // 返回 ErrSessionNotFound、ErrSessionNotBelongToUser 或 ErrAgentInternal。
 func (s *chatService) GetSessionMessages(ctx context.Context, sessionID string, userID uint64, page, size int) ([]dto.MessageResponse, int64, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if size <= 0 || size > agent.MaxPageSize {
+		size = agent.DefaultPageSize
+	}
 	session, err := s.repo.FindSessionByID(ctx, sessionID)
 	if err != nil {
 		s.logger.WarnCtx(ctx, "get session messages: session not found", map[string]any{"session_id": sessionID})
@@ -334,12 +389,17 @@ func (s *chatService) DeleteSession(ctx context.Context, sessionID string, userI
 		s.logger.WarnCtx(ctx, "delete session: permission denied", map[string]any{"session_id": sessionID, "user_id": userID, "owner_id": session.UserID})
 		return fmt.Errorf("session not belong to user: %w", agent.ErrSessionNotBelongToUser)
 	}
-	// 先删消息,再删 session
-	if err := s.repo.DeleteMessagesBySession(ctx, sessionID); err != nil {
-		s.logger.ErrorCtx(ctx, "delete messages failed", err, nil)
-	}
-	if err := s.repo.DeleteSession(ctx, sessionID); err != nil {
-		s.logger.ErrorCtx(ctx, "delete session failed", err, map[string]any{"session_id": sessionID})
+	// 事务内先删消息再删 session,保证原子性
+	if err := s.repo.WithTx(ctx, func(tx repository.Repository) error {
+		if err := tx.DeleteMessagesBySession(ctx, sessionID); err != nil {
+			return fmt.Errorf("delete messages: %w", err)
+		}
+		if err := tx.DeleteSession(ctx, sessionID); err != nil {
+			return fmt.Errorf("delete session: %w", err)
+		}
+		return nil
+	}); err != nil {
+		s.logger.ErrorCtx(ctx, "delete session tx failed", err, map[string]any{"session_id": sessionID})
 		return fmt.Errorf("delete session: %w: %w", err, agent.ErrAgentInternal)
 	}
 	return nil
@@ -351,6 +411,10 @@ func (s *chatService) DeleteSession(ctx context.Context, sessionID string, userI
 // 返回 agent 和 session,可能返回 ErrAgentInvalidRequest、ErrSessionNotFound、
 // ErrSessionNotBelongToUser、ErrChatRateLimited、ErrAgentInternal 等错误。
 func (s *chatService) prepareChat(ctx context.Context, req ChatServiceRequest) (*model.Agent, *model.AgentSession, error) {
+	// 消息长度校验(按 rune 计数,对中文友好)
+	if len([]rune(req.Message)) > agent.MaxChatMessageLength {
+		return nil, nil, fmt.Errorf("message too long (max %d chars): %w", agent.MaxChatMessageLength, agent.ErrAgentInvalidRequest)
+	}
 	// 解析 agent
 	ag, err := s.registrySvc.LoadAgentByOwnerSlug(ctx, req.OwnerUID, req.AgentSlug)
 	if err != nil {
@@ -448,7 +512,7 @@ func (s *chatService) buildUpstreamMessages(ctx context.Context, ag *model.Agent
 // buildHTTPRequest 构建发送给上游 agent 的 HTTP 请求。
 // 包含 JSON body 序列化、认证 token 解密和 header 设置。
 // 返回 ErrAgentInternal(序列化/请求构建失败)或 ErrAgentCryptoFailed(token 解密失败)。
-func (s *chatService) buildHTTPRequest(ctx context.Context, ag *model.Agent, session *model.AgentSession, messages []map[string]string, stream bool) (*http.Request, error) {
+func (s *chatService) buildHTTPRequest(ctx context.Context, ag *model.Agent, session *model.AgentSession, messages []map[string]string, stream bool, csReq ChatServiceRequest) (*http.Request, error) {
 	body := map[string]any{
 		"messages": messages,
 		"stream":   stream,
@@ -486,6 +550,18 @@ func (s *chatService) buildHTTPRequest(ctx context.Context, ag *model.Agent, ses
 		req.Header.Set("X-Synapse-Session-ID", session.SessionID)
 	}
 
+	// org / user 上下文头。agent 不用来鉴权,只是让 agent 能在日志 / 限流 / 引用里
+	// 识别"哪个 org 的哪个用户在问"。未设置的字段不写 header。
+	if csReq.OrgID != 0 {
+		req.Header.Set("X-Synapse-Org-ID", strconv.FormatUint(csReq.OrgID, 10))
+	}
+	if csReq.OrgSlug != "" {
+		req.Header.Set("X-Synapse-Org-Slug", csReq.OrgSlug)
+	}
+	if csReq.CallerUserID != 0 {
+		req.Header.Set("X-Synapse-User-ID", strconv.FormatUint(csReq.CallerUserID, 10))
+	}
+
 	return req, nil
 }
 
@@ -493,7 +569,7 @@ func (s *chatService) buildHTTPRequest(ctx context.Context, ag *model.Agent, ses
 // 尝试 OpenAI choices 格式 → 简单 JSON 格式 → 纯文本回退。
 // 返回 ErrChatUpstreamUnreachable 当读取 body 失败或上游返回非 2xx 时。
 func (s *chatService) parseUpstreamResponse(ctx context.Context, resp *http.Response) (string, error) {
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, agent.MaxUpstreamResponseBytes))
 	if err != nil {
 		s.logger.ErrorCtx(ctx, "read upstream response body failed", err, map[string]any{"status": resp.StatusCode})
 		return "", fmt.Errorf("read upstream response: %w: %w", err, agent.ErrChatUpstreamUnreachable)
@@ -558,6 +634,14 @@ func extractDeltaContent(data string) string {
 	return ""
 }
 
+// detachedDBCtx 派生一个不被 parent cancel 影响、带短 timeout 的 ctx,
+// 用于流末/同步末的落库。client 在拿到上游响应后断开时,parent ctx 已 cancel,
+// 直接用它落库会被 GORM 立刻 fail,导致已生成的 assistant 内容丢失。
+// 5 秒足够覆盖一次正常的 INSERT/UPDATE,超过表示 DB 异常,该失败就失败。
+func detachedDBCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), 5*time.Second)
+}
+
 // autoSetTitle 在首次对话后自动设置 session title(取用户消息前 N 个字符)。
 // 如果 session 已有 title 则跳过。更新失败只记录日志不返回错误。
 func (s *chatService) autoSetTitle(ctx context.Context, session *model.AgentSession, userMessage string) {
@@ -565,8 +649,9 @@ func (s *chatService) autoSetTitle(ctx context.Context, session *model.AgentSess
 		return
 	}
 	title := userMessage
-	if len(title) > agent.MaxSessionTitleLength {
-		title = title[:agent.MaxSessionTitleLength]
+	runes := []rune(title)
+	if len(runes) > agent.MaxSessionTitleLength {
+		title = string(runes[:agent.MaxSessionTitleLength])
 	}
 	if err := s.repo.UpdateSessionTitle(ctx, session.SessionID, title); err != nil {
 		s.logger.ErrorCtx(ctx, "auto set session title failed", err, nil)

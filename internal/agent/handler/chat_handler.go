@@ -2,8 +2,11 @@
 package handler
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/eyrihe999-stack/Synapse/internal/agent/dto"
 	"github.com/eyrihe999-stack/Synapse/internal/agent/service"
@@ -85,14 +88,25 @@ func (h *AgentHandler) handleStreamChat(c *gin.Context, req service.ChatServiceR
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
 
+	// SSE 长连接:清掉 http.Server.WriteTimeout 对此连接的限制,
+	// 超时由 agent.TimeoutSeconds(service 层的 context.WithTimeout)独立控制。
+	if rc := http.NewResponseController(c.Writer); rc != nil {
+		if err := rc.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			h.logger.WarnCtx(c.Request.Context(), "clear SSE write deadline failed", map[string]any{"error": err.Error()})
+		}
+	}
+
 	writer := &ginSSEWriter{c: c}
 	//sayso-lint:ignore err-swallow
 	_, err := h.chatSvc.ChatStream(c.Request.Context(), req, writer)
 	if err != nil {
-		// 如果还没开始写 SSE,可以返回 JSON 错误
-		// 如果已经写了 SSE header,通过 error event 通知客户端
+		// 用 json.Marshal 而不是 sprintf,避免 err.Error() 含 " 或换行时 SSE event 变成非法 JSON。
+		payload, mErr := json.Marshal(map[string]string{"message": err.Error()})
+		if mErr != nil {
+			payload = []byte(`{"message":"internal error"}`)
+		}
 		//sayso-lint:ignore err-swallow
-		writer.WriteEvent("error", fmt.Sprintf(`{"message":"%s"}`, err.Error()))
+		writer.WriteEvent("error", string(payload))
 		writer.Flush()
 		h.logger.WarnCtx(c.Request.Context(), "stream chat error", map[string]any{"error": err.Error()})
 	}

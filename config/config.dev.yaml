@@ -1,17 +1,44 @@
 server:
   port: "8080"
   mode: debug
+  # read_timeout 0s = 不限制(上传/长 body 安全);slowloris 防护由代码里 ReadHeaderTimeout 10s 兜底。
+  read_timeout: 0s
+  # write_timeout 0s = 不限制整体写入(对 SSE 长流友好);单次对话超时由 agent.timeout_seconds 控制。
+  write_timeout: 0s
+  # idle_timeout 控制 keep-alive 连接闲置多久被回收,防止 fd 累积。
+  idle_timeout: 120s
+  # shutdown_timeout 优雅关闭时等待 in-flight 请求的最长时间(超过则切断 SSE 等长连接)。
+  shutdown_timeout: 30s
 
 database:
   mysql:
     host: 127.0.0.1
     port: 13306
     username: root
+    password: "123456"
+    database: synapse
+    # 每次 chat 流式请求占用 2-3 个连接(查 agent + 查/建 session + 写消息)。
+    # 生产侧按 "预期并发 chat 数 × 3 + 余量" 估算,例如 100 并发流建议 max_open_conns ≥ 300。
+    # 当前默认按 chat_rate_limit_per_minute=60 + ~50 并发用户估算,留 ~3x 余量。
+    max_open_conns: 200
+    # 保持 ~= 50% 的 max_open_conns,减少高峰期反复建连;空闲超过 conn_max_idle_time 自动回收。
+    max_idle_conns: 100
+    # 连接存活上限:防止 MySQL wait_timeout / LB 切主后复用到失效连接。
+    conn_max_lifetime: "1h"
+    # 空闲超时:突发后多余 idle 连接的回收节奏,必须短于 conn_max_lifetime。
+    conn_max_idle_time: "5m"
+  # 向量库(pgvector on Postgres)。host 留空 = 不启用,document 上传仍可工作,只是不做向量索引。
+  postgres:
+    host: 127.0.0.1
+    port: 15432
+    username: postgres
     password: "synapse123"
     database: synapse
-    max_open_conns: 25
-    max_idle_conns: 10
+    ssl_mode: disable
+    max_open_conns: 50
+    max_idle_conns: 25
     conn_max_lifetime: "1h"
+    conn_max_idle_time: "5m"
 
 redis:
   host: 127.0.0.1
@@ -31,6 +58,18 @@ jwt:
   issuer: synapse
   max_sessions_per_user: 5
 
+# OAuth 2.1 AS 配置(远端 MCP agent 接入)。issuer 留空 = 整个 OAuth 模块禁用,MCP 只走 legacy JWT 路径。
+# 生产环境务必:
+#   - issuer / mcp_resource_url 用公网可达的 HTTPS URL
+#   - signing_key / cookie_secret 走环境变量(OAUTH_SIGNING_KEY / OAUTH_COOKIE_SECRET),不写 yaml
+#   - cookie_secure: true
+oauth:
+  issuer: "https://breann-ungenuine-crusily.ngrok-free.dev"
+  signing_key: "synapse-dev-oauth-signing-key-change-me-32bytes-min"
+  cookie_secret: "synapse-dev-oauth-cookie-secret-change-me-32bytes"
+  mcp_resource_url: "https://breann-ungenuine-crusily.ngrok-free.dev/api/v2/retrieval/mcp"
+  cookie_secure: false
+
 snowflake:
   datacenter_id: 0
   worker_id: 0
@@ -43,4 +82,68 @@ organization:
 agent:
   default_max_context_rounds: 20
   chat_rate_limit_per_minute: 60
-  max_timeout_seconds: 300
+
+# 对象存储 —— 存放上传的原始文档、图片等。key 结构:{path_prefix}/{org_id}/{doc_id}/...
+# 生产环境把 access_key_* 放到 env:OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET。
+oss:
+  provider: aliyun
+  access_key_id: ""
+  access_key_secret: ""
+  region: "cn-hangzhou"
+  bucket: "lunalab-res"
+  endpoint: ""
+  domain: ""
+  # Synapse 独立前缀,避免和 sayso 的 `uploads/` 混用。
+  path_prefix: "synapse/docs"
+
+# 文档模块(仅上传存储)。
+document:
+  upload:
+    max_file_size_bytes: 10485760   # 10 MB
+    allowed_mime_types:
+      - text/markdown
+      - text/plain
+      - text/x-markdown
+
+# 向量化 provider 顶层配置。各模态独立一块,以后新增 image / code 时并列扩展。
+# provider: "fake" 可在无 Azure 环境下离线跑;"azure" 走下面 azure 子块。
+# 生产侧把 azure.api_key 放 env:AZURE_EMBEDDING_API_KEY。
+embedding:
+  text:
+    provider: azure
+    # text-embedding-3-large 原生 3072 维,但 pgvector HNSW 上限 2000 维。
+    # 用 Matryoshka 截断到 1536 维(API 层传 dimensions=1536),质量几乎无损且能走 HNSW。
+    # schema 侧是 vector(1536),改这里必须同步改 document_chunks.embedding 列定义。
+    model_dim: 1536
+    azure:
+      endpoint: "https://lunalabs-api.openai.azure.com/openai/v1/"
+      deployment: "text-embedding-3-large"
+      api_key: ""
+      api_version: "2024-10-21"
+
+# T1.2 二阶段重排(cross-encoder)。Provider 空串 = 禁用,SearchChunks 的 opts.Rerank 将 no-op。
+# 启用前需要单独起 TEI 服务:
+#   docker run -d -p 8082:80 --name synapse-tei ghcr.io/huggingface/text-embeddings-inference:cpu-latest \
+#     --model-id BAAI/bge-reranker-v2-m3
+# GPU 机器把镜像换成 :1.5 tag。
+reranker:
+  provider: ""  # "bge_tei" 启用
+  bge_tei:
+    base_url: "http://127.0.0.1:8082"
+    timeout: "5s"
+
+# 飞书集成(T2.1 用户级 OAuth 同步)。部署级配置:
+#   - base_url: 飞书区域(国内/海外)
+#   - redirect_uri: OAuth 回调(所有 org 共享),必须在开发者后台的"安全配置 → 重定向 URL"白名单里登记
+#   - frontend_redirect_url: 回调成功/失败后 302 跳到前端页面的基础 URL
+#
+# 应用凭证(app_id / app_secret)**不在此处** —— per org 存在 org_feishu_configs 表,
+# 由 org admin 在前端设置页填入。一个 Synapse 实例可服务多 org,各自接自家飞书 App。
+feishu:
+  base_url: ""  # 空 = 默认中国区
+  redirect_uri: "https://breann-ungenuine-crusily.ngrok-free.dev/api/v2/integrations/feishu/callback"  # 例如 http://localhost:8080/api/v2/integrations/feishu/callback
+  frontend_redirect_url: "http://localhost:3080/org/integrations/feishu"  # OAuth 完成后 302 回跳到飞书集成详情页,带 ?feishu=success|error;空 = 回调直接返 JSON
+
+# GitLab 集成(PAT 模式)。实例配置(base_url / insecure_skip_verify)**不在此处** ——
+# per org 存在 org_gitlab_configs 表,由 org admin 在前端设置页填入。
+# 一个 Synapse 实例可服务对接多个不同 GitLab(SaaS / 各自企业自建)的组织。

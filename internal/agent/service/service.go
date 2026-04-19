@@ -11,11 +11,16 @@ import (
 	"gorm.io/datatypes"
 )
 
-// Config agent 模块 service 层配置，包含默认上下文轮数、聊天限流和超时上限。
+// Config agent 模块 service 层配置,包含默认上下文轮数与聊天限流。
+// 注:单次请求超时上下界(Min/MaxTimeoutSeconds)是硬编码常量,见 internal/agent/const.go。
 type Config struct {
 	DefaultMaxContextRounds int
 	ChatRateLimitPerMinute  int
-	MaxTimeoutSeconds       int
+	// AllowPrivateEndpoints 是否允许 agent endpoint 指向 RFC1918 / IPv6 ULA 私网地址。
+	// Docker / K8s 同网络内部署 agent 时必须 true;agent 仅公网部署时可设 false 收紧。
+	// 注:loopback(127.x/::1)与 link-local(169.254.x,含云元数据)始终拦截,
+	// 与此开关无关。详见 internal/agent/endpoint_guard.go。
+	AllowPrivateEndpoints bool
 }
 
 // DefaultConfig 返回默认配置。
@@ -23,7 +28,7 @@ func DefaultConfig() Config {
 	return Config{
 		DefaultMaxContextRounds: agent.DefaultMaxContextRounds,
 		ChatRateLimitPerMinute:  agent.DefaultChatRateLimitPerMinute,
-		MaxTimeoutSeconds:       agent.MaxTimeoutSeconds,
+		AllowPrivateEndpoints:   true,
 	}
 }
 
@@ -88,6 +93,8 @@ func agentToDTO(a *model.Agent) dto.AgentResponse {
 		TimeoutSeconds:   a.TimeoutSeconds,
 		IconURL:          a.IconURL,
 		Tags:             unmarshalTags(a.Tags),
+		DataSources:      unmarshalDataSources(a.DataSources),
+		Version:          a.Version,
 		Status:           a.Status,
 		CreatedAt:        a.CreatedAt.Unix(),
 		UpdatedAt:        a.UpdatedAt.Unix(),
@@ -125,6 +132,8 @@ func publishToDTO(p *model.AgentPublish) dto.PublishResponse {
 		resp.AgentIconURL = p.Agent.IconURL
 		resp.AgentContextMode = p.Agent.ContextMode
 		resp.AgentTags = unmarshalTags(p.Agent.Tags)
+		resp.AgentVersion = p.Agent.Version
+		resp.AgentUpdatedAt = p.Agent.UpdatedAt.Unix()
 	}
 	return resp
 }
@@ -165,6 +174,30 @@ func marshalTags(tags []string) datatypes.JSON {
 
 // unmarshalTags 将 JSON 存储格式反序列化为字符串切片；数据为空或解析失败返回 nil。
 func unmarshalTags(data datatypes.JSON) []string {
+	if len(data) == 0 {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// marshalDataSources tags 一样的序列化(复用 JSON 数组存储格式)。
+func marshalDataSources(sources []string) datatypes.JSON {
+	if len(sources) == 0 {
+		return datatypes.JSON([]byte("[]"))
+	}
+	b, err := json.Marshal(sources)
+	if err != nil {
+		return datatypes.JSON([]byte("[]"))
+	}
+	return datatypes.JSON(b)
+}
+
+// unmarshalDataSources 反序列化 data_sources JSON。
+func unmarshalDataSources(data datatypes.JSON) []string {
 	if len(data) == 0 {
 		return nil
 	}

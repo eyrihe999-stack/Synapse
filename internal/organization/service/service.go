@@ -59,6 +59,9 @@ func BuildPresetRoles() []*model.OrgRole {
 		organization.PermAgentUnpublishSelf,
 		organization.PermAgentInvoke,
 		organization.PermAuditReadSelf,
+		// 文档权限:成员默认可读 + 可上传;删除留给 admin+(走 AllPermissions - OwnerOnly)。
+		organization.PermDocumentRead,
+		organization.PermDocumentWrite,
 	})
 
 	return []*model.OrgRole{

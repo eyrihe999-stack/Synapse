@@ -35,6 +35,8 @@ func (h *AgentHandler) handleServiceError(c *gin.Context, err error) {
 		c.JSON(http.StatusOK, response.BaseResponse{Code: agent.CodeAgentTimeoutOutOfRange, Message: "Timeout out of range"})
 	case errors.Is(err, agent.ErrAgentDisplayNameInvalid):
 		c.JSON(http.StatusOK, response.BaseResponse{Code: agent.CodeAgentDisplayNameInvalid, Message: "Invalid display name"})
+	case errors.Is(err, agent.ErrAgentTagsInvalid):
+		c.JSON(http.StatusOK, response.BaseResponse{Code: agent.CodeAgentTagsInvalid, Message: "Invalid tags"})
 	case errors.Is(err, agent.ErrPublishAlreadyExists):
 		c.JSON(http.StatusOK, response.BaseResponse{Code: agent.CodePublishAlreadyExists, Message: "Publish already exists"})
 	case errors.Is(err, agent.ErrPublishNotPending):

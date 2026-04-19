@@ -11,6 +11,11 @@ bin/
 synapse
 nexus
 sayso-lint
+evalretrieval
+feishu-sync
+goldrefresh
+goldseed
+reingest
 
 # Environment
 .env
@@ -32,6 +37,10 @@ vendor/
 
 # Claude Code tmp
 .claude/tmp/
+.claude/scheduled_tasks.lock
+
+# Evaluation outputs
+runs/
 
 # OS
 .DS_Store

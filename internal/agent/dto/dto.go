@@ -9,6 +9,7 @@ type CreateAgentRequest struct {
 	DisplayName      string   `json:"display_name" binding:"required"`
 	Description      string   `json:"description"`
 	AgentType        string   `json:"agent_type"`
+	Version          string   `json:"version"`
 	EndpointURL      string   `json:"endpoint_url" binding:"required"`
 	ContextMode      string   `json:"context_mode"`
 	MaxContextRounds int      `json:"max_context_rounds"`
@@ -16,12 +17,16 @@ type CreateAgentRequest struct {
 	TimeoutSeconds   int      `json:"timeout_seconds"`
 	IconURL          string   `json:"icon_url"`
 	Tags             []string `json:"tags"`
+	// DataSources 仅 agent_type=knowledge 有效;每项是数据源类型(如 "documents")。
+	DataSources []string `json:"data_sources,omitempty"`
 }
 
 // UpdateAgentRequest 部分更新 agent 请求。
 type UpdateAgentRequest struct {
 	DisplayName      *string  `json:"display_name,omitempty"`
 	Description      *string  `json:"description,omitempty"`
+	Version          *string  `json:"version,omitempty"`
+	AgentType        *string  `json:"agent_type,omitempty"`
 	EndpointURL      *string  `json:"endpoint_url,omitempty"`
 	ContextMode      *string  `json:"context_mode,omitempty"`
 	MaxContextRounds *int     `json:"max_context_rounds,omitempty"`
@@ -29,6 +34,9 @@ type UpdateAgentRequest struct {
 	TimeoutSeconds   *int     `json:"timeout_seconds,omitempty"`
 	IconURL          *string  `json:"icon_url,omitempty"`
 	Tags             []string `json:"tags,omitempty"`
+	// DataSources 支持整列表替换。传 nil/不传 = 不改;传空数组 = 清空。
+	// 仅 knowledge 类型接受非空值;其它类型传非空会被校验拒绝。
+	DataSources *[]string `json:"data_sources,omitempty"`
 }
 
 // AgentResponse agent 响应。
@@ -46,6 +54,8 @@ type AgentResponse struct {
 	TimeoutSeconds   int      `json:"timeout_seconds"`
 	IconURL          string   `json:"icon_url,omitempty"`
 	Tags             []string `json:"tags,omitempty"`
+	DataSources      []string `json:"data_sources,omitempty"`
+	Version          string   `json:"version"`
 	Status           string   `json:"status"`
 	CreatedAt        int64    `json:"created_at"`
 	UpdatedAt        int64    `json:"updated_at"`
@@ -55,7 +65,7 @@ type AgentResponse struct {
 
 // ChatRequest 对话请求。
 type ChatRequest struct {
-	Message   string `json:"message" binding:"required"`
+	Message   string `json:"message" binding:"required,max=32000"`
 	SessionID string `json:"session_id"`
 	Stream    bool   `json:"stream"`
 }
@@ -133,6 +143,8 @@ type PublishResponse struct {
 	AgentIconURL     string   `json:"agent_icon_url,omitempty"`
 	AgentContextMode string   `json:"agent_context_mode,omitempty"`
 	AgentTags        []string `json:"agent_tags,omitempty"`
+	AgentVersion     string   `json:"agent_version,omitempty"`
+	AgentUpdatedAt   int64    `json:"agent_updated_at,omitempty"`
 }
 
 // ─── 分页 ───────────────────────────────────────────────────────────────────

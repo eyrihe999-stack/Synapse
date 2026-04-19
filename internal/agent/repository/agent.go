@@ -6,7 +6,30 @@ import (
 	"fmt"
 
 	"github.com/eyrihe999-stack/Synapse/internal/agent/model"
+	"gorm.io/gorm/clause"
 )
+
+// cascadeDeleteBatchSize 大表级联删除单批行数。
+// 单批是 implicit tx,行数过大会持锁久、生成超长 binlog,卡住其他并发写。
+const cascadeDeleteBatchSize = 1000
+
+// batchDeleteExec 循环按 LIMIT 执行 DELETE,直到无行匹配。
+// 每批一个 implicit tx,不持长锁。sql 必须是单表 DELETE 语句且不带尾部 LIMIT(由本方法附加)。
+func (r *gormRepository) batchDeleteExec(ctx context.Context, sql string, args ...any) error {
+	stmt := sql + " LIMIT ?"
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		res := r.db.WithContext(ctx).Exec(stmt, append(args, cascadeDeleteBatchSize)...)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil
+		}
+	}
+}
 
 // CreateAgent 将新的 agent 记录写入数据库。
 func (r *gormRepository) CreateAgent(ctx context.Context, agent *model.Agent) error {
@@ -20,6 +43,20 @@ func (r *gormRepository) CreateAgent(ctx context.Context, agent *model.Agent) er
 func (r *gormRepository) FindAgentByID(ctx context.Context, id uint64) (*model.Agent, error) {
 	var a model.Agent
 	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&a).Error; err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// LockAgentByID 在事务内对 agent 行加 SELECT ... FOR UPDATE 行锁。
+// 用于串行化同一 agent 的并发状态变更(例如两个并发 publish 提交)。
+// 必须在 WithTx 内调用,否则行锁会随单句自动释放、起不到串行化作用。
+func (r *gormRepository) LockAgentByID(ctx context.Context, id uint64) (*model.Agent, error) {
+	var a model.Agent
+	if err := r.db.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ?", id).
+		First(&a).Error; err != nil {
 		return nil, err
 	}
 	return &a, nil
@@ -82,23 +119,23 @@ func (r *gormRepository) DeletePublishesByAgent(ctx context.Context, agentID uin
 	return nil
 }
 
-// DeleteSessionsByAgent 删除指定 agent 的所有 session 记录。
+// DeleteSessionsByAgent 删除指定 agent 的所有 session 记录(分批,避免长事务)。
 func (r *gormRepository) DeleteSessionsByAgent(ctx context.Context, agentID uint64) error {
-	if err := r.db.WithContext(ctx).
-		Where("agent_id = ?", agentID).
-		Delete(&model.AgentSession{}).Error; err != nil {
+	if err := r.batchDeleteExec(ctx,
+		"DELETE FROM agent_sessions WHERE agent_id = ?", agentID,
+	); err != nil {
 		return fmt.Errorf("delete sessions by agent: %w", err)
 	}
 	return nil
 }
 
-// DeleteMessagesByAgent 删除指定 agent 所有 session 下的消息。
+// DeleteMessagesByAgent 删除指定 agent 所有 session 下的消息(分批,避免长事务)。
+// 注意:必须在 DeleteSessionsByAgent 之前调用,因为子查询依赖 agent_sessions 还存在。
 func (r *gormRepository) DeleteMessagesByAgent(ctx context.Context, agentID uint64) error {
-	if err := r.db.WithContext(ctx).
-		Where("session_id IN (?)",
-			r.db.Model(&model.AgentSession{}).Select("session_id").Where("agent_id = ?", agentID),
-		).
-		Delete(&model.AgentMessage{}).Error; err != nil {
+	if err := r.batchDeleteExec(ctx,
+		"DELETE FROM agent_messages WHERE session_id IN (SELECT session_id FROM agent_sessions WHERE agent_id = ?)",
+		agentID,
+	); err != nil {
 		return fmt.Errorf("delete messages by agent: %w", err)
 	}
 	return nil
@@ -120,19 +157,23 @@ func (r *gormRepository) DeleteSecretsByAgent(ctx context.Context, agentID uint6
 	return nil
 }
 
-// DeleteInvocationPayloadsByAgent 删除指定 agent 所有调用的 payload 记录。
+// DeleteInvocationPayloadsByAgent 删除指定 agent 所有调用的 payload 记录(分批,避免长事务)。
+// 注意:必须在 DeleteInvocationsByAgent 之前调用,因为子查询依赖 agent_invocations 还存在。
 func (r *gormRepository) DeleteInvocationPayloadsByAgent(ctx context.Context, agentID uint64) error {
-	if err := r.db.WithContext(ctx).Exec(
-		"DELETE FROM agent_invocation_payloads WHERE invocation_id IN (SELECT invocation_id FROM agent_invocations WHERE agent_id = ?)", agentID,
-	).Error; err != nil {
+	if err := r.batchDeleteExec(ctx,
+		"DELETE FROM agent_invocation_payloads WHERE invocation_id IN (SELECT invocation_id FROM agent_invocations WHERE agent_id = ?)",
+		agentID,
+	); err != nil {
 		return fmt.Errorf("delete invocation payloads by agent: %w", err)
 	}
 	return nil
 }
 
-// DeleteInvocationsByAgent 删除指定 agent 的所有调用记录。
+// DeleteInvocationsByAgent 删除指定 agent 的所有调用记录(分批,避免长事务)。
 func (r *gormRepository) DeleteInvocationsByAgent(ctx context.Context, agentID uint64) error {
-	if err := r.db.WithContext(ctx).Exec("DELETE FROM agent_invocations WHERE agent_id = ?", agentID).Error; err != nil {
+	if err := r.batchDeleteExec(ctx,
+		"DELETE FROM agent_invocations WHERE agent_id = ?", agentID,
+	); err != nil {
 		return fmt.Errorf("delete invocations by agent: %w", err)
 	}
 	return nil

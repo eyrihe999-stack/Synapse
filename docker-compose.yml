@@ -13,6 +13,13 @@ services:
       - DB_DATABASE=synapse
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      # pgvector on Postgres;空值时 synapse 启动期向量能力降级。
+      - PG_HOST=synapse-pg
+      - PG_PORT=5432
+      - PG_USERNAME=postgres
+      - PG_PASSWORD=synapse123
+      - PG_DATABASE=synapse
+      - PG_SSL_MODE=disable
     networks:
       - synapse-net
     restart: unless-stopped

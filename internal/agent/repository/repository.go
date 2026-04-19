@@ -16,6 +16,9 @@ type Repository interface {
 	// ─── Agent ────────────────────────────────────────────────────────────
 	CreateAgent(ctx context.Context, agent *model.Agent) error
 	FindAgentByID(ctx context.Context, id uint64) (*model.Agent, error)
+	// LockAgentByID 在事务内对 agent 行加 SELECT ... FOR UPDATE 行锁,
+	// 用于串行化同一 agent 的并发状态变更(如发布提交)。必须在 WithTx 里调用。
+	LockAgentByID(ctx context.Context, id uint64) (*model.Agent, error)
 	FindAgentByOwnerSlug(ctx context.Context, ownerUserID uint64, slug string) (*model.Agent, error)
 	ListAgentsByOwner(ctx context.Context, ownerUserID uint64) ([]*model.Agent, error)
 	UpdateAgentFields(ctx context.Context, id uint64, updates map[string]any) error

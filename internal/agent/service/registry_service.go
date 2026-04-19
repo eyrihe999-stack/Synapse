@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"strings"
 
 	"github.com/eyrihe999-stack/Synapse/internal/agent"
 	"github.com/eyrihe999-stack/Synapse/internal/agent/dto"
@@ -29,17 +28,27 @@ type RegistryService interface {
 }
 
 type registryService struct {
+	cfg       Config
 	repo      repository.Repository
 	masterKey *agent.MasterKey
 	logger    logger.LoggerInterface
 }
 
-// NewRegistryService 创建 RegistryService 实例，注入仓库、主密钥和日志依赖。
-func NewRegistryService(repo repository.Repository, masterKey *agent.MasterKey, log logger.LoggerInterface) RegistryService {
-	return &registryService{repo: repo, masterKey: masterKey, logger: log}
+// NewRegistryService 创建 RegistryService 实例，注入配置、仓库、主密钥和日志依赖。
+// cfg.AllowPrivateEndpoints 控制 endpoint URL 校验是否放行 RFC1918 私网地址。
+func NewRegistryService(cfg Config, repo repository.Repository, masterKey *agent.MasterKey, log logger.LoggerInterface) RegistryService {
+	return &registryService{cfg: cfg, repo: repo, masterKey: masterKey, logger: log}
 }
 
 var slugRe = regexp.MustCompile(agent.AgentSlugPattern)
+
+// validateDataSources 校验 data_sources。knowledge 类型已撤,此字段当前在任何 agent 上都必须为空。
+func validateDataSources(agentType string, sources []string) error {
+	if len(sources) > 0 {
+		return fmt.Errorf("data_sources not supported, got type=%s: %w", agentType, agent.ErrAgentInvalidRequest)
+	}
+	return nil
+}
 
 // CreateAgent 创建新 agent，校验 slug / endpoint / display_name 等字段合法性后写入数据库。
 // 可能返回 ErrAgentSlugInvalid、ErrAgentEndpointInvalid、ErrAgentSlugTaken、ErrAgentInternal 等错误。
@@ -55,14 +64,19 @@ func (s *registryService) CreateAgent(ctx context.Context, userID uint64, req dt
 		s.logger.WarnCtx(ctx, "unsupported agent type", map[string]any{"agent_type": agentType})
 		return nil, fmt.Errorf("unsupported type: %w", agent.ErrAgentTypeUnsupported)
 	}
+	// 版本号（默认 0.1.0）
+	version := req.Version
+	if version == "" {
+		version = "0.1.0"
+	}
 	// 校验 slug
 	if !slugRe.MatchString(req.Slug) {
 		s.logger.WarnCtx(ctx, "invalid agent slug", map[string]any{"slug": req.Slug})
 		return nil, fmt.Errorf("invalid slug: %w", agent.ErrAgentSlugInvalid)
 	}
-	// 校验 endpoint
-	if err := validateEndpoint(req.EndpointURL); err != nil {
-		s.logger.WarnCtx(ctx, "invalid agent endpoint", map[string]any{"endpoint": req.EndpointURL})
+	// 校验 endpoint(含 SSRF 防护:拦 loopback / link-local / 配置决定是否拦私网)
+	if err := agent.ValidateEndpointURL(req.EndpointURL, s.cfg.AllowPrivateEndpoints); err != nil {
+		s.logger.WarnCtx(ctx, "invalid agent endpoint", map[string]any{"endpoint": req.EndpointURL, "error": err.Error()})
 		//sayso-lint:ignore sentinel-wrap
 		return nil, err
 	}
@@ -98,6 +112,18 @@ func (s *registryService) CreateAgent(ctx context.Context, userID uint64, req dt
 		s.logger.WarnCtx(ctx, "agent timeout out of range", map[string]any{"timeout_seconds": timeout})
 		return nil, fmt.Errorf("timeout out of range: %w", agent.ErrAgentTimeoutOutOfRange)
 	}
+	// tags
+	if err := validateTags(req.Tags); err != nil {
+		s.logger.WarnCtx(ctx, "invalid agent tags", map[string]any{"tags": req.Tags})
+		//sayso-lint:ignore sentinel-wrap
+		return nil, err
+	}
+	// data_sources:knowledge 必填且非空,其它类型必须为空
+	if err := validateDataSources(agentType, req.DataSources); err != nil {
+		s.logger.WarnCtx(ctx, "invalid agent data_sources", map[string]any{"agent_type": agentType, "data_sources": req.DataSources})
+		//sayso-lint:ignore sentinel-wrap
+		return nil, err
+	}
 	// slug 唯一性
 	//sayso-lint:ignore err-swallow
 	if _, err := s.repo.FindAgentByOwnerSlug(ctx, userID, req.Slug); err == nil {
@@ -130,6 +156,8 @@ func (s *registryService) CreateAgent(ctx context.Context, userID uint64, req dt
 		TimeoutSeconds:     timeout,
 		IconURL:            req.IconURL,
 		Tags:               marshalTags(req.Tags),
+		DataSources:        marshalDataSources(req.DataSources),
+		Version:            version,
 		Status:             model.AgentStatusActive,
 	}
 	if err := s.repo.CreateAgent(ctx, a); err != nil {
@@ -206,8 +234,8 @@ func (s *registryService) UpdateAgent(ctx context.Context, agentID, requesterUse
 		updates["description"] = *req.Description
 	}
 	if req.EndpointURL != nil {
-		if err := validateEndpoint(*req.EndpointURL); err != nil {
-			s.logger.WarnCtx(ctx, "invalid endpoint on update", map[string]any{"endpoint": *req.EndpointURL})
+		if err := agent.ValidateEndpointURL(*req.EndpointURL, s.cfg.AllowPrivateEndpoints); err != nil {
+			s.logger.WarnCtx(ctx, "invalid endpoint on update", map[string]any{"endpoint": *req.EndpointURL, "error": err.Error()})
 			//sayso-lint:ignore sentinel-wrap
 			return nil, err
 		}
@@ -250,7 +278,43 @@ func (s *registryService) UpdateAgent(ctx context.Context, agentID, requesterUse
 		updates["icon_url"] = *req.IconURL
 	}
 	if req.Tags != nil {
+		if err := validateTags(req.Tags); err != nil {
+			s.logger.WarnCtx(ctx, "invalid agent tags on update", map[string]any{"tags": req.Tags})
+			//sayso-lint:ignore sentinel-wrap
+			return nil, err
+		}
 		updates["tags"] = marshalTags(req.Tags)
+	}
+	if req.Version != nil {
+		updates["version"] = *req.Version
+	}
+	// AgentType + DataSources 要一起校验:因为 validateDataSources 取决于最终的 type。
+	// 组合出最终 type 和最终 sources,一并过一遍校验。
+	finalType := a.AgentType
+	if req.AgentType != nil {
+		if _, ok := agent.ValidAgentTypes[*req.AgentType]; !ok {
+			s.logger.WarnCtx(ctx, "unsupported agent type on update", map[string]any{"agent_type": *req.AgentType})
+			return nil, fmt.Errorf("unsupported type: %w", agent.ErrAgentTypeUnsupported)
+		}
+		finalType = *req.AgentType
+		updates["agent_type"] = *req.AgentType
+	}
+	if req.DataSources != nil || req.AgentType != nil {
+		// 任一字段变更都需要校验,以免出现 "新 type + 旧 sources" 这种不一致态。
+		finalSources := unmarshalDataSources(a.DataSources)
+		if req.DataSources != nil {
+			finalSources = *req.DataSources
+		}
+		if err := validateDataSources(finalType, finalSources); err != nil {
+			s.logger.WarnCtx(ctx, "invalid data_sources on update", map[string]any{
+				"agent_id": agentID, "agent_type": finalType, "data_sources": finalSources,
+			})
+			//sayso-lint:ignore sentinel-wrap
+			return nil, err
+		}
+		if req.DataSources != nil {
+			updates["data_sources"] = marshalDataSources(*req.DataSources)
+		}
 	}
 	if len(updates) > 0 {
 		if err := s.repo.UpdateAgentFields(ctx, agentID, updates); err != nil {
@@ -283,20 +347,30 @@ func (s *registryService) DeleteAgent(ctx context.Context, agentID, requesterUse
 		s.logger.WarnCtx(ctx, "delete agent denied, not author", map[string]any{"agent_id": agentID, "requester": requesterUserID})
 		return fmt.Errorf("not author: %w", agent.ErrAgentNotAuthor)
 	}
-	// 级联删除：payload → invocation → message → session → method → secret → publish → agent
+	// 级联删除拆成 3 步,避免一个长事务持锁卡住其他 chat 写入:
+	//   1. 先 ban,阻断 prepareChat 接受新对话(已 in-flight 的几秒内会自然结束)。
+	//   2. 大表(payload/invocation/message/session)分批删,每批独立 implicit tx。
+	//   3. 小表 + agent 行用一个事务,保证元数据原子清理。
+	// 这种拆法不再保证全过程原子,但每个删除幂等,失败重试 DeleteAgent 可继续清理残留。
+	if err := s.repo.UpdateAgentFields(ctx, agentID, map[string]any{"status": model.AgentStatusBanned}); err != nil {
+		s.logger.ErrorCtx(ctx, "ban agent before cascade delete failed", err, map[string]any{"agent_id": agentID})
+		return fmt.Errorf("ban agent: %w: %w", err, agent.ErrAgentInternal)
+	}
+	for _, step := range []struct {
+		name string
+		fn   func(context.Context, uint64) error
+	}{
+		{"invocation_payloads", s.repo.DeleteInvocationPayloadsByAgent},
+		{"invocations", s.repo.DeleteInvocationsByAgent},
+		{"messages", s.repo.DeleteMessagesByAgent},
+		{"sessions", s.repo.DeleteSessionsByAgent},
+	} {
+		if err := step.fn(ctx, agentID); err != nil {
+			s.logger.ErrorCtx(ctx, "cascade delete failed", err, map[string]any{"agent_id": agentID, "step": step.name})
+			return fmt.Errorf("cascade delete %s: %w: %w", step.name, err, agent.ErrAgentInternal)
+		}
+	}
 	if err := s.repo.WithTx(ctx, func(tx repository.Repository) error {
-		if err := tx.DeleteInvocationPayloadsByAgent(ctx, agentID); err != nil {
-			return err
-		}
-		if err := tx.DeleteInvocationsByAgent(ctx, agentID); err != nil {
-			return err
-		}
-		if err := tx.DeleteMessagesByAgent(ctx, agentID); err != nil {
-			return err
-		}
-		if err := tx.DeleteSessionsByAgent(ctx, agentID); err != nil {
-			return err
-		}
 		if err := tx.DeleteMethodsByAgent(ctx, agentID); err != nil {
 			return err
 		}
@@ -308,7 +382,7 @@ func (s *registryService) DeleteAgent(ctx context.Context, agentID, requesterUse
 		}
 		return tx.DeleteAgent(ctx, agentID)
 	}); err != nil {
-		s.logger.ErrorCtx(ctx, "delete agent failed", err, nil)
+		s.logger.ErrorCtx(ctx, "delete agent metadata failed", err, nil)
 		return fmt.Errorf("delete agent: %w: %w", err, agent.ErrAgentInternal)
 	}
 	s.logger.InfoCtx(ctx, "agent deleted", map[string]any{"agent_id": agentID})
@@ -346,16 +420,15 @@ func (s *registryService) DecryptAuthToken(ctx context.Context, a *model.Agent) 
 	return token, nil
 }
 
-// validateEndpoint 校验 endpoint URL，允许 http 和 https。
-// 可能返回 ErrAgentEndpointInvalid。
-func validateEndpoint(u string) error {
-	if u == "" {
-		//sayso-lint:ignore log-coverage
-		return fmt.Errorf("endpoint empty: %w", agent.ErrAgentEndpointInvalid)
+// validateTags 校验标签数量和单项长度。
+func validateTags(tags []string) error {
+	if len(tags) > agent.MaxTagsCount {
+		return fmt.Errorf("too many tags (max %d): %w", agent.MaxTagsCount, agent.ErrAgentTagsInvalid)
 	}
-	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-		//sayso-lint:ignore log-coverage
-		return fmt.Errorf("endpoint must be http or https: %w", agent.ErrAgentEndpointInvalid)
+	for _, t := range tags {
+		if len([]rune(t)) > agent.MaxTagLength || t == "" {
+			return fmt.Errorf("invalid tag (empty or exceeds %d chars): %w", agent.MaxTagLength, agent.ErrAgentTagsInvalid)
+		}
 	}
 	return nil
 }

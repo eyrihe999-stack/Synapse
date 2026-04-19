@@ -14,6 +14,9 @@ import (
 func RunMigrations(ctx context.Context, db *gorm.DB, log logger.LoggerInterface, onReady func()) error {
 	log.Info("agent: running migrations", nil)
 
+	// 兼容迁移：若 version 列已存在但有 NULL 值，先填充默认值
+	db.WithContext(ctx).Exec("UPDATE agents SET version = '0.1.0' WHERE version IS NULL OR version = ''")
+
 	if err := db.WithContext(ctx).AutoMigrate(
 		&model.Agent{},
 		&model.AgentSession{},

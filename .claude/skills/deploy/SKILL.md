@@ -89,13 +89,33 @@ docker push localhost:5001/${SERVICE}:latest
 
 ## 步骤 7：启动服务
 
-仅启动 TARGETS 中的服务，使用对应的 TAG 变量：
+**重要**：compose.yml 里 `image: localhost:5001/synapse:${SERVER_TAG:-latest}`。如果单服务部署时不设置另一个服务的 TAG 环境变量，compose 会把它解析为 `:latest`；若当前运行的容器是用显式 tag 启动的，compose 视为 config 变更，会连带 recreate 那个服务，并把它重新绑到 `:latest`。
 
-- 仅后端：`SERVER_TAG=${IMAGE_TAG} docker compose up -d synapse`
-- 仅前端：`WEB_TAG=${IMAGE_TAG} docker compose up -d synapse-web`
-- 全部：`SERVER_TAG=${IMAGE_TAG} WEB_TAG=${IMAGE_TAG} docker compose up -d`
+所以单服务部署前，必须先读取另一个服务当前运行的镜像 tag，并显式传回，保持它固定在原版本。
 
-这样只传对应服务的变量，另一个服务的镜像 tag 保持不变（默认 latest 或上次的值），不会被 recreate。
+```bash
+# 读取当前运行容器的 tag（失败则回落 latest）
+get_tag() {
+  docker inspect -f '{{.Config.Image}}' "$1" 2>/dev/null | awk -F: '{print $NF}' || echo latest
+}
+```
+
+- 仅后端：
+  ```bash
+  WEB_TAG_KEEP=$(get_tag synapse-synapse-web-1)
+  SERVER_TAG=${IMAGE_TAG} WEB_TAG=${WEB_TAG_KEEP} docker compose up -d synapse
+  ```
+- 仅前端：
+  ```bash
+  SERVER_TAG_KEEP=$(get_tag synapse-synapse-1)
+  SERVER_TAG=${SERVER_TAG_KEEP} WEB_TAG=${IMAGE_TAG} docker compose up -d synapse-web
+  ```
+- 全部：
+  ```bash
+  SERVER_TAG=${IMAGE_TAG} WEB_TAG=${IMAGE_TAG} docker compose up -d
+  ```
+
+这样另一个服务的镜像引用与其运行中的容器完全一致，compose 不会 recreate 它。
 
 ## 步骤 8：健康检查
 

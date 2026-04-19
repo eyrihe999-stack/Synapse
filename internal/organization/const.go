@@ -91,9 +91,26 @@ const (
 	PermAuditRead = "audit.read"
 	// PermAuditReadSelf 仅查看"和我相关"的调用审计(调用者=我 或 被调 agent=我发布的)
 	PermAuditReadSelf = "audit.read.self"
+
+	// ─ Document 管理类(3 个) ─
+	// 权限点集中在 organization,由 document 模块消费(参考 Agent 管理类同样的分层)。
+
+	// PermDocumentRead 在本 org 检索 / 读取文档。
+	PermDocumentRead = "document.read"
+	// PermDocumentWrite 上传 / 更新文档。
+	PermDocumentWrite = "document.write"
+	// PermDocumentDelete 删除文档(含他人上传的)。
+	PermDocumentDelete = "document.delete"
+
+	// ─ Integration 管理类(1 个) ─
+	// 由 integration 模块消费(参考 Agent/Document 同样的分层)。
+
+	// PermIntegrationManage 管理组织级第三方集成应用凭证(目前覆盖飞书 app_id / app_secret,未来 google / slack 同此权限)。
+	// 不影响成员自己点"连接账号"走 OAuth —— 那是用户级操作,只需 JWT。
+	PermIntegrationManage = "integration.manage"
 )
 
-// AllPermissions 列出所有 15 个权限点,用于:
+// AllPermissions 列出所有权限点,用于:
 //   - 前端展示权限选择面板
 //   - 自定义角色创建时校验权限是否合法
 //   - owner 预设角色初始化
@@ -116,6 +133,10 @@ var AllPermissions = []string{
 	PermAgentInvoke,
 	PermAuditRead,
 	PermAuditReadSelf,
+	PermDocumentRead,
+	PermDocumentWrite,
+	PermDocumentDelete,
+	PermIntegrationManage,
 }
 
 // OwnerOnlyPermissions 是 owner 独占的权限点,自定义角色不能勾选。

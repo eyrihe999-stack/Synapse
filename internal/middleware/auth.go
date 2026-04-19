@@ -3,6 +3,7 @@ package middleware
 import (
 	"strings"
 
+	oauthsvc "github.com/eyrihe999-stack/Synapse/internal/oauth/service"
 	"github.com/eyrihe999-stack/Synapse/internal/user"
 	"github.com/eyrihe999-stack/Synapse/pkg/response"
 	"github.com/eyrihe999-stack/Synapse/pkg/utils"
@@ -145,6 +146,64 @@ func JWTAuthWithSession(jwtManager *utils.JWTManager, sessionStore user.SessionS
 		c.Set("device_id", deviceID)
 		c.Set("jwt_claims", claims)
 
+		c.Next()
+	}
+}
+
+// BearerAuth 双向兼容:先尝试 OAuth access token(agent CLI 走这条),失败再试 web JWT(浏览器 / webapp)。
+//
+// 为什么需要:
+//   - agent CLI 用 OAuth desktop flow 拿到的是 oauth-access+jwt(自己的 signing key)
+//   - web UI 登录拿到的是 web JWT(JWT.SecretKey 签)
+// 两者签名密钥不同,只认一种的 middleware 会拒另一种。
+//
+// oauthSvc 为 nil 时退化等同 JWTAuth(OAuth 模块没启用时的安全兜底)。
+//
+// 上下文注入:
+//   - OAuth 路径:user_id 来自 claims.Subject,另设 oauth_claims(含 org_id / scope)
+//   - JWT 路径:和 JWTAuth 保持一致(user_id / user_email / device_id / jwt_claims)
+func BearerAuth(jwtManager *utils.JWTManager, oauthSvc oauthsvc.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" {
+			response.Unauthorized(c, "Missing authorization header", "")
+			c.Abort()
+			return
+		}
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			response.Unauthorized(c, "Invalid authorization header format", "Expected: Bearer <token>")
+			c.Abort()
+			return
+		}
+		token := parts[1]
+
+		// 1) 先试 OAuth(若启用)。ValidateAccessToken 内部强制 typ=oauth-access+jwt,
+		// 传来的 web JWT 会因 typ 不匹配被拒,不会误通过。
+		if oauthSvc != nil {
+			if claims, err := oauthSvc.ValidateAccessToken(token); err == nil {
+				c.Set("user_id", claims.Subject)
+				c.Set("oauth_claims", claims)
+				c.Next()
+				return
+			}
+		}
+
+		// 2) 回落 web JWT
+		claims, err := jwtManager.ValidateAccessToken(token)
+		if err != nil {
+			if err == utils.ErrExpiredToken {
+				response.Unauthorized(c, "Token has expired", "Please refresh your token")
+			} else {
+				response.Unauthorized(c, "Invalid token", err.Error())
+			}
+			c.Abort()
+			return
+		}
+		c.Set("user_id", claims.UserID)
+		c.Set("user_email", claims.Email)
+		c.Set("device_id", claims.DeviceID)
+		c.Set("jwt_claims", claims)
 		c.Next()
 	}
 }

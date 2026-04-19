@@ -1,0 +1,411 @@
+# 由 cmd/goldseed 生成。人工补 query 和 expected_chunk_keywords 后跑 cmd/evalretrieval。
+# 一篇想测多种问法就复制整个条目,改 id 和 query。
+entries:
+  - id: "1"
+    query: "企业版agent网络是怎么实现的"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506089821257728]  # 多相关文档时追加 id,如 [303505962561880064, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=enterprise-org-agent | file=enterprise-org-agent.md | preview=# 企业版 Sayso:Organization + Agent 实现方案 > 状态:需求对齐完成,待实现 > 创建日期:2026-04-15 > 相关模块:新增 `internal/organization/` + `internal/a..."
+
+  - id: "1001"
+    query: "sayso企业版方案"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506089821257728]  # 多相关文档时追加 id,如 [303505962561880064, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=enterprise-org-agent | file=enterprise-org-agent.md | preview=# 企业版 Sayso:Organization + Agent 实现方案 > 状态:需求对齐完成,待实现 > 创建日期:2026-04-15 > 相关模块:新增 `internal/organization/` + `internal/a..."
+
+  - id: "2"
+    query: "客户端版本管理是怎么做的"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506089422798848,303506055105003520]  # 多相关文档时追加 id,如 [303505963572707328, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=client-version-management | file=client-version-management.md | preview=# PC 客户端版本管理 — clientversion 模块实现方案 ## Context PRD 要求新增 PC 客户端版本管理后台，支持 Mac/Windows 双平台版本 CRUD、全局配置（官网关联版本 + 强制最低版本）、客户端..."
+
+  - id: "2001"
+    query: "客户端版本管理的数据模型"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506089422798848,303506055105003520]  # 多相关文档时追加 id,如 [303505963572707328, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=client-version-management | file=client-version-management.md | preview=# PC 客户端版本管理 — clientversion 模块实现方案 ## Context PRD 要求新增 PC 客户端版本管理后台，支持 Mac/Windows 双平台版本 CRUD、全局配置（官网关联版本 + 强制最低版本）、客户端..."
+
+  - id: "2002"
+    query: "客户端版本管理的api有哪些"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506089422798848,303506055105003520]  # 多相关文档时追加 id,如 [303505963572707328, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=client-version-management | file=client-version-management.md | preview=# PC 客户端版本管理 — clientversion 模块实现方案 ## Context PRD 要求新增 PC 客户端版本管理后台，支持 Mac/Windows 双平台版本 CRUD、全局配置（官网关联版本 + 强制最低版本）、客户端..."
+
+  - id: "3"
+    query: "订单系统是怎么做的"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506087367589888]  # 多相关文档时追加 id,如 [303505963581095936, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Order 模块架构文档 ## 概览 Order 模块负责管理用户订单的完整生命周期：预下单、支付结算、取消和关闭。核心实体包括 **订单**（`v2_orders`）和 **用户订单锁**（`v2_user_order_locks`）..."
+
+  - id: "3001"
+    query: "sayso order api文档"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506087367589888]  # 多相关文档时追加 id,如 [303505963581095936, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Order 模块架构文档 ## 概览 Order 模块负责管理用户订单的完整生命周期：预下单、支付结算、取消和关闭。核心实体包括 **订单**（`v2_orders`）和 **用户订单锁**（`v2_user_order_locks`）..."
+
+  - id: "3002"
+    query: "sayso order 问题排查，系统设计"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506087367589888, 303506082120515584]  # 多相关文档时追加 id,如 [303505963581095936, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Order 模块架构文档 ## 概览 Order 模块负责管理用户订单的完整生命周期：预下单、支付结算、取消和关闭。核心实体包括 **订单**（`v2_orders`）和 **用户订单锁**（`v2_user_order_locks`）..."
+
+  - id: "3003"
+    query: "订单模块的后端实现详细文档"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506087367589888]  # 多相关文档时追加 id,如 [303505963581095936, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Order 模块架构文档 ## 概览 Order 模块负责管理用户订单的完整生命周期：预下单、支付结算、取消和关闭。核心实体包括 **订单**（`v2_orders`）和 **用户订单锁**（`v2_user_order_locks`）..."
+
+  - id: "4"
+    query: "订单模块测试报告"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506082120515584]  # 多相关文档时追加 id,如 [303505977338413056, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=test-summary | file=test-summary.md | preview=# Order 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 11 | | 顶层 Test 函数数 | 24 | | 子测试用例数 | 39 | | 总行数 | 2065 | | 场景..."
+
+  - id: "4001"
+    query: "sayso order模块测试报告"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506082120515584]  # 多相关文档时追加 id,如 [303505977338413056, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=test-summary | file=test-summary.md | preview=# Order 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 11 | | 顶层 Test 函数数 | 24 | | 子测试用例数 | 39 | | 总行数 | 2065 | | 场景..."
+
+  - id: "5"
+    query: "人拉人活动架构文档"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506074197475328]  # 多相关文档时追加 id,如 [303505979448147968, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Referral 模块架构文档 ## 概览 referral 模块实现用户邀请（referral）体系，核心功能包括： - **邀请码管理**：为每位用户生成唯一邀请码 - **邀请码兑换**：新用户提交邀请码后，双方获得权益奖励 - ..."
+
+  - id: "5001"
+    query: "人拉人活动api文档"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506074197475328]  # 多相关文档时追加 id,如 [303505979448147968, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Referral 模块架构文档 ## 概览 referral 模块实现用户邀请（referral）体系，核心功能包括： - **邀请码管理**：为每位用户生成唯一邀请码 - **邀请码兑换**：新用户提交邀请码后，双方获得权益奖励 - ..."
+
+  - id: "5002"
+    query: "人拉人活动问题排查，错误码"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506074197475328, 303506067880853504]  # 多相关文档时追加 id,如 [303505979448147968, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Referral 模块架构文档 ## 概览 referral 模块实现用户邀请（referral）体系，核心功能包括： - **邀请码管理**：为每位用户生成唯一邀请码 - **邀请码兑换**：新用户提交邀请码后，双方获得权益奖励 - ..."
+
+  - id: "6"
+    query: "人拉人模块测试报告"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506067880853504]  # 多相关文档时追加 id,如 [303505987287302144, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=test-summary | file=test-summary.md | preview=# Referral 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 11 | | 顶层 Test 函数数 | 17 | | 子测试用例数 | 21 | | 总行数 | 1045 | |..."
+
+  - id: "6001"
+    query: "人拉人模块有哪些测试链路"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506067880853504]  # 多相关文档时追加 id,如 [303505987287302144, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=test-summary | file=test-summary.md | preview=# Referral 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 11 | | 顶层 Test 函数数 | 17 | | 子测试用例数 | 21 | | 总行数 | 1045 | |..."
+
+  - id: "7"
+    query: "热词模块架构文档呢"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506064164700160]  # 多相关文档时追加 id,如 [303506000700686336, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Hotword 模块架构文档 ## 概览 Hotword 模块负责管理用户自定义的 ASR 热词（speech-to-text vocabulary boosting），并在 WebSocket 会话中向 ASR 适配器提供「系统关键词..."
+
+  - id: "7001"
+    query: "热词模块api文档"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506064164700160]  # 多相关文档时追加 id,如 [303506000700686336, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Hotword 模块架构文档 ## 概览 Hotword 模块负责管理用户自定义的 ASR 热词（speech-to-text vocabulary boosting），并在 WebSocket 会话中向 ASR 适配器提供「系统关键词..."
+
+  - id: "7002"
+    query: "热词模块问题排查"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506064164700160, 303506062008827904]  # 多相关文档时追加 id,如 [303506000700686336, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Hotword 模块架构文档 ## 概览 Hotword 模块负责管理用户自定义的 ASR 热词（speech-to-text vocabulary boosting），并在 WebSocket 会话中向 ASR 适配器提供「系统关键词..."
+
+  - id: "8"
+    query: "热词模块测试报告"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506062008827904]  # 多相关文档时追加 id,如 [303506005754822656, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=test-summary | file=test-summary.md | preview=# Hotword 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 9 | | 顶层 Test 函数数 | 29 | | 子测试用例数 | 55 | | 总行数 | 1790 | | 场..."
+
+  - id: "8001"
+    query: "热词模块代码测试链路"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506062008827904]  # 多相关文档时追加 id,如 [303506005754822656, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=test-summary | file=test-summary.md | preview=# Hotword 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 9 | | 顶层 Test 函数数 | 29 | | 子测试用例数 | 55 | | 总行数 | 1790 | | 场..."
+
+  - id: "9"
+    query: "登录模块架构文档"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506053754437632]  # 多相关文档时追加 id,如 [303506007977803776, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Auth 模块架构文档 ## 概览 Auth 模块负责用户认证和会话管理，是系统的核心基础模块。核心职责： - **多渠道认证**：手机号短信验证码、邮箱验证码、Google OAuth（ID Token + Authorization..."
+
+  - id: "9001"
+    query: "登录模块API文档"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506053754437632]  # 多相关文档时追加 id,如 [303506007977803776, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Auth 模块架构文档 ## 概览 Auth 模块负责用户认证和会话管理，是系统的核心基础模块。核心职责： - **多渠道认证**：手机号短信验证码、邮箱验证码、Google OAuth（ID Token + Authorization..."
+
+  - id: "9002"
+    query: "登录模块问题排查"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506053754437632, 303506035031064576]  # 多相关文档时追加 id,如 [303506007977803776, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Auth 模块架构文档 ## 概览 Auth 模块负责用户认证和会话管理，是系统的核心基础模块。核心职责： - **多渠道认证**：手机号短信验证码、邮箱验证码、Google OAuth（ID Token + Authorization..."
+
+  - id: "10"
+    query: "登录模块测试报告"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506035031064576]  # 多相关文档时追加 id,如 [303506019419865088, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=test-summary | file=test-summary.md | preview=# Auth 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 19 | | 顶层 Test 函数数 | 56 | | 子测试用例数 | 162 | | 总行数 | 4204 | | 场景..."
+
+  - id: "11"
+    query: "支付宝支付相关"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506032208297984, 303506026764091392]  # 多相关文档时追加 id,如 [303506026764091392, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Alipay 模块架构文档 ## 概览 alipay 模块负责支付宝支付集成，是用户侧付费流程的核心模块。主要职责： - **预下单**：调用支付宝 TradePreCreate API 生成付款二维码 - **异步通知处理**：接收支..."
+
+  - id: "11001"
+    query: "支付宝模块架构文档"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506032208297984]  # 多相关文档时追加 id,如 [303506026764091392, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Alipay 模块架构文档 ## 概览 alipay 模块负责支付宝支付集成，是用户侧付费流程的核心模块。主要职责： - **预下单**：调用支付宝 TradePreCreate API 生成付款二维码 - **异步通知处理**：接收支..."
+
+  - id: "11002"
+    query: "支付宝模块问题排查"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506032208297984, 303506026764091392]  # 多相关文档时追加 id,如 [303506026764091392, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Alipay 模块架构文档 ## 概览 alipay 模块负责支付宝支付集成，是用户侧付费流程的核心模块。主要职责： - **预下单**：调用支付宝 TradePreCreate API 生成付款二维码 - **异步通知处理**：接收支..."
+
+  - id: "11003"
+    query: "支付宝功能测试报告"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506026764091392]  # 多相关文档时追加 id,如 [303506032208297984, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=test-summary | file=test-summary.md | preview=# Alipay 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 13 | | 顶层 Test 函数数 | 39 | | 子测试用例数 | 55 | | 总行数 | 1800 | | 场..."
+
+  - id: "13"
+    query: "用户反馈，feedback相关功能架构实现"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506019419865088]  # 多相关文档时追加 id,如 [303506035031064576, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Feedback 模块架构文档 ## 概览 Feedback 模块负责收集、查询、审核用户反馈，并在审核通过后按配置发放权益奖励。核心实体为 `V2Feedback`（`v2_feedbacks` 表）。 - **用户侧**：鉴权后可创..."
+
+  - id: "13001"
+    query: "用户反馈，feedback相关功能问题排查"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506019419865088, 303506007977803776]  # 多相关文档时追加 id,如 [303506035031064576, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=architecture | file=architecture.md | preview=# Feedback 模块架构文档 ## 概览 Feedback 模块负责收集、查询、审核用户反馈，并在审核通过后按配置发放权益奖励。核心实体为 `V2Feedback`（`v2_feedbacks` 表）。 - **用户侧**：鉴权后可创..."
+
+  - id: "14"
+    query: "feedback模块测试报告"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506007977803776]  # 多相关文档时追加 id,如 [303506053754437632, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=test-summary | file=test-summary.md | preview=# Feedback 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 10 | | 顶层 Test 函数数 | 22 | | 子测试用例数 | 43 | | 总行数 | 1663 | |..."
+
+  - id: "15"
+    query: "用户权益体系架构"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506005754822656]  # 多相关文档时追加 id,如 [303506055105003520, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=architecture | file=architecture.md | preview=# Entitlement 模块架构文档 ## 概览 Entitlement（权益）模块负责用户权益的全生命周期管理，包括试用发放、付费购买、奖励发放、过期回收及 Stripe 订阅集成。模块采用 **账本（Ledger）+ 快照（Snap..."
+
+  - id: "15001"
+    query: "用户权益体系说明文档"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506005754822656]  # 多相关文档时追加 id,如 [303506055105003520, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=architecture | file=architecture.md | preview=# Entitlement 模块架构文档 ## 概览 Entitlement（权益）模块负责用户权益的全生命周期管理，包括试用发放、付费购买、奖励发放、过期回收及 Stripe 订阅集成。模块采用 **账本（Ledger）+ 快照（Snap..."
+
+  - id: "15002"
+    query: "用户权益体系问题排查"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506005754822656, 303506000700686336]  # 多相关文档时追加 id,如 [303506055105003520, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=architecture | file=architecture.md | preview=# Entitlement 模块架构文档 ## 概览 Entitlement（权益）模块负责用户权益的全生命周期管理，包括试用发放、付费购买、奖励发放、过期回收及 Stripe 订阅集成。模块采用 **账本（Ledger）+ 快照（Snap..."
+
+  - id: "16"
+    query: "用户权益体系测试报告"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303506000700686336]  # 多相关文档时追加 id,如 [303506062008827904, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=test-summary | file=test-summary.md | preview=# Entitlement 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 28 | | 顶层 Test 函数数 | 126 | | 子测试用例数 | 226 | | 总行数 | 725..."
+
+  - id: "17"
+    query: "ws websocket模块后端架构"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303505987287302144]  # 多相关文档时追加 id,如 [303506064164700160, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=architecture | file=architecture.md | preview=# WS 模块架构文档 ## 概览 ws 模块提供实时语音转写与智能文本处理能力，支持两种接入方式： 1. **WebSocket 流式接入**（`/ws/v2/audio`）：客户端通过 WebSocket 连接实时推送音频流，服务端进行..."
+
+  - id: "17001"
+    query: "ws问题排查"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303505987287302144, 303505979448147968]  # 多相关文档时追加 id,如 [303506064164700160, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=architecture | file=architecture.md | preview=# WS 模块架构文档 ## 概览 ws 模块提供实时语音转写与智能文本处理能力，支持两种接入方式： 1. **WebSocket 流式接入**（`/ws/v2/audio`）：客户端通过 WebSocket 连接实时推送音频流，服务端进行..."
+
+  - id: "17002"
+    query: "ws相关api"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303505987287302144]  # 多相关文档时追加 id,如 [303506064164700160, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=architecture | file=architecture.md | preview=# WS 模块架构文档 ## 概览 ws 模块提供实时语音转写与智能文本处理能力，支持两种接入方式： 1. **WebSocket 流式接入**（`/ws/v2/audio`）：客户端通过 WebSocket 连接实时推送音频流，服务端进行..."
+
+  - id: "18"
+    query: "ws测试报告"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303505979448147968]  # 多相关文档时追加 id,如 [303506067880853504, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=test-summary | file=test-summary.md | preview=# WS 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 34 | | 顶层 Test 函数数 | 141 | | 子测试用例数 | 107 | | 总行数 | 2973 | | 场景覆..."
+
+  - id: "19"
+    query: "用户数据分析模块体系"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303505977338413056]  # 多相关文档时追加 id,如 [303506074197475328, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=architecture | file=architecture.md | preview=# Analytics 模块架构文档 ## 概览 Analytics 模块负责维护用户累计使用统计（字数、录音时长、AI 交互次数），为用户端的\"数据看板\"提供查询接口，并在历史数据存在时提供一次性回填能力。核心实体为 `UserAnaly..."
+
+  - id: "19001"
+    query: "用户数据分析模块架构"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303505977338413056]  # 多相关文档时追加 id,如 [303506074197475328, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=architecture | file=architecture.md | preview=# Analytics 模块架构文档 ## 概览 Analytics 模块负责维护用户累计使用统计（字数、录音时长、AI 交互次数），为用户端的\"数据看板\"提供查询接口，并在历史数据存在时提供一次性回填能力。核心实体为 `UserAnaly..."
+
+  - id: "19002"
+    query: "用户数据分析模块问题排查"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303505977338413056, 303505963581095936]  # 多相关文档时追加 id,如 [303506074197475328, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=architecture | file=architecture.md | preview=# Analytics 模块架构文档 ## 概览 Analytics 模块负责维护用户累计使用统计（字数、录音时长、AI 交互次数），为用户端的\"数据看板\"提供查询接口，并在历史数据存在时提供一次性回填能力。核心实体为 `UserAnaly..."
+
+  - id: "20"
+    query: "用户数据分析模块测试报告"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303505963581095936]  # 多相关文档时追加 id,如 [303506082120515584, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: test
+    notes: "title=test-summary | file=test-summary.md | preview=# Analytics 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 7 | | 顶层 Test 函数数 | 8 | | 子测试用例数 | 12 | | 总行数 | 532 | | 场..."
+
+  - id: "21"
+    query: "stripe支付相关实现"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303505963572707328]  # 多相关文档时追加 id,如 [303506087367589888, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=architecture | file=architecture.md | preview=# Stripe 模块架构文档 ## 概览 Stripe 模块是系统的国际支付渠道，实现 Stripe Checkout 一次性支付和 Stripe Subscription 周期订阅两种支付模式。模块本身**不持有订单或权益数据**，而是..."
+
+  - id: "21002"
+    query: "stripe支付架构文档"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303505963572707328]  # 多相关文档时追加 id,如 [303506087367589888, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=architecture | file=architecture.md | preview=# Stripe 模块架构文档 ## 概览 Stripe 模块是系统的国际支付渠道，实现 Stripe Checkout 一次性支付和 Stripe Subscription 周期订阅两种支付模式。模块本身**不持有订单或权益数据**，而是..."
+
+  - id: "21001"
+    query: "stripe支付相关api"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303505963572707328]  # 多相关文档时追加 id,如 [303506087367589888, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: arch
+    notes: "title=architecture | file=architecture.md | preview=# Stripe 模块架构文档 ## 概览 Stripe 模块是系统的国际支付渠道，实现 Stripe Checkout 一次性支付和 Stripe Subscription 周期订阅两种支付模式。模块本身**不持有订单或权益数据**，而是..."
+
+  - id: "22"
+    query: "stripe模块测试报告"  # TODO: 写一个查询,例如 "XX 模块的 YY 是怎么实现的"
+    expected_doc_ids: [303505962561880064]  # 多相关文档时追加 id,如 [303506089422798848, 123456]
+    expected_chunk_keywords: []  # TODO: 期望命中 chunk 里出现的关键词 (any-of)
+    tag: ""
+    notes: "title=test-summary | file=test-summary.md | preview=# Stripe 模块测试总结 ## 概览 | 指标 | 数值 | |------|------| | 测试文件数 | 9 | | 顶层 Test 函数数 | 28 | | 子测试用例数 | 44 | | 总行数 | 1391 | | 场景..."
+
+  # ─── 关键词 / 精确串 query (测 T1.1 混合检索 BM25 路的价值) ───
+
+  - id: "100"
+    query: "V2Feedback 表"
+    expected_doc_ids: [303506019419865088]
+    expected_chunk_keywords: [V2Feedback, v2_feedbacks]
+    tag: keyword
+    notes: "title=architecture | file=architecture.md | preview=# Feedback 模块架构文档 ## 概览 Feedback 模块负责收集、查询、审核用户反馈，并在审核通过后按配置发放权益奖励。核心实体为 `V2Feedback`（`v2_feedbacks` 表）。 - **用户侧**：鉴权后可创..."
+
+  - id: "101"
+    query: "v2_orders 表结构"
+    expected_doc_ids: [303506087367589888]
+    expected_chunk_keywords: [v2_orders]
+    tag: keyword
+    notes: "title=architecture | file=architecture.md | preview=# Order 模块架构文档 ## 概览 Order 模块负责管理用户订单的完整生命周期：预下单、支付结算、取消和关闭。核心实体包括 **订单**（`v2_orders`）和 **用户订单锁**（`v2_user_order_locks`）..."
+
+  - id: "102"
+    query: "/ws/v2/audio 接口"
+    expected_doc_ids: [303505987287302144]
+    expected_chunk_keywords: ["/ws/v2/audio"]
+    tag: keyword
+    notes: "title=architecture | file=architecture.md | preview=# WS 模块架构文档 ## 概览 ws 模块提供实时语音转写与智能文本处理能力，支持两种接入方式： 1. **WebSocket 流式接入**（`/ws/v2/audio`）：客户端通过 WebSocket 连接实时推送音频流，服务端进行..."
+
+  - id: "103"
+    query: "UserAnalytics 实体"
+    expected_doc_ids: [303505977338413056]
+    expected_chunk_keywords: [UserAnalytics]
+    tag: keyword
+    notes: "title=architecture | file=architecture.md | preview=# Analytics 模块架构文档 ## 概览 Analytics 模块负责维护用户累计使用统计（字数、录音时长、AI 交互次数），为用户端的\"数据看板\"提供查询接口，并在历史数据存在时提供一次性回填能力。核心实体为 `UserAnaly..."
+
+  - id: "104"
+    query: "TradePreCreate API"
+    expected_doc_ids: [303506032208297984]
+    expected_chunk_keywords: [TradePreCreate]
+    tag: keyword
+    notes: "title=architecture | file=architecture.md | preview=# Alipay 模块架构文档 ## 概览 alipay 模块负责支付宝支付集成，是用户侧付费流程的核心模块。主要职责： - **预下单**：调用支付宝 TradePreCreate API 生成付款二维码 - **异步通知处理**：接收支..."
+
+  - id: "105"
+    query: "Google OAuth ID Token"
+    expected_doc_ids: [303506053754437632]
+    expected_chunk_keywords: [OAuth, "ID Token"]
+    tag: keyword
+    notes: "title=architecture | file=architecture.md | preview=# Auth 模块架构文档 ## 概览 Auth 模块负责用户认证和会话管理，是系统的核心基础模块。核心职责： - **多渠道认证**：手机号短信验证码、邮箱验证码、Google OAuth（ID Token + Authorization..."
+
+  - id: "106"
+    query: "Stripe Checkout webhook"
+    expected_doc_ids: [303505963572707328]
+    expected_chunk_keywords: [Checkout, webhook]
+    tag: keyword
+    notes: "title=architecture | file=architecture.md | preview=# Stripe 模块架构文档 ## 概览 Stripe 模块是系统的国际支付渠道，实现 Stripe Checkout 一次性支付和 Stripe Subscription 周期订阅两种支付模式。模块本身**不持有订单或权益数据**，而是..."
+
+  - id: "107"
+    query: "referral 邀请码兑换"
+    expected_doc_ids: [303506074197475328]
+    expected_chunk_keywords: [邀请码, 兑换]
+    tag: keyword
+    notes: "title=architecture | file=architecture.md | preview=# Referral 模块架构文档 ## 概览 referral 模块实现用户邀请（referral）体系，核心功能包括： - **邀请码管理**：为每位用户生成唯一邀请码 - **邀请码兑换**：新用户提交邀请码后，双方获得权益奖励 - ..."
+
+  - id: "108"
+    query: "v2_user_order_locks"
+    expected_doc_ids: [303506087367589888]
+    expected_chunk_keywords: [v2_user_order_locks]
+    tag: keyword
+    notes: "title=architecture | file=architecture.md | preview=# Order 模块架构文档 ## 概览 Order 模块负责管理用户订单的完整生命周期：预下单、支付结算、取消和关闭。核心实体包括 **订单**（`v2_orders`）和 **用户订单锁**（`v2_user_order_locks`）..."
+
+  - id: "109"
+    query: "Ledger 账本 Snapshot 快照"
+    expected_doc_ids: [303506005754822656]
+    expected_chunk_keywords: [Ledger, Snapshot, 账本]
+    tag: keyword
+    notes: "title=architecture | file=architecture.md | preview=# Entitlement 模块架构文档 ## 概览 Entitlement（权益）模块负责用户权益的全生命周期管理，包括试用发放、付费购买、奖励发放、过期回收及 Stripe 订阅集成。模块采用 **账本（Ledger）+ 快照（Snap..."
+

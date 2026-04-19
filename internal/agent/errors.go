@@ -27,6 +27,8 @@ const (
 	CodeAgentTimeoutOutOfRange = 400120016
 	// CodeAgentDisplayNameInvalid agent 显示名不合法。
 	CodeAgentDisplayNameInvalid = 400120017
+	// CodeAgentTagsInvalid agent 标签不合法。
+	CodeAgentTagsInvalid = 400120018
 	// CodePublishAlreadyExists 该 agent 在此 org 已有活跃发布。
 	CodePublishAlreadyExists = 400120040
 	// CodePublishNotPending 发布记录不处于 pending 状态,无法审核。
@@ -110,6 +112,8 @@ var (
 	ErrAgentTimeoutOutOfRange = errors.New("agent: timeout out of range")
 	// ErrAgentDisplayNameInvalid 显示名格式不合法时返回。
 	ErrAgentDisplayNameInvalid = errors.New("agent: display name invalid")
+	// ErrAgentTagsInvalid 标签数量或长度不合法时返回。
+	ErrAgentTagsInvalid = errors.New("agent: tags invalid")
 	// ErrPublishAlreadyExists 该 agent 在目标 org 已有活跃发布记录时返回。
 	ErrPublishAlreadyExists = errors.New("agent: publish already exists")
 	// ErrPublishNotPending 发布记录不处于 pending 状态时尝试审核返回。
