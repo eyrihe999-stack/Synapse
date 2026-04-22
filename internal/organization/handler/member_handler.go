@@ -5,14 +5,13 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/eyrihe999-stack/Synapse/internal/middleware"
-	"github.com/eyrihe999-stack/Synapse/internal/organization/dto"
-	"github.com/eyrihe999-stack/Synapse/pkg/response"
+	"github.com/eyrihe999-stack/Synapse/internal/common/middleware"
+	"github.com/eyrihe999-stack/Synapse/internal/common/response"
 	"github.com/gin-gonic/gin"
 )
 
-// ListMembers GET /api/v2/orgs/:slug/members
-// 成员身份即可调用,不需要额外权限。
+// ListMembers 分页列出某 org 的成员,对应 GET /api/v2/orgs/:slug/members。
+// 调用方须已通过 org 成员资格中间件校验。
 func (h *OrgHandler) ListMembers(c *gin.Context) {
 	if !h.checkReady(c) {
 		return
@@ -35,8 +34,8 @@ func (h *OrgHandler) ListMembers(c *gin.Context) {
 	})
 }
 
-// RemoveMember DELETE /api/v2/orgs/:slug/members/:user_id
-// 需要 PermMemberRemove。
+// RemoveMember 踢出某位成员,对应 DELETE /api/v2/orgs/:slug/members/:user_id。
+// operator 不能是 target,owner 不可被踢。
 func (h *OrgHandler) RemoveMember(c *gin.Context) {
 	if !h.checkReady(c) {
 		return
@@ -67,8 +66,8 @@ func (h *OrgHandler) RemoveMember(c *gin.Context) {
 	})
 }
 
-// LeaveOrg DELETE /api/v2/orgs/:slug/members/me
-// 成员主动退出,owner 拒绝。
+// LeaveOrg 当前用户主动退出 org,对应 DELETE /api/v2/orgs/:slug/members/me。
+// Owner 调用此接口会被拒绝(需先走解散流程)。
 func (h *OrgHandler) LeaveOrg(c *gin.Context) {
 	if !h.checkReady(c) {
 		return
@@ -90,42 +89,5 @@ func (h *OrgHandler) LeaveOrg(c *gin.Context) {
 	c.JSON(http.StatusOK, response.BaseResponse{
 		Code:    http.StatusOK,
 		Message: "Left organization",
-	})
-}
-
-// AssignMemberRole PATCH /api/v2/orgs/:slug/members/:user_id/role
-// 需要 PermMemberRoleAssign。
-func (h *OrgHandler) AssignMemberRole(c *gin.Context) {
-	if !h.checkReady(c) {
-		return
-	}
-	operatorID, ok := middleware.GetUserID(c)
-	if !ok {
-		response.Unauthorized(c, "Missing user context", "")
-		return
-	}
-	org, ok := GetOrg(c)
-	if !ok {
-		response.InternalServerError(c, "Missing org context", "")
-		return
-	}
-	targetIDStr := c.Param("user_id")
-	targetID, err := strconv.ParseUint(targetIDStr, 10, 64)
-	if err != nil {
-		response.BadRequest(c, "Invalid user_id", err.Error())
-		return
-	}
-	var req dto.AssignMemberRoleRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "Invalid request body", err.Error())
-		return
-	}
-	if err := h.memberSvc.AssignRole(c.Request.Context(), operatorID, org.ID, targetID, req.RoleID); err != nil {
-		h.handleServiceError(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, response.BaseResponse{
-		Code:    http.StatusOK,
-		Message: "Role assigned",
 	})
 }

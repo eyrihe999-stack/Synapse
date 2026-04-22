@@ -9,6 +9,10 @@ server:
   idle_timeout: 120s
   # shutdown_timeout 优雅关闭时等待 in-flight 请求的最长时间(超过则切断 SSE 等长连接)。
   shutdown_timeout: 30s
+  # M2.4 可信反代白名单(CIDR / IP)。空 = 不信任任何代理(走 socket IP,dev 本机直连安全默认)。
+  # 生产必须填:k8s ingress / nginx / ALB 的出口 CIDR,例如 ["10.0.0.0/8", "172.16.0.0/12"]。
+  # 直接暴露公网务必保持空,否则 X-Forwarded-For 可被任意客户端伪造,绕过限流 / 污染审计 IP。
+  trusted_proxies: []
 
 database:
   mysql:
@@ -48,27 +52,46 @@ redis:
 
 log:
   level: debug
-  format: text
-  output: stdout
+  format: text             # json 或 text
+  output: stdout           # stdout / stderr / file
+  file_path: "logs/synapse.log"  # 仅 output=file 生效
+  max_size: 100            # MB,单文件切分阈值
+  max_age: 7               # days,保留多少天
+  max_backups: 3           # 最多保留几份
+  compress: true           # 旧文件 gzip
+
+  # 阿里云 SLS(Simple Log Service)投递配置。dev 默认 enabled: false。
+  # 打开需要填真实 AK / project / logstore;trace_id 跨服务查日志与 sayso-server 共用同一套字段。
+  sls:
+    enabled: false
+    endpoint: "cn-hangzhou.log.aliyuncs.com"
+    access_key_id: ""
+    access_key_secret: ""
+    project: "synapse-dev"
+    logstore: "app-logs"
+    topic: "synapse"
+    source: "dev-server"
+    max_batch_size: 3145728       # 3MB
+    max_batch_count: 4096
+    linger_ms: 2000               # flush 间隔 ms
+    retries: 3
+    max_reserved_attempts: 11
+    metadata:
+      app: "synapse"
+      version: "1.0.0"
+      environment: "development"
+      region: "cn-hangzhou"
 
 jwt:
   secret_key: "synapse-dev-secret-change-me"
   access_token_duration: 2h
-  refresh_token_duration: 168h
+  # refresh_token_duration 也是 Redis session 的 TTL。
+  # 前端用 sessionStorage(tab 级)存 token,关 tab 就丢,长 TTL 只会让后端 Redis
+  # 孤儿 session 堆积(前端没机会调吊销接口,用户关 tab 不算"主动登出")。
+  # 24h 是"用户 1 天内不访问就重登"的折中,匹配 sessionStorage 语义。
+  refresh_token_duration: 24h
   issuer: synapse
   max_sessions_per_user: 5
-
-# OAuth 2.1 AS 配置(远端 MCP agent 接入)。issuer 留空 = 整个 OAuth 模块禁用,MCP 只走 legacy JWT 路径。
-# 生产环境务必:
-#   - issuer / mcp_resource_url 用公网可达的 HTTPS URL
-#   - signing_key / cookie_secret 走环境变量(OAUTH_SIGNING_KEY / OAUTH_COOKIE_SECRET),不写 yaml
-#   - cookie_secure: true
-oauth:
-  issuer: "https://breann-ungenuine-crusily.ngrok-free.dev"
-  signing_key: "synapse-dev-oauth-signing-key-change-me-32bytes-min"
-  cookie_secret: "synapse-dev-oauth-cookie-secret-change-me-32bytes"
-  mcp_resource_url: "https://breann-ungenuine-crusily.ngrok-free.dev/api/v2/retrieval/mcp"
-  cookie_secure: false
 
 snowflake:
   datacenter_id: 0
@@ -77,33 +100,9 @@ snowflake:
 organization:
   max_owned_orgs: 5
   max_joined_orgs: 20
-  invitation_expires_days: 7
-
-agent:
-  default_max_context_rounds: 20
-  chat_rate_limit_per_minute: 60
-
-# 对象存储 —— 存放上传的原始文档、图片等。key 结构:{path_prefix}/{org_id}/{doc_id}/...
-# 生产环境把 access_key_* 放到 env:OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET。
-oss:
-  provider: aliyun
-  access_key_id: ""
-  access_key_secret: ""
-  region: "cn-hangzhou"
-  bucket: "lunalab-res"
-  endpoint: ""
-  domain: ""
-  # Synapse 独立前缀,避免和 sayso 的 `uploads/` 混用。
-  path_prefix: "synapse/docs"
-
-# 文档模块(仅上传存储)。
-document:
-  upload:
-    max_file_size_bytes: 10485760   # 10 MB
-    allowed_mime_types:
-      - text/markdown
-      - text/plain
-      - text/x-markdown
+  # 邀请邮件里落地页 URL,邮件会拼成 "{invitation_frontend_base_url}?token=xxx"。
+  # dev 指向 localhost 前端;留空会降级成裸 token(方便从日志里复制测)。
+  invitation_frontend_base_url: "http://localhost:3080/invite"
 
 # 向量化 provider 顶层配置。各模态独立一块,以后新增 image / code 时并列扩展。
 # provider: "fake" 可在无 Azure 环境下离线跑;"azure" 走下面 azure 子块。
@@ -121,29 +120,69 @@ embedding:
       api_key: ""
       api_version: "2024-10-21"
 
-# T1.2 二阶段重排(cross-encoder)。Provider 空串 = 禁用,SearchChunks 的 opts.Rerank 将 no-op。
-# 启用前需要单独起 TEI 服务:
-#   docker run -d -p 8082:80 --name synapse-tei ghcr.io/huggingface/text-embeddings-inference:cpu-latest \
-#     --model-id BAAI/bge-reranker-v2-m3
-# GPU 机器把镜像换成 :1.5 tag。
-reranker:
-  provider: ""  # "bge_tei" 启用
-  bge_tei:
-    base_url: "http://127.0.0.1:8082"
-    timeout: "5s"
+# 邮件发送 —— 用于邮箱验证码等场景。
+# 敏感字段统一走 env:
+#   EMAIL_PROVIDER=resend | smtp           # 选通道,空串 = 不发邮件(dev 本地看日志拿码)
+#   EMAIL_API_KEY=re_xxx                    # Resend API key(provider=resend 时必填)
+#   EMAIL_SMTP_HOST=smtp.example.com        # SMTP 主机(provider=smtp 时必填)
+#   EMAIL_SMTP_PORT=465                     # SMTP TLS 端口,默认 465
+#   EMAIL_USERNAME / EMAIL_PASSWORD         # SMTP 认证
+#   EMAIL_FROM=no-reply@synapse.example.com # 发件人地址
+#   EMAIL_FROM_NAME=Synapse                 # 显示名
+#   EMAIL_DAILY_VERIFICATION_LIMIT=10       # 单邮箱每日发送上限,0 走默认 10
+#   EMAIL_LOCALE=zh | en                    # 邮件模板语言,默认 zh
+email:
+  provider: "smtp"
+  smtp_host: "smtpdm-ap-southeast-1.aliyun.com"
+  smtp_port: 465
+  username: "noreplay@mail.sayso.ai"  # 阿里云 DM SMTP 认证要求完整发信地址
+  password: ""
+  from: "noreplay@mail.sayso.ai"
+  from_name: "Synapse"
+  api_key: ""
+  daily_verification_limit: 10
+  code_ttl: ""                  # 空串 = 10m
+  max_attempts: 0               # 0 = 走默认值 5
+  locale: ""                    # 空串 = 默认 zh
+  password_reset_ttl: "15m"     # 密码重置 token TTL
+  password_reset_link_base: "http://localhost:3080"  # 前端域名,service 会拼 /reset-password?token=...
 
-# 飞书集成(T2.1 用户级 OAuth 同步)。部署级配置:
-#   - base_url: 飞书区域(国内/海外)
-#   - redirect_uri: OAuth 回调(所有 org 共享),必须在开发者后台的"安全配置 → 重定向 URL"白名单里登记
-#   - frontend_redirect_url: 回调成功/失败后 302 跳到前端页面的基础 URL
-#
-# 应用凭证(app_id / app_secret)**不在此处** —— per org 存在 org_feishu_configs 表,
-# 由 org admin 在前端设置页填入。一个 Synapse 实例可服务多 org,各自接自家飞书 App。
-feishu:
-  base_url: ""  # 空 = 默认中国区
-  redirect_uri: "https://breann-ungenuine-crusily.ngrok-free.dev/api/v2/integrations/feishu/callback"  # 例如 http://localhost:8080/api/v2/integrations/feishu/callback
-  frontend_redirect_url: "http://localhost:3080/org/integrations/feishu"  # OAuth 完成后 302 回跳到飞书集成详情页,带 ?feishu=success|error;空 = 回调直接返 JSON
+# user 模块安全相关:登录失败锁 + 注册限流 + 密码策略。0 值全部走代码默认。
+user:
+  login_fail:
+    max: 10         # 连续失败多少次锁账号
+    lock_ttl: "15m" # 锁多久
+  register_rate:
+    max: 5          # 滑动窗口内每 IP 允许多少次 /register
+    window_sec: 60  # 窗口长度(秒)
+  password:
+    min_len: 10             # M1.5:最短长度
+    check_weak_list: true   # 是否查 top-10k 弱密 bloom;本地测试可临时关
 
-# GitLab 集成(PAT 模式)。实例配置(base_url / insecure_skip_verify)**不在此处** ——
-# per org 存在 org_gitlab_configs 表,由 org admin 在前端设置页填入。
-# 一个 Synapse 实例可服务对接多个不同 GitLab(SaaS / 各自企业自建)的组织。
+# M1.6 第三方登录(Synapse 作为 RP,消费 Google/Feishu 作 IdP)。
+# 敏感字段建议走 env:GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET /
+#                   OAUTH_LOGIN_STATE_COOKIE_SECRET
+# redirect_uri 必须和 Google Cloud Console 登记的授权回调 URL 完全一致,
+# 本地开发走 http://localhost:8080/... 需要把它加到开发者后台白名单。
+oauth_login:
+  state_cookie_secret: ""  # 空串走代码默认(dev),生产必须覆盖(≥ 32 字节强随机)
+  cookie_secure: false  # 生产 HTTPS 时改 true
+  google:
+    enabled: true
+    client_id: ""
+    client_secret: ""
+    redirect_uri: "http://localhost:8080/api/v1/auth/oauth/google/callback"
+    frontend_redirect_base: "http://localhost:3080"  # 前端 origin,callback 完后拼 /auth/oauth/callback?exchange=...
+
+# 阿里云 OSS 接入。文档上传走这里,payload 只存 key,runner 拉原文喂 pipeline。
+# Bucket 权限策略:建议私有 + 后端代下载(GET /documents/:id/content 由服务端用 AK 拉回代理回前端)。
+# PathPrefix + MaxVersionsPerDocument 供代码默认兜底,yaml 留空也能跑。
+oss:
+  access_key_id: ""
+  access_key_secret: ""
+  region: "cn-hangzhou"
+  bucket: "lunalab-res"
+  endpoint: ""                      # 空 = 自动拼 oss-cn-hangzhou.aliyuncs.com
+  domain: ""                        # 空 = 用 bucket 默认域(走 OSS 直链)
+  path_prefix: "synapse"            # OSS key 顶层前缀,synapse/{orgID}/{docID}/{versionHash}.md
+  max_versions_per_document: 10     # 单文档最多保留几个历史版本,超过自动删最老的

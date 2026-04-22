@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # ── Build stage ────────────────────────────────────────────────
 FROM golang:1.25-alpine AS builder
 
@@ -12,25 +13,36 @@ WORKDIR /src
 ARG GOPROXY=https://goproxy.cn,direct
 ENV GOPROXY=${GOPROXY}
 
-# Cache dependencies
+# cache mount 让 mod 下载与 build cache 跨构建持久化,避免 COPY . . 层失效时 tree-sitter C 源全量重编
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 
-# Build(CGO 开启 + 静态链接)
-# 首次 build 会花几分钟编译 6 个 tree-sitter grammar C 源;Docker layer 缓存后续增量构建只重编改过的 Go 代码。
 COPY . .
-RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w -extldflags '-static'" -o /bin/synapse ./cmd/synapse/
+# /deploy skill 在 build 前 export GIT_SHA,通过 compose build arg 传进来;没传默认 unknown
+ARG GIT_SHA=unknown
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w -X main.GitSHA=${GIT_SHA} -extldflags '-static'" -o /bin/synapse ./cmd/synapse/
 
 # ── Runtime stage ─────────────────────────────────────────────
-FROM alpine:3.21
+FROM alpine:3.23
 
-RUN apk add --no-cache ca-certificates tzdata
+# wget:HEALTHCHECK 探活用;app user:非 root 跑 binary
+RUN apk add --no-cache ca-certificates tzdata wget \
+    && addgroup -S app && adduser -S -G app app
 
 WORKDIR /app
 
-COPY --from=builder /bin/synapse /app/synapse
-COPY config/ /app/config/
+COPY --from=builder --chown=app:app /bin/synapse /app/synapse
+COPY --chown=app:app config/ /app/config/
+
+USER app
 
 EXPOSE 8080
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
+    CMD wget -q -O /dev/null http://localhost:8080/health || exit 1
 
 ENTRYPOINT ["/app/synapse"]

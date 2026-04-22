@@ -1,84 +1,22 @@
-// service.go user 模块业务逻辑层。
+// service.go user 模块服务契约与核心装配:interface、userService 结构、
+// 构造函数、密码策略与反爆破 / 注册限流参数。具体业务(注册登录 / 资料 /
+// session 管理 / OAuth / 账号安全 / 邮箱激活 等)按职责拆到同包其它文件。
 package service
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"net/mail"
 	"time"
 
+	"github.com/eyrihe999-stack/Synapse/config"
 	"github.com/eyrihe999-stack/Synapse/internal/user"
-	"github.com/eyrihe999-stack/Synapse/internal/user/model"
 	"github.com/eyrihe999-stack/Synapse/internal/user/repository"
-	"github.com/eyrihe999-stack/Synapse/pkg/logger"
-	"github.com/eyrihe999-stack/Synapse/pkg/utils"
-	"github.com/go-sql-driver/mysql"
-	"golang.org/x/crypto/bcrypt"
-	"gorm.io/gorm"
+	"github.com/eyrihe999-stack/Synapse/internal/common/email"
+	"github.com/eyrihe999-stack/Synapse/internal/common/logger"
+	"github.com/eyrihe999-stack/Synapse/internal/common/pwdpolicy"
+	"github.com/eyrihe999-stack/Synapse/internal/common/jwt"
 )
-
-// mysqlErrDupEntry MySQL 唯一索引冲突错误码。Register 并发竞争时,
-// FindByEmail 没查到但 CreateUser 撞 unique 索引,需要把它映射回 ErrEmailAlreadyRegistered。
-const mysqlErrDupEntry = 1062
-
-// isDupEntryErr 判断是否为 MySQL 唯一索引冲突。
-func isDupEntryErr(err error) bool {
-	var me *mysql.MySQLError
-	return errors.As(err, &me) && me.Number == mysqlErrDupEntry
-}
-
-// RegisterRequest 用户注册请求。
-type RegisterRequest struct {
-	Email       string `json:"email" binding:"required"`
-	Password    string `json:"password" binding:"required"`
-	DisplayName string `json:"display_name"`
-	DeviceID    string `json:"device_id"`
-	DeviceName  string `json:"device_name"`
-	LoginIP     string `json:"-"` // handler 层设置,不从 JSON 读取
-}
-
-// LoginRequest 用户登录请求。
-type LoginRequest struct {
-	Email      string `json:"email" binding:"required"`
-	Password   string `json:"password" binding:"required"`
-	DeviceID   string `json:"device_id"`
-	DeviceName string `json:"device_name"`
-	LoginIP    string `json:"-"` // handler 层设置,不从 JSON 读取
-}
-
-// RefreshRequest 刷新 token 请求。
-type RefreshRequest struct {
-	RefreshToken string `json:"refresh_token" binding:"required"`
-	DeviceID     string `json:"device_id"`
-	DeviceName   string `json:"device_name"`
-	LoginIP      string `json:"-"`
-}
-
-// UpdateProfileRequest 更新个人信息请求。
-type UpdateProfileRequest struct {
-	DisplayName *string `json:"display_name"`
-	AvatarURL   *string `json:"avatar_url"`
-}
-
-// AuthResponse 登录/注册成功后的认证响应。
-type AuthResponse struct {
-	AccessToken  string      `json:"access_token"`
-	RefreshToken string      `json:"refresh_token"`
-	ExpiresIn    int         `json:"expires_in"`
-	User         UserProfile `json:"user"`
-}
-
-// UserProfile 用户公开资料。
-type UserProfile struct {
-	ID          uint64     `json:"id,string"`
-	Email       string     `json:"email"`
-	DisplayName string     `json:"display_name"`
-	AvatarURL   string     `json:"avatar_url"`
-	Status      int32      `json:"status"`
-	LastLoginAt *time.Time `json:"last_login_at"`
-	CreatedAt   time.Time  `json:"created_at"`
-}
 
 // UserService 定义用户模块的业务操作接口。
 type UserService interface {
@@ -90,306 +28,196 @@ type UserService interface {
 	ListSessions(ctx context.Context, userID uint64) ([]user.SessionEntry, error)
 	KickSession(ctx context.Context, userID uint64, deviceID string) error
 	LogoutAll(ctx context.Context, userID uint64) error
+	SendEmailCode(ctx context.Context, req SendEmailCodeRequest) (*SendEmailCodeResponse, error)
+	RequestPasswordReset(ctx context.Context, req RequestPasswordResetRequest) error
+	ConfirmPasswordReset(ctx context.Context, req ConfirmPasswordResetRequest) error
+
+	// ── 生命周期 (M1.7) ───────────────────────────────────────────────────────
+	// DeleteAccount 自助注销当前账号:pseudo 化 PII + 删第三方绑定 + 踢全部 session。
+	// 实现见 account_lifecycle.go。
+	// GDPR 物理抹除(硬删 users 行 + 跨模块级联清理)暂不实现,等系统成熟统一规划。
+	DeleteAccount(ctx context.Context, userID uint64, req DeleteAccountRequest) error
+	// ExpireStalePendingVerifyAccounts 清理长期未激活的 pending_verify 账号(走 pseudo 化释放 email 占位)。
+	// 由 cmd/synapse-cleanup CLI 调用;web 进程不挂。
+	ExpireStalePendingVerifyAccounts(ctx context.Context, staleDuration time.Duration, batchLimit int) (ExpireStats, error)
+
+	// ── 邮箱激活 (M1.1) ───────────────────────────────────────────────────────
+	// VerifyEmail 凭一次性 token 激活邮箱,成功后 status → active 且 email_verified_at 落当前时间。
+	VerifyEmail(ctx context.Context, token string) error
+	// ResendEmailVerification 已登录用户重发激活邮件;已验证返 ErrEmailAlreadyVerified。
+	ResendEmailVerification(ctx context.Context, userID uint64) error
+	// IsUserVerified 跨模块前置 guard(CreateOrg / PublishAgent 等)用的口径判断。
+	// 非 active / 未验证均返 (false, nil);内部错误走第二个返回值。
+	IsUserVerified(ctx context.Context, userID uint64) (bool, error)
+
+	// ── 账号安全自助(已登录) ────────────────────────────────────────────────
+	// ChangePassword 已登录用户改密;有本地密码的账号必须带旧密码二次确认,成功后 LogoutAll。
+	ChangePassword(ctx context.Context, userID uint64, req ChangePasswordRequest) error
+	// ChangeEmail 已登录用户改邮箱;通过消费发到新邮箱的 6 位 code 证明所有权,成功后 LogoutAll。
+	ChangeEmail(ctx context.Context, userID uint64, req ChangeEmailRequest) error
+
+	// ── OAuth login (M1.6) ────────────────────────────────────────────────────
+	// LoginWithOAuth 根据 IdP callback 解出的 (provider, subject, email, ...) 完成登录:
+	// 命中 identity → 登录对应 user;未命中但 email_verified + users.email 命中 → 自动合并;
+	// 全不中 → 建新 user + identity。
+	LoginWithOAuth(ctx context.Context, req OAuthLoginRequest) (*AuthResponse, error)
+	// StoreOAuthExchange 把 AuthResponse 以一次性 exchange code 存 Redis(60s),
+	// 返回 code 供 handler 302 到前端。前端再调 PickupOAuthExchange 兑换。
+	StoreOAuthExchange(ctx context.Context, auth *AuthResponse) (string, error)
+	// PickupOAuthExchange GET+DEL exchange code,返回先前存的 AuthResponse。
+	// 不存在 / 过期返 ErrOAuthExchangeExpired,防止重放。
+	PickupOAuthExchange(ctx context.Context, code string) (*AuthResponse, error)
+
+	// VerifyPasswordOnly 纯密码校验 + 反爆破 + 审计,不消费 email code、不签 session / JWT。
+	// 专供 Synapse 自带 OAuth AS 的 /oauth/login 表单用,让 OAuth 登录和 web 登录共享同一套
+	// per-email 锁定 + per-IP spray 防御,避免 /oauth/login 成为绕过 M1.4 的爆破通道。
+	// 失败返 ErrInvalidCredentials / ErrAccountLocked / ErrLoginIPRateLimited。
+	VerifyPasswordOnly(ctx context.Context, email, password, ip, userAgent string) (userID uint64, err error)
+
+	// SetOwnerChecker 晚绑定注入 M3.7 owner 孤儿态 guard。
+	// main.go 构造完 org service 后调用一次;nil 表示关掉该 guard。
+	SetOwnerChecker(checker OwnerChecker)
 }
 
 type userService struct {
 	repo               repository.Repository
-	jwtManager         *utils.JWTManager
+	jwtManager         *jwt.JWTManager
 	sessionStore       user.SessionStore
 	maxSessionsPerUser int
 	log                logger.LoggerInterface
+	codeStore          EmailCodeStore
+	emailSender        email.Sender
+	emailCfg           *config.EmailConfig
+	loginGuard         LoginGuard
+	userCfg            *config.UserConfig
+	pwdResetStore      PasswordResetStore
+	pwdPolicy          *pwdpolicy.Policy
+	oauthExchangeStore OAuthExchangeStore
+	emailVerifyStore   EmailVerifyStore // M1.1 邮箱激活 token 存取;nil 时激活接口返 ErrUserInternal
+	ownerChecker       OwnerChecker     // M3.7 注销前 org owner 孤儿态 guard;nil 时跳过检查
+}
+
+// OwnerChecker M3.7 跨模块 guard:判断某用户是否为任一 active org 的 owner。
+// 主进程在 main.go 用 organization 模块适配器实现后注入;
+// 为 nil 时 DeleteAccount 跳过检查(单测 / 旧部署兼容)。
+type OwnerChecker interface {
+	// ListActiveOrgsOwnedBy 返回该 user 当前持有的 active org 列表。
+	// 空列表 + nil error = 无 owner 身份,可安全注销。
+	ListActiveOrgsOwnedBy(ctx context.Context, userID uint64) ([]user.OwnedOrgSummary, error)
+}
+
+// SetOwnerChecker 见 UserService.SetOwnerChecker 注释。
+func (s *userService) SetOwnerChecker(checker OwnerChecker) {
+	s.ownerChecker = checker
 }
 
 // NewUserService 构造一个 UserService 实例。
-func NewUserService(repo repository.Repository, jwtManager *utils.JWTManager, sessionStore user.SessionStore, maxSessionsPerUser int, log logger.LoggerInterface) UserService {
-	return &userService{repo: repo, jwtManager: jwtManager, sessionStore: sessionStore, maxSessionsPerUser: maxSessionsPerUser, log: log}
+//
+// codeStore / emailSender / emailCfg 可传 nil → 邮箱验证码接口返回 ErrUserInternal,
+// 其余功能不受影响。main.go 装配时只要装了 Email 配置就应该全部传入。
+//
+// loginGuard / userCfg 可传 nil → 登录失败锁 + 注册滑动窗口限流全部关闭(开发/单测友好)。
+// 生产环境必须都传,否则反爆破防线就没有。
+// pwdResetStore 可传 nil → 密码重置接口返 ErrUserInternal。
+// pwdPolicy 可传 nil → 退化到仅长度 8 位的旧行为(仅用于单测和过渡);
+// 生产必须传,main.go 装配时 pwdpolicy.New 失败应直接 fatal。
+//
+// ownerChecker(M3.7)有环形依赖风险(org service 依赖 user.UserVerifier,
+// user service 反过来依赖 org 侧 owner 查询),因此留晚绑定,见 SetOwnerChecker。
+func NewUserService(
+	repo repository.Repository,
+	jwtManager *jwt.JWTManager,
+	sessionStore user.SessionStore,
+	maxSessionsPerUser int,
+	log logger.LoggerInterface,
+	codeStore EmailCodeStore,
+	emailSender email.Sender,
+	emailCfg *config.EmailConfig,
+	loginGuard LoginGuard,
+	userCfg *config.UserConfig,
+	pwdResetStore PasswordResetStore,
+	pwdPolicy *pwdpolicy.Policy,
+	oauthExchangeStore OAuthExchangeStore,
+	emailVerifyStore EmailVerifyStore,
+) UserService {
+	return &userService{
+		repo:               repo,
+		jwtManager:         jwtManager,
+		sessionStore:       sessionStore,
+		maxSessionsPerUser: maxSessionsPerUser,
+		log:                log,
+		codeStore:          codeStore,
+		emailSender:        emailSender,
+		emailCfg:           emailCfg,
+		loginGuard:         loginGuard,
+		userCfg:            userCfg,
+		pwdResetStore:      pwdResetStore,
+		pwdPolicy:          pwdPolicy,
+		oauthExchangeStore: oauthExchangeStore,
+		emailVerifyStore:   emailVerifyStore,
+	}
 }
 
-// Register 注册新用户并返回认证凭证。
+// checkPassword 统一密码策略校验,Register 和 ConfirmPasswordReset 共用。
+// pwdPolicy 为 nil 时仅校验 8 位最短(过渡行为,生产绝对不会走这分支)。
 //
-// 校验邮箱格式和密码长度后创建用户,返回 access/refresh token。
-// 返回 ErrInvalidEmail / ErrPasswordTooShort / ErrEmailAlreadyRegistered / ErrUserInternal。
-func (s *userService) Register(ctx context.Context, req RegisterRequest) (*AuthResponse, error) {
-	//sayso-lint:ignore err-swallow
-	if _, err := mail.ParseAddress(req.Email); err != nil { // 丢弃解析结果,仅校验格式
-		s.log.WarnCtx(ctx, "邮箱格式非法", map[string]any{"email": req.Email})
-		return nil, fmt.Errorf("invalid email: %w", user.ErrInvalidEmail)
-	}
-	if len(req.Password) < 8 {
-		s.log.WarnCtx(ctx, "密码长度不足", map[string]any{"email": req.Email})
-		return nil, fmt.Errorf("password too short: %w", user.ErrPasswordTooShort)
-	}
-
-	// 检查邮箱是否已注册
-	//sayso-lint:ignore err-swallow
-	_, err := s.repo.FindByEmail(ctx, req.Email) // 丢弃 user 记录,仅检查是否存在
-	if err == nil {
-		s.log.WarnCtx(ctx, "邮箱已注册", map[string]any{"email": req.Email})
-		return nil, fmt.Errorf("email taken: %w", user.ErrEmailAlreadyRegistered)
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		s.log.ErrorCtx(ctx, "查询邮箱失败", err, map[string]any{"email": req.Email})
-		return nil, fmt.Errorf("check email: %w: %w", err, user.ErrUserInternal)
-	}
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-	if err != nil {
-		s.log.ErrorCtx(ctx, "密码哈希失败", err, nil)
-		return nil, fmt.Errorf("hash password: %w: %w", err, user.ErrUserInternal)
-	}
-
-	displayName := req.DisplayName
-	if displayName == "" {
-		displayName = req.Email
-	}
-
-	u := &model.User{
-		Email:        req.Email,
-		PasswordHash: string(hash),
-		DisplayName:  displayName,
-		Status:       model.StatusActive,
-	}
-
-	if err := s.repo.CreateUser(ctx, u); err != nil {
-		// 兜底:FindByEmail 与 CreateUser 之间有 TOCTOU 窗口,
-		// 并发注册同邮箱时这里会撞 unique 索引,需要把 sentinel 映射回去。
-		if isDupEntryErr(err) {
-			s.log.WarnCtx(ctx, "邮箱已注册(并发竞争)", map[string]any{"email": req.Email})
-			return nil, fmt.Errorf("email taken: %w", user.ErrEmailAlreadyRegistered)
+// 纯验证器:无 ctx 无 logger,调用方按上下文(注册/改密)统一打业务日志;
+// 在此打日志反而会重复记录。
+func (s *userService) checkPassword(pw string) error {
+	if s.pwdPolicy == nil {
+		if len(pw) < 8 {
+			//sayso-lint:ignore log-coverage
+			return fmt.Errorf("password too short: %w", user.ErrPasswordTooShort)
 		}
-		s.log.ErrorCtx(ctx, "创建用户失败", err, map[string]any{"email": req.Email})
-		return nil, fmt.Errorf("create user: %w: %w", err, user.ErrUserInternal)
+		return nil
 	}
-
-	deviceID := req.DeviceID
-	if deviceID == "" {
-		deviceID = "default"
-	}
-
-	//sayso-lint:ignore sentinel-wrap
-	return s.generateAuthResponse(ctx, u, deviceID, req.DeviceName, req.LoginIP)
-}
-
-// Login 用户登录,校验邮箱密码后返回认证凭证。
-//
-// 返回 ErrInvalidCredentials / ErrUserInternal。
-func (s *userService) Login(ctx context.Context, req LoginRequest) (*AuthResponse, error) {
-	u, err := s.repo.FindByEmail(ctx, req.Email)
-	if err != nil {
-		s.log.WarnCtx(ctx, "登录用户不存在", map[string]any{"email": req.Email})
-		return nil, fmt.Errorf("find user: %w", user.ErrInvalidCredentials)
-	}
-
-	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(req.Password)); err != nil {
-		s.log.WarnCtx(ctx, "密码不匹配", map[string]any{"email": req.Email})
-		return nil, fmt.Errorf("password mismatch: %w", user.ErrInvalidCredentials)
-	}
-
-	now := time.Now().UTC()
-	//sayso-lint:ignore err-swallow
-	_ = s.repo.UpdateFields(ctx, u.ID, map[string]any{"last_login_at": now}) // best-effort 更新登录时间,失败不阻塞
-
-	deviceID := req.DeviceID
-	if deviceID == "" {
-		deviceID = "default"
-	}
-
-	//sayso-lint:ignore sentinel-wrap
-	return s.generateAuthResponse(ctx, u, deviceID, req.DeviceName, req.LoginIP)
-}
-
-// GetProfile 按用户 ID 查询公开资料。
-//
-// 返回 ErrUserNotFound。
-func (s *userService) GetProfile(ctx context.Context, userID uint64) (*UserProfile, error) {
-	u, err := s.repo.FindByID(ctx, userID)
-	if err != nil {
-		s.log.WarnCtx(ctx, "用户不存在", map[string]any{"user_id": userID})
-		return nil, fmt.Errorf("find user: %w", user.ErrUserNotFound)
-	}
-	return toUserProfile(u), nil
-}
-
-// UpdateProfile 更新当前用户的个人信息(display_name / avatar_url)。
-//
-// 返回 ErrUserInternal / ErrUserNotFound。
-func (s *userService) UpdateProfile(ctx context.Context, userID uint64, req UpdateProfileRequest) (*UserProfile, error) {
-	updates := make(map[string]any)
-	if req.DisplayName != nil {
-		updates["display_name"] = *req.DisplayName
-	}
-	if req.AvatarURL != nil {
-		updates["avatar_url"] = *req.AvatarURL
-	}
-	if len(updates) > 0 {
-		if err := s.repo.UpdateFields(ctx, userID, updates); err != nil {
-			s.log.ErrorCtx(ctx, "更新用户信息失败", err, map[string]any{"user_id": userID})
-			return nil, fmt.Errorf("update profile: %w: %w", err, user.ErrUserInternal)
-		}
-	}
-
-	//sayso-lint:ignore sentinel-wrap
-	return s.GetProfile(ctx, userID) // GetProfile 内部已返回 ErrUserNotFound sentinel
-}
-
-// RefreshToken 用 refresh token 换取新的认证凭证。
-//
-// 校验 refresh token 签名后,检查 Redis 中 JTI 是否匹配,
-// 匹配则签发新 token 对并更新 session。
-// 返回 ErrInvalidRefreshToken / ErrSessionRevoked / ErrUserNotFound / ErrUserInternal。
-func (s *userService) RefreshToken(ctx context.Context, req RefreshRequest) (*AuthResponse, error) {
-	claims, err := s.jwtManager.ValidateRefreshToken(req.RefreshToken)
-	if err != nil {
-		s.log.WarnCtx(ctx, "refresh token 无效", map[string]any{"error": err.Error()})
-		return nil, fmt.Errorf("invalid refresh token: %w: %w", err, user.ErrInvalidRefreshToken)
-	}
-
-	deviceID := claims.DeviceID
-	if deviceID == "" {
-		deviceID = "default"
-	}
-
-	// 校验 Redis session 中的 JTI 是否匹配
-	session, err := s.sessionStore.Get(ctx, claims.UserID, deviceID)
-	if err != nil {
-		s.log.WarnCtx(ctx, "session 不存在,可能已被踢下线", map[string]any{
-			"user_id": claims.UserID, "device_id": deviceID,
-		})
-		return nil, fmt.Errorf("session revoked: %w", user.ErrSessionRevoked)
-	}
-	if session.JTI != claims.ID {
-		s.log.WarnCtx(ctx, "refresh token JTI 不匹配,可能已被替换", map[string]any{
-			"user_id": claims.UserID, "device_id": deviceID,
-		})
-		return nil, fmt.Errorf("jti mismatch: %w", user.ErrSessionRevoked)
-	}
-
-	u, err := s.repo.FindByID(ctx, claims.UserID)
-	if err != nil {
-		s.log.WarnCtx(ctx, "refresh token 对应用户不存在", map[string]any{"user_id": claims.UserID})
-		return nil, fmt.Errorf("find user: %w", user.ErrUserNotFound)
-	}
-
-	// 使用请求中的 device_name(如果有),否则保留原 session 的
-	deviceName := req.DeviceName
-	if deviceName == "" {
-		deviceName = session.DeviceName
-	}
-	loginIP := req.LoginIP
-	if loginIP == "" {
-		loginIP = session.LoginIP
-	}
-
-	//sayso-lint:ignore sentinel-wrap
-	return s.generateAuthResponse(ctx, u, deviceID, deviceName, loginIP)
-}
-
-// ListSessions 返回用户的所有活跃设备 session。
-func (s *userService) ListSessions(ctx context.Context, userID uint64) ([]user.SessionEntry, error) {
-	entries, err := s.sessionStore.List(ctx, userID)
-	if err != nil {
-		s.log.ErrorCtx(ctx, "查询 session 列表失败", err, map[string]any{"user_id": userID})
-		return nil, fmt.Errorf("list sessions: %w: %w", err, user.ErrUserInternal)
-	}
-	return entries, nil
-}
-
-// KickSession 踢掉指定设备的 session。
-//
-// 返回 ErrSessionNotFound / ErrUserInternal。
-func (s *userService) KickSession(ctx context.Context, userID uint64, deviceID string) error {
-	// 先检查 session 是否存在
-	//sayso-lint:ignore err-swallow
-	if _, err := s.sessionStore.Get(ctx, userID, deviceID); err != nil { // 丢弃 session 信息,仅检查是否存在
-		s.log.WarnCtx(ctx, "session 不存在", map[string]any{"user_id": userID, "device_id": deviceID})
-		return fmt.Errorf("session not found: %w", user.ErrSessionNotFound)
-	}
-	if err := s.sessionStore.Delete(ctx, userID, deviceID); err != nil {
-		s.log.ErrorCtx(ctx, "踢设备失败", err, map[string]any{"user_id": userID, "device_id": deviceID})
-		return fmt.Errorf("kick session: %w: %w", err, user.ErrUserInternal)
+	switch err := s.pwdPolicy.Validate(pw); {
+	case errors.Is(err, pwdpolicy.ErrTooShort):
+		//sayso-lint:ignore log-coverage
+		return fmt.Errorf("password too short: %w", user.ErrPasswordTooShort)
+	case errors.Is(err, pwdpolicy.ErrTooCommon):
+		//sayso-lint:ignore log-coverage
+		return fmt.Errorf("password too common: %w", user.ErrPasswordTooCommon)
+	case err != nil:
+		//sayso-lint:ignore log-coverage
+		return fmt.Errorf("pwd policy: %w: %w", err, user.ErrUserInternal)
 	}
 	return nil
 }
 
-// LogoutAll 退出用户的所有设备。
-//
-// 返回 ErrUserInternal。
-func (s *userService) LogoutAll(ctx context.Context, userID uint64) error {
-	if err := s.sessionStore.DeleteAll(ctx, userID); err != nil {
-		s.log.ErrorCtx(ctx, "退出所有设备失败", err, map[string]any{"user_id": userID})
-		return fmt.Errorf("logout all: %w: %w", err, user.ErrUserInternal)
+// loginLockTTL 解析 cfg.User.LoginFail.LockTTL,失败回退 15m。
+func (s *userService) loginLockTTL() time.Duration {
+	const fallback = 15 * time.Minute
+	if s.userCfg == nil || s.userCfg.LoginFail.LockTTL == "" {
+		return fallback
 	}
-	return nil
+	d, err := time.ParseDuration(s.userCfg.LoginFail.LockTTL)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
 }
 
-// generateAuthResponse 生成 access/refresh token 对,保存 session 到 Redis,并组装响应。
-func (s *userService) generateAuthResponse(ctx context.Context, u *model.User, deviceID, deviceName, loginIP string) (*AuthResponse, error) {
-	//sayso-lint:ignore err-swallow
-	accessToken, _, err := s.jwtManager.GenerateAccessToken(u.ID, u.Email, deviceID)
-	if err != nil {
-		s.log.ErrorCtx(ctx, "生成 access token 失败", err, map[string]any{"user_id": u.ID})
-		return nil, fmt.Errorf("generate access token: %w: %w", err, user.ErrUserInternal)
+// loginFailMax 连续失败触发锁定的阈值,userCfg 为 nil 返回 0(不锁)。
+func (s *userService) loginFailMax() int {
+	if s.userCfg == nil {
+		return 0
 	}
-
-	//sayso-lint:ignore err-swallow
-	refreshToken, _, err := s.jwtManager.GenerateRefreshToken(u.ID, u.Email, deviceID)
-	if err != nil {
-		s.log.ErrorCtx(ctx, "生成 refresh token 失败", err, map[string]any{"user_id": u.ID})
-		return nil, fmt.Errorf("generate refresh token: %w: %w", err, user.ErrUserInternal)
-	}
-
-	// 解析 refresh token 取 JTI
-	refreshClaims, err := s.jwtManager.ValidateRefreshToken(refreshToken)
-	if err != nil {
-		s.log.ErrorCtx(ctx, "解析 refresh token JTI 失败", err, map[string]any{"user_id": u.ID})
-		return nil, fmt.Errorf("parse refresh jti: %w: %w", err, user.ErrUserInternal)
-	}
-
-	// 检查设备数量限制(同一设备重新登录不计入)
-	if s.maxSessionsPerUser > 0 {
-		//sayso-lint:ignore err-swallow
-		existing, _ := s.sessionStore.Get(ctx, u.ID, deviceID) // 丢弃 error,Get 失败视为新设备
-		if existing == nil { // 新设备
-			//sayso-lint:ignore err-shadow
-			sessions, err := s.sessionStore.List(ctx, u.ID)
-			if err == nil && len(sessions) >= s.maxSessionsPerUser {
-				s.log.WarnCtx(ctx, "设备数量已达上限", map[string]any{
-					"user_id": u.ID, "limit": s.maxSessionsPerUser, "current": len(sessions),
-				})
-				return nil, fmt.Errorf("session limit: %w", user.ErrSessionLimitReached)
-			}
-		}
-	}
-
-	// 保存 session 到 Redis
-	sessionInfo := user.SessionInfo{
-		JTI:        refreshClaims.ID,
-		DeviceName: deviceName,
-		LoginIP:    loginIP,
-		LoginAt:    time.Now().UTC().Unix(),
-	}
-	if err := s.sessionStore.Save(ctx, u.ID, deviceID, sessionInfo, s.jwtManager.RefreshTokenDuration()); err != nil {
-		s.log.ErrorCtx(ctx, "保存 session 失败", err, map[string]any{"user_id": u.ID, "device_id": deviceID})
-		return nil, fmt.Errorf("save session: %w: %w", err, user.ErrUserInternal)
-	}
-
-	return &AuthResponse{
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		ExpiresIn:    s.jwtManager.GetAccessTokenDuration(),
-		User:         *toUserProfile(u),
-	}, nil
+	return s.userCfg.LoginFail.Max
 }
 
-// toUserProfile 将 model.User 转为 UserProfile DTO。
-func toUserProfile(u *model.User) *UserProfile {
-	return &UserProfile{
-		ID:          u.ID,
-		Email:       u.Email,
-		DisplayName: u.DisplayName,
-		AvatarURL:   u.AvatarURL,
-		Status:      u.Status,
-		LastLoginAt: u.LastLoginAt,
-		CreatedAt:   u.CreatedAt,
+// registerRateMax / registerRateWindow 返回注册滑动窗口参数,userCfg 为 nil 时返 0(不限流)。
+func (s *userService) registerRateMax() int {
+	if s.userCfg == nil {
+		return 0
 	}
+	return s.userCfg.RegisterRate.Max
+}
+
+func (s *userService) registerRateWindow() time.Duration {
+	const fallback = 60 * time.Second
+	if s.userCfg == nil || s.userCfg.RegisterRate.WindowSec == 0 {
+		return fallback
+	}
+	return time.Duration(s.userCfg.RegisterRate.WindowSec) * time.Second
 }

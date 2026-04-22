@@ -18,6 +18,9 @@ import (
 )
 
 // Repository async_jobs 表 CRUD。
+// 11 个方法对应 Job 生命周期的 Create / 状态机(MarkRunning/Heartbeat/MarkFinished/ReapStale)/ 进度(SetTotal/IncProgress)/ 查询 —— 各职责正交,拆分会让 Service 拼装多个子仓库、收益很低。
+//
+//sayso-lint:ignore interface-pollution
 type Repository interface {
 	// Create 插入 queued 任务。返回带 ID 的行。
 	Create(ctx context.Context, in *model.Job) error
@@ -53,11 +56,6 @@ type Repository interface {
 	// ReapStale 启动时扫"status=running 且 heartbeat 陈旧"的行,标 failed。
 	// 返被回收条数。err 仅 DB 异常。
 	ReapStale(ctx context.Context, olderThan time.Duration) (int64, error)
-
-	// ListByUser 列出某用户该 kind 的最近 limit 条任务(按 id DESC)。
-	// 用途:前端"同步历史"区块 —— 让用户看到过去每次同步的状态、错误、失败明细。
-	// limit 上限由 service 层管控,repo 只负责 LIMIT 截断。
-	ListByUser(ctx context.Context, userID uint64, kind string, limit int) ([]*model.Job, error)
 }
 
 // New 构造。
@@ -122,7 +120,7 @@ func (r *gormRepo) FindLatest(ctx context.Context, userID uint64, kind string) (
 }
 
 func (r *gormRepo) MarkRunning(ctx context.Context, id uint64) error {
-	now := time.Now()
+	now := time.Now().UTC()
 	res := r.db.WithContext(ctx).Model(&model.Job{}).
 		Where("id = ? AND status = ?", id, model.StatusQueued).
 		Updates(map[string]any{
@@ -142,7 +140,7 @@ func (r *gormRepo) MarkRunning(ctx context.Context, id uint64) error {
 func (r *gormRepo) Heartbeat(ctx context.Context, id uint64) error {
 	if err := r.db.WithContext(ctx).Model(&model.Job{}).
 		Where("id = ?", id).
-		Update("heartbeat_at", time.Now()).Error; err != nil {
+		Update("heartbeat_at", time.Now().UTC()).Error; err != nil {
 		return fmt.Errorf("async job heartbeat: %w", err)
 	}
 	return nil
@@ -177,7 +175,7 @@ func (r *gormRepo) IncProgress(ctx context.Context, id uint64, deltaDone, deltaF
 }
 
 func (r *gormRepo) MarkFinished(ctx context.Context, id uint64, status model.Status, result datatypes.JSON, errMsg string) error {
-	now := time.Now()
+	now := time.Now().UTC()
 	updates := map[string]any{
 		"status":      status,
 		"finished_at": now,
@@ -198,27 +196,9 @@ func (r *gormRepo) MarkFinished(ctx context.Context, id uint64, status model.Sta
 	return nil
 }
 
-func (r *gormRepo) ListByUser(ctx context.Context, userID uint64, kind string, limit int) ([]*model.Job, error) {
-	if userID == 0 || kind == "" {
-		return nil, fmt.Errorf("async job list: user_id + kind required")
-	}
-	if limit <= 0 {
-		limit = 20
-	}
-	var rows []*model.Job
-	if err := r.db.WithContext(ctx).
-		Where("user_id = ? AND kind = ?", userID, kind).
-		Order("id DESC").
-		Limit(limit).
-		Find(&rows).Error; err != nil {
-		return nil, fmt.Errorf("async job list: %w", err)
-	}
-	return rows, nil
-}
-
 func (r *gormRepo) ReapStale(ctx context.Context, olderThan time.Duration) (int64, error) {
-	cutoff := time.Now().Add(-olderThan)
-	now := time.Now()
+	cutoff := time.Now().UTC().Add(-olderThan)
+	now := time.Now().UTC()
 	// heartbeat_at IS NULL 也算 stale —— 理论上 MarkRunning 已填首次 heartbeat,
 	// 仍为 NULL 说明崩在 MarkRunning 和首次 Heartbeat 之间。
 	res := r.db.WithContext(ctx).Model(&model.Job{}).

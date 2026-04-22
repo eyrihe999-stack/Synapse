@@ -1,4 +1,4 @@
-// org_service.go 组织本体的 CRUD / 设置 / 转让 / 解散 service。
+// org_service.go 组织本体的 CRUD / 解散 service。
 package service
 
 import (
@@ -12,7 +12,7 @@ import (
 	"github.com/eyrihe999-stack/Synapse/internal/organization/dto"
 	"github.com/eyrihe999-stack/Synapse/internal/organization/model"
 	"github.com/eyrihe999-stack/Synapse/internal/organization/repository"
-	"github.com/eyrihe999-stack/Synapse/pkg/logger"
+	"github.com/eyrihe999-stack/Synapse/internal/common/logger"
 	"gorm.io/gorm"
 )
 
@@ -20,50 +20,72 @@ import (
 //sayso-lint:ignore interface-pollution
 type OrgService interface {
 	// CreateOrg 创建一个 org 并把调用者设为 owner。
-	// 事务内插入:org / 3 条预设角色 / owner member / role_history
 	CreateOrg(ctx context.Context, userID uint64, req dto.CreateOrgRequest) (*dto.OrgResponse, error)
 
 	// GetOrgBySlug 查 org 详情。调用方应该先确认 user 是成员。
 	GetOrgBySlug(ctx context.Context, slug string) (*dto.OrgResponse, error)
 
-	// ListOrgsByUser 列出某用户所属的所有 org(含当前用户在其中的角色)。
-	ListOrgsByUser(ctx context.Context, userID uint64) ([]dto.OrgWithMyRoleResponse, error)
+	// CheckSlug 预检 slug 合法性与可用性。
+	CheckSlug(ctx context.Context, slug string) (*dto.CheckSlugResponse, error)
 
-	// UpdateOrg 更新 org 基础信息(display_name / description)。需要 PermOrgUpdate。
+	// ListOrgsByUser 列出某用户所属的所有 org。
+	ListOrgsByUser(ctx context.Context, userID uint64) ([]dto.OrgWithMembershipResponse, error)
+
+	// UpdateOrg 更新 org 基础信息(display_name / description)。
 	UpdateOrg(ctx context.Context, orgID uint64, req dto.UpdateOrgRequest) (*dto.OrgResponse, error)
 
-	// UpdateSettings 更新 org 设置(require_agent_review / record_full_payload)。
-	// 需要 PermOrgSettingsReviewToggle。
-	UpdateSettings(ctx context.Context, orgID uint64, req dto.UpdateOrgSettingsRequest) (*dto.OrgResponse, error)
-
-	// DissolveOrg 解散 org(owner 独占)。主事务提交后触发 OnOrgDissolved hooks。
+	// DissolveOrg 软删除 org(标记 status=dissolved + dissolved_at)。
 	DissolveOrg(ctx context.Context, orgID uint64) error
 
 	// GetOrgByID 内部工具,按 ID 取 org。
 	GetOrgByID(ctx context.Context, orgID uint64) (*model.Org, error)
+
+	// IsMember 查询指定 user 是否是 active org 的成员。
+	// 用于 OAuth consent 页的成员资格二次校验。
+	IsMember(ctx context.Context, orgID, userID uint64) (bool, error)
 }
 
 // ─── 实现 ────────────────────────────────────────────────────────────────────
 
 type orgService struct {
-	cfg    Config
-	repo   repository.Repository
-	hooks  *HookRegistry
-	logger logger.LoggerInterface
+	cfg      Config
+	repo     repository.Repository
+	logger   logger.LoggerInterface
+	verifier UserVerifier // M1.1 邮箱验证 guard;nil 时 CreateOrg 不做前置校验
 }
 
 // NewOrgService 构造一个 OrgService 实例。
-// hooks 可以为 nil(测试时),生产环境必须传入以支持解散时的跨模块联动。
-func NewOrgService(cfg Config, repo repository.Repository, hooks *HookRegistry, log logger.LoggerInterface) OrgService {
-	return &orgService{cfg: cfg, repo: repo, hooks: hooks, logger: log}
+func NewOrgService(cfg Config, repo repository.Repository, verifier UserVerifier, log logger.LoggerInterface) OrgService {
+	return &orgService{cfg: cfg, repo: repo, logger: log, verifier: verifier}
 }
 
 // orgSlugRegexp 预编译的 slug 校验正则。
 var orgSlugRegexp = regexp.MustCompile(organization.OrgSlugPattern)
 
-// CreateOrg 创建新 org 并把调用者注册为 owner。事务内完成:写 org、种 3 条预设角色、插 owner member、写角色历史。
-// 可能返回:ErrOrgSlugInvalid / ErrOrgDisplayNameInvalid / ErrOrgMaxOwnedReached / ErrOrgSlugTaken / ErrOrgInternal
+// CreateOrg 创建新 org 并把调用者注册为 owner。事务内:写 org + 插 owner member。
+//
+// 可能的错误:
+//   - ErrOrgUserNotVerified:邮箱未验证
+//   - ErrOrgSlugInvalid:slug 格式非法
+//   - ErrOrgDisplayNameInvalid:display_name 非法
+//   - ErrOrgInvalidRequest:description 超长
+//   - ErrOrgMaxOwnedReached:超出每用户创建上限
+//   - ErrOrgSlugTaken:slug 已被占用
+//   - ErrOrgInternal:数据库查询或事务执行失败
 func (s *orgService) CreateOrg(ctx context.Context, userID uint64, req dto.CreateOrgRequest) (*dto.OrgResponse, error) {
+	// M1.1 前置:邮箱未验证的账号不允许创建 org
+	if s.verifier != nil {
+		verified, vErr := s.verifier.IsUserVerified(ctx, userID)
+		if vErr != nil {
+			s.logger.ErrorCtx(ctx, "查询邮箱验证状态失败", vErr, map[string]any{"user_id": userID})
+			return nil, fmt.Errorf("check verified: %w: %w", vErr, organization.ErrOrgInternal)
+		}
+		if !verified {
+			s.logger.WarnCtx(ctx, "邮箱未验证,拒绝创建 org", map[string]any{"user_id": userID})
+			return nil, fmt.Errorf("email unverified: %w", organization.ErrOrgUserNotVerified)
+		}
+	}
+
 	// 参数校验
 	if !orgSlugRegexp.MatchString(req.Slug) {
 		s.logger.WarnCtx(ctx, "slug 格式非法", map[string]any{"user_id": userID, "slug": req.Slug})
@@ -100,51 +122,36 @@ func (s *orgService) CreateOrg(ctx context.Context, userID uint64, req dto.Creat
 
 	var createdOrg *model.Org
 
-	// 事务内:创建 org + 3 条预设角色 + owner member + role_history
+	// 事务内:创建 org + seed 三个系统角色 + owner member(挂 owner 角色)
 	err = s.repo.WithTx(ctx, func(tx repository.Repository) error {
 		now := time.Now().UTC()
 		org := &model.Org{
-			Slug:               req.Slug,
-			DisplayName:        req.DisplayName,
-			Description:        req.Description,
-			OwnerUserID:        userID,
-			Status:             model.OrgStatusActive,
-			RequireAgentReview: false,
-			RecordFullPayload:  false,
+			Slug:        req.Slug,
+			DisplayName: req.DisplayName,
+			Description: req.Description,
+			OwnerUserID: userID,
+			Status:      model.OrgStatusActive,
 		}
 		if createOrgErr := tx.CreateOrg(ctx, org); createOrgErr != nil {
 			s.logger.ErrorCtx(ctx, "事务内创建 org 失败", createOrgErr, map[string]any{"user_id": userID, "slug": req.Slug})
 			return fmt.Errorf("tx create org: %w: %w", createOrgErr, organization.ErrOrgInternal)
 		}
 
-		// 种入 3 条预设角色,设置 org_id
-		presetRoles := BuildPresetRoles()
-		for _, r := range presetRoles {
-			r.OrgID = org.ID
+		systemRoles, seedErr := tx.SeedSystemRolesForOrg(ctx, org.ID)
+		if seedErr != nil {
+			s.logger.ErrorCtx(ctx, "事务内 seed 系统角色失败", seedErr, map[string]any{"org_id": org.ID, "user_id": userID})
+			return fmt.Errorf("tx seed system roles: %w: %w", seedErr, organization.ErrOrgInternal)
 		}
-		if createRoleErr := tx.CreateRolesBatch(ctx, presetRoles); createRoleErr != nil {
-			s.logger.ErrorCtx(ctx, "事务内种预设角色失败", createRoleErr, map[string]any{"org_id": org.ID})
-			return fmt.Errorf("tx create preset roles: %w: %w", createRoleErr, organization.ErrOrgInternal)
-		}
-
-		// 找到 owner 角色 ID
-		var ownerRoleID uint64
-		for _, r := range presetRoles {
-			if r.Name == organization.RoleOwner {
-				ownerRoleID = r.ID
-				break
-			}
-		}
-		if ownerRoleID == 0 {
-			s.logger.ErrorCtx(ctx, "预设 owner 角色 ID 为 0", nil, map[string]any{"org_id": org.ID})
-			return fmt.Errorf("preset owner role missing: %w", organization.ErrOrgInternal)
+		ownerRole, ok := systemRoles[model.SystemRoleSlugOwner]
+		if !ok || ownerRole == nil {
+			s.logger.ErrorCtx(ctx, "seed 后缺少 owner 角色", nil, map[string]any{"org_id": org.ID})
+			return fmt.Errorf("owner role missing after seed: %w", organization.ErrOrgInternal)
 		}
 
-		// 创建 owner member
 		ownerMember := &model.OrgMember{
 			OrgID:    org.ID,
 			UserID:   userID,
-			RoleID:   ownerRoleID,
+			RoleID:   ownerRole.ID,
 			JoinedAt: now,
 		}
 		if createMemberErr := tx.CreateMember(ctx, ownerMember); createMemberErr != nil {
@@ -152,24 +159,10 @@ func (s *orgService) CreateOrg(ctx context.Context, userID uint64, req dto.Creat
 			return fmt.Errorf("tx create owner member: %w: %w", createMemberErr, organization.ErrOrgInternal)
 		}
 
-		// 角色历史:首次加入
-		if historyErr := tx.AppendRoleHistory(ctx, &model.OrgMemberRoleHistory{
-			OrgID:           org.ID,
-			UserID:          userID,
-			FromRoleID:      nil,
-			ToRoleID:        ownerRoleID,
-			ChangedByUserID: userID,
-			Reason:          organization.RoleChangeReasonJoin,
-		}); historyErr != nil {
-			s.logger.ErrorCtx(ctx, "事务内写首次加入历史失败", historyErr, map[string]any{"org_id": org.ID})
-			return fmt.Errorf("tx append role history: %w: %w", historyErr, organization.ErrOrgInternal)
-		}
-
 		createdOrg = org
 		return nil
 	})
 	if err != nil {
-		// 事务内的日志已打,这里只返回
 		if errors.Is(err, organization.ErrOrgInternal) || errors.Is(err, organization.ErrOrgSlugTaken) {
 			s.logger.ErrorCtx(ctx, "创建 org 事务失败", err, map[string]any{"user_id": userID, "slug": req.Slug})
 		}
@@ -182,7 +175,12 @@ func (s *orgService) CreateOrg(ctx context.Context, userID uint64, req dto.Creat
 	return &resp, nil
 }
 
-// GetOrgBySlug 按 slug 查询 org 详情。已解散的 org 返回 ErrOrgDissolved,不存在返回 ErrOrgNotFound。
+// GetOrgBySlug 按 slug 查询 org 详情。
+//
+// 可能的错误:
+//   - ErrOrgNotFound:slug 对应的 org 不存在
+//   - ErrOrgDissolved:org 已解散
+//   - ErrOrgInternal:数据库查询失败
 func (s *orgService) GetOrgBySlug(ctx context.Context, slug string) (*dto.OrgResponse, error) {
 	org, err := s.repo.FindOrgBySlug(ctx, slug)
 	if err != nil {
@@ -201,29 +199,33 @@ func (s *orgService) GetOrgBySlug(ctx context.Context, slug string) (*dto.OrgRes
 	return &resp, nil
 }
 
-// ListOrgsByUser 列出某用户所属的所有 active org,并附带其角色快照。查询失败返回 ErrOrgInternal。
-func (s *orgService) ListOrgsByUser(ctx context.Context, userID uint64) ([]dto.OrgWithMyRoleResponse, error) {
+// ListOrgsByUser 列出某用户所属的所有 active org。
+//
+// 可能的错误:
+//   - ErrOrgInternal:数据库查询失败
+func (s *orgService) ListOrgsByUser(ctx context.Context, userID uint64) ([]dto.OrgWithMembershipResponse, error) {
 	rows, err := s.repo.ListOrgsByUser(ctx, userID)
 	if err != nil {
 		s.logger.ErrorCtx(ctx, "列出我的 org 失败", err, map[string]any{"user_id": userID})
 		return nil, fmt.Errorf("list orgs: %w: %w", err, organization.ErrOrgInternal)
 	}
-	out := make([]dto.OrgWithMyRoleResponse, 0, len(rows))
+	out := make([]dto.OrgWithMembershipResponse, 0, len(rows))
 	for _, r := range rows {
-		item := dto.OrgWithMyRoleResponse{
+		out = append(out, dto.OrgWithMembershipResponse{
 			Org:      orgToDTO(r.Org),
 			JoinedAt: r.Member.JoinedAt.Unix(),
-		}
-		if r.Role != nil {
-			item.MyRole = roleToSummary(r.Role)
-		}
-		out = append(out, item)
+		})
 	}
 	return out, nil
 }
 
-// UpdateOrg 部分更新 org 的 display_name 和 description,权限判断由 handler 中间件前置完成。
-// 可能返回:ErrOrgDisplayNameInvalid / ErrOrgInvalidRequest / ErrOrgNotFound / ErrOrgInternal
+// UpdateOrg 部分更新 org 的 display_name 和 description。
+//
+// 可能的错误:
+//   - ErrOrgDisplayNameInvalid:display_name 非法
+//   - ErrOrgInvalidRequest:description 超长
+//   - ErrOrgNotFound:org 不存在(loadOrgDTO 返回)
+//   - ErrOrgInternal:数据库查询或更新失败
 func (s *orgService) UpdateOrg(ctx context.Context, orgID uint64, req dto.UpdateOrgRequest) (*dto.OrgResponse, error) {
 	updates := map[string]any{}
 	if req.DisplayName != nil {
@@ -252,31 +254,10 @@ func (s *orgService) UpdateOrg(ctx context.Context, orgID uint64, req dto.Update
 	return s.loadOrgDTO(ctx, orgID)
 }
 
-// UpdateSettings 更新 org 运行时开关(require_agent_review、record_full_payload)。
-// 未提供任何字段时返回当前 org 的 DTO。数据库失败返回 ErrOrgInternal。
-func (s *orgService) UpdateSettings(ctx context.Context, orgID uint64, req dto.UpdateOrgSettingsRequest) (*dto.OrgResponse, error) {
-	updates := map[string]any{}
-	if req.RequireAgentReview != nil {
-		updates["require_agent_review"] = *req.RequireAgentReview
-	}
-	if req.RecordFullPayload != nil {
-		updates["record_full_payload"] = *req.RecordFullPayload
-	}
-	if len(updates) == 0 {
-		//sayso-lint:ignore sentinel-wrap,log-coverage
-		return s.loadOrgDTO(ctx, orgID)
-	}
-	if err := s.repo.UpdateOrgFields(ctx, orgID, updates); err != nil {
-		s.logger.ErrorCtx(ctx, "更新 org 设置失败", err, map[string]any{"org_id": orgID})
-		return nil, fmt.Errorf("update settings: %w: %w", err, organization.ErrOrgInternal)
-	}
-	s.logger.InfoCtx(ctx, "org 设置已更新", map[string]any{"org_id": orgID, "updates": len(updates)})
-	//sayso-lint:ignore sentinel-wrap
-	return s.loadOrgDTO(ctx, orgID)
-}
-
-// DissolveOrg 软删除 org(标记 status=dissolved 并记录时间),解散后触发 OnOrgDissolved hook。
-// 权限校验由 handler 层完成。数据库失败返回 ErrOrgInternal。
+// DissolveOrg 软删除 org(标记 status=dissolved + dissolved_at)。
+//
+// 可能的错误:
+//   - ErrOrgInternal:数据库更新失败
 func (s *orgService) DissolveOrg(ctx context.Context, orgID uint64) error {
 	now := time.Now().UTC()
 	updates := map[string]any{
@@ -288,16 +269,30 @@ func (s *orgService) DissolveOrg(ctx context.Context, orgID uint64) error {
 		return fmt.Errorf("dissolve org: %w: %w", err, organization.ErrOrgInternal)
 	}
 	s.logger.InfoCtx(ctx, "org 已解散", map[string]any{"org_id": orgID})
-
-	// 事后触发跨模块 hook(失败只记日志,不回滚)
-	if s.hooks != nil {
-		s.hooks.FireOrgDissolved(ctx, orgID)
-	}
 	return nil
 }
 
+// CheckSlug 对前端输入的 slug 做一次预检,返回 (available, reason)。
+func (s *orgService) CheckSlug(ctx context.Context, slug string) (*dto.CheckSlugResponse, error) {
+	if !orgSlugRegexp.MatchString(slug) {
+		return &dto.CheckSlugResponse{Available: false, Reason: organization.SlugCheckReasonInvalidFormat}, nil
+	}
+	existing, err := s.repo.FindOrgBySlug(ctx, slug)
+	if err == nil && existing != nil {
+		return &dto.CheckSlugResponse{Available: false, Reason: organization.SlugCheckReasonTaken}, nil
+	}
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		s.logger.ErrorCtx(ctx, "slug 预检查询失败", err, map[string]any{"slug": slug})
+		return nil, fmt.Errorf("check slug: %w: %w", err, organization.ErrOrgInternal)
+	}
+	return &dto.CheckSlugResponse{Available: true}, nil
+}
+
 // GetOrgByID 按 ID 加载原始 model.Org,供中间件和内部代码使用。
-// 不存在返回 ErrOrgNotFound,数据库失败返回 ErrOrgInternal。
+//
+// 可能的错误:
+//   - ErrOrgNotFound:orgID 对应记录不存在
+//   - ErrOrgInternal:数据库查询失败
 func (s *orgService) GetOrgByID(ctx context.Context, orgID uint64) (*model.Org, error) {
 	org, err := s.repo.FindOrgByID(ctx, orgID)
 	if err != nil {
@@ -311,7 +306,33 @@ func (s *orgService) GetOrgByID(ctx context.Context, orgID uint64) (*model.Org, 
 	return org, nil
 }
 
-// loadOrgDTO 内部工具:按 ID 重新加载 org 并转成 DTO,用于 UpdateOrg / UpdateSettings 返回最新状态。
+// IsMember 校验指定 user 是否是 org 的 active 成员。
+// orgID 不存在或 org 已解散或 user 不是成员 → (false, nil)。
+func (s *orgService) IsMember(ctx context.Context, orgID, userID uint64) (bool, error) {
+	org, err := s.repo.FindOrgByID(ctx, orgID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		s.logger.ErrorCtx(ctx, "查询 org 失败", err, map[string]any{"org_id": orgID})
+		return false, fmt.Errorf("find org: %w: %w", err, organization.ErrOrgInternal)
+	}
+	if org.Status != model.OrgStatusActive {
+		return false, nil
+	}
+	//sayso-lint:ignore err-swallow
+	_, err = s.repo.FindMember(ctx, orgID, userID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		s.logger.ErrorCtx(ctx, "查询成员失败", err, map[string]any{"org_id": orgID, "user_id": userID})
+		return false, fmt.Errorf("find member: %w: %w", err, organization.ErrOrgInternal)
+	}
+	return true, nil
+}
+
+// loadOrgDTO 内部工具:按 ID 重新加载 org 并转成 DTO。
 func (s *orgService) loadOrgDTO(ctx context.Context, orgID uint64) (*dto.OrgResponse, error) {
 	org, err := s.repo.FindOrgByID(ctx, orgID)
 	if err != nil {

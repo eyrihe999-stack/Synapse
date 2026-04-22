@@ -1,16 +1,9 @@
 // repository.go 组织模块统一的 Repository 接口定义与事务封装。
-//
-// 设计说明:
-//   - 整个模块共享一个 Repository 接口,方法按资源分组(org / member / role /
-//     invitation / role_history),每组方法的实现放在同名文件里。
-//   - WithTx 是事务入口:service 层通过 WithTx 在一个事务内跨多张表写入。
-//   - 事务内返回的 tx-bound Repository 拥有和外层完全相同的方法集,方便
-//     service 层无感知地切换事务/非事务调用。
-//   - 读方法(Find / List / Count 等)同样可以在事务内走 tx,保证读自己写。
 package repository
 
 import (
 	"context"
+	"time"
 
 	"github.com/eyrihe999-stack/Synapse/internal/organization/model"
 	"gorm.io/gorm"
@@ -18,15 +11,11 @@ import (
 
 // Repository 组织模块的数据访问入口。
 //
-// 方法按资源分组,跨资源的事务通过 WithTx 获得一个绑定到同一个 tx 的
-// Repository 实例。
-//
 //sayso-lint:ignore interface-pollution
 type Repository interface {
 	// ─── 事务 ──────────────────────────────────────────────────────────────
 
 	// WithTx 在事务内执行 fn,事务内所有 repo 调用共享同一个 tx。
-	// fn 返回 nil 则提交,返回 error 则回滚。
 	WithTx(ctx context.Context, fn func(tx Repository) error) error
 
 	// ─── Org ──────────────────────────────────────────────────────────────
@@ -39,30 +28,36 @@ type Repository interface {
 	FindOrgBySlug(ctx context.Context, slug string) (*model.Org, error)
 	// UpdateOrgFields 部分更新 org 字段(只更新 updates map 里的列)。
 	UpdateOrgFields(ctx context.Context, id uint64, updates map[string]any) error
-	// CountOwnedOrgsByUser 统计某用户作为 owner 的 org 数量(含已解散需要传 false 排除)。
+	// CountOwnedOrgsByUser 统计某用户作为 owner 的 org 数量。
 	CountOwnedOrgsByUser(ctx context.Context, userID uint64, includeDissolved bool) (int64, error)
-	// ListOrgsByUser 列出某用户所属的所有 org(JOIN members),返回 org 列表和对应的 member 行。
-	// 实现会一次性取回 org 和 member 方便 handler 返回 "org + 我的角色" 的视图。
+	// ListActiveOrgsOwnedBy 列出某用户作为 owner 的所有 active org(按 slug 字典序)。
+	ListActiveOrgsOwnedBy(ctx context.Context, userID uint64) ([]*model.Org, error)
+	// ListOrgsByUser 列出某用户所属的所有 active org(JOIN members)。
 	ListOrgsByUser(ctx context.Context, userID uint64) ([]OrgWithMember, error)
 
 	// ─── Role ─────────────────────────────────────────────────────────────
 
-	// CreateRole 创建一个角色(预设或自定义)。
+	// CreateRole 创建一条角色记录(系统 seed 或自定义角色均经此方法)。
 	CreateRole(ctx context.Context, role *model.OrgRole) error
-	// CreateRolesBatch 批量创建角色(org 创建时种预设用)。
-	CreateRolesBatch(ctx context.Context, roles []*model.OrgRole) error
-	// FindRoleByID 按 ID 查找。
+	// FindRoleByID 按主键查找角色,不存在返回 gorm.ErrRecordNotFound。
 	FindRoleByID(ctx context.Context, id uint64) (*model.OrgRole, error)
-	// FindRoleByOrgName 按 (org_id, name) 查找。
-	FindRoleByOrgName(ctx context.Context, orgID uint64, name string) (*model.OrgRole, error)
-	// ListRolesByOrg 列出某 org 的所有角色。
+	// FindRoleByOrgAndSlug 在某 org 内按 slug 查找角色。
+	FindRoleByOrgAndSlug(ctx context.Context, orgID uint64, slug string) (*model.OrgRole, error)
+	// ListRolesByOrg 列出某 org 的所有角色,系统角色在前(owner→admin→member),自定义角色按 slug 字典序。
 	ListRolesByOrg(ctx context.Context, orgID uint64) ([]*model.OrgRole, error)
-	// UpdateRoleFields 部分更新角色。
-	UpdateRoleFields(ctx context.Context, id uint64, updates map[string]any) error
-	// DeleteRole 删除角色(service 层需确保非预设且无成员引用)。
+	// UpdateRoleDisplayName 只更新 display_name 字段。
+	UpdateRoleDisplayName(ctx context.Context, id uint64, displayName string) error
+	// UpdateRolePermissions 替换 permissions 字段为给定集合。同事务写 audit。
+	UpdateRolePermissions(ctx context.Context, id uint64, perms []string) error
+	// DeleteRole 硬删除一条角色。调用方须先保证无成员挂该角色。
 	DeleteRole(ctx context.Context, id uint64) error
-	// CountMembersByRoleID 统计某角色有多少成员在用,用于删除前检查。
-	CountMembersByRoleID(ctx context.Context, roleID uint64) (int64, error)
+	// CountCustomRolesByOrg 统计某 org 的自定义角色数(is_system=false)。
+	CountCustomRolesByOrg(ctx context.Context, orgID uint64) (int64, error)
+	// CountMembersByRole 统计某 role 下的成员数,删除前用来判断是否有成员占用。
+	CountMembersByRole(ctx context.Context, roleID uint64) (int64, error)
+	// SeedSystemRolesForOrg 给一个 org 幂等插入三条系统角色,返回 slug→OrgRole 的映射。
+	// CreateOrg 事务内调用;migration 路径有自己的 batch 版本不复用这个。
+	SeedSystemRolesForOrg(ctx context.Context, orgID uint64) (map[string]*model.OrgRole, error)
 
 	// ─── Member ───────────────────────────────────────────────────────────
 
@@ -70,87 +65,143 @@ type Repository interface {
 	CreateMember(ctx context.Context, member *model.OrgMember) error
 	// FindMember 按 (org_id, user_id) 查找。
 	FindMember(ctx context.Context, orgID, userID uint64) (*model.OrgMember, error)
-	// FindMemberWithRole 查找成员并携带其角色(JOIN roles)。
-	FindMemberWithRole(ctx context.Context, orgID, userID uint64) (*MemberWithRole, error)
-	// ListMembersByOrg 分页列出 org 的所有成员(JOIN roles)。
-	ListMembersByOrg(ctx context.Context, orgID uint64, page, size int) ([]*MemberWithRole, int64, error)
+	// ListMembersByOrg 分页列出 org 的所有成员,JOIN users + org_roles 回填展示字段。
+	// users 记录缺失时字段为空串;role 记录缺失时(数据回填遗漏等极端情况)也为空串,service 层不过滤。
+	ListMembersByOrg(ctx context.Context, orgID uint64, page, size int) ([]*MemberWithProfile, int64, error)
 	// CountMembersByOrg 统计某 org 的成员数。
 	CountMembersByOrg(ctx context.Context, orgID uint64) (int64, error)
-	// CountMembersByUser 统计某用户加入的 org 数。
+	// CountMembersByUser 统计某用户加入的 active org 数。
 	CountMembersByUser(ctx context.Context, userID uint64) (int64, error)
-	// UpdateMemberRole 变更成员角色。
+	// UpdateMemberRole 更新 (org_id, user_id) 成员的 role_id。
 	UpdateMemberRole(ctx context.Context, orgID, userID, roleID uint64) error
 	// DeleteMember 删除一条成员关系(踢出/退出)。
 	DeleteMember(ctx context.Context, orgID, userID uint64) error
 	// DeleteMembersByOrg 删除 org 下所有成员(解散时级联)。
 	DeleteMembersByOrg(ctx context.Context, orgID uint64) error
 
-	// ─── Invitation ───────────────────────────────────────────────────────
+	// ─── Invitation ────────────────────────────────────────────────────────
 
-	// CreateInvitation 创建一条邀请。
+	// CreateInvitation 创建一条邀请记录。
 	CreateInvitation(ctx context.Context, inv *model.OrgInvitation) error
-	// FindInvitationByID 按 ID 查找。
+	// FindInvitationByID 按主键查找邀请。不存在时返回 gorm.ErrRecordNotFound。
 	FindInvitationByID(ctx context.Context, id uint64) (*model.OrgInvitation, error)
-	// FindPendingByOrgInvitee 按 (org_id, invitee_user_id, status=pending) 查找唯一记录。
-	FindPendingByOrgInvitee(ctx context.Context, orgID, inviteeUserID uint64) (*model.OrgInvitation, error)
-	// ListPendingByInvitee 列出某用户收到的 pending 邀请。
-	ListPendingByInvitee(ctx context.Context, inviteeUserID uint64, page, size int) ([]*model.OrgInvitation, int64, error)
-	// ListByInvitee 列出某用户收到的邀请,按状态过滤(空字符串=全部)。
-	ListByInvitee(ctx context.Context, inviteeUserID uint64, status string, page, size int) ([]*model.OrgInvitation, int64, error)
-	// ListPendingByOrg 列出某 org 的 pending 邀请。
-	ListPendingByOrg(ctx context.Context, orgID uint64, page, size int) ([]*model.OrgInvitation, int64, error)
-	// ListByOrg 列出某 org 的邀请,按状态过滤(空字符串=全部)。
-	ListByOrg(ctx context.Context, orgID uint64, status string, page, size int) ([]*model.OrgInvitation, int64, error)
-	// UpdateInvitationStatus 更新邀请状态并记录 responded_at。
-	UpdateInvitationStatus(ctx context.Context, id uint64, status string) error
-	// ExpirePendingInvitations 将所有 expires_at < now 的 pending 邀请标记为 expired,返回受影响行数。
-	ExpirePendingInvitations(ctx context.Context) (int64, error)
+	// FindInvitationByTokenHash 按 token_hash 查找邀请。
+	FindInvitationByTokenHash(ctx context.Context, tokenHash string) (*model.OrgInvitation, error)
+	// FindPendingInvitation 查找 (org_id, email) 下 status=pending 的邀请(最多一条)。
+	// 不存在返回 gorm.ErrRecordNotFound。
+	FindPendingInvitation(ctx context.Context, orgID uint64, email string) (*model.OrgInvitation, error)
+	// ListInvitationsByOrg 列出某 org 下所有邀请(默认按 created_at DESC)。
+	// statusFilter 为空时返回全部状态;非空只返回指定状态。
+	ListInvitationsByOrg(ctx context.Context, orgID uint64, statusFilter string, page, size int) ([]*InvitationWithRole, int64, error)
+	// UpdateInvitationFields 部分更新邀请字段(status / token_hash / expires_at / accepted_at / accepted_user_id)。
+	UpdateInvitationFields(ctx context.Context, id uint64, updates map[string]any) error
 
-	// ─── Role History ────────────────────────────────────────────────────
+	// IsEmailMemberOfOrg 检查某 email 是否已是 org 的成员。
+	// email 大小写不敏感比较(JOIN users 表按 LOWER 比较)。
+	IsEmailMemberOfOrg(ctx context.Context, orgID uint64, email string) (bool, error)
 
-	// AppendRoleHistory 追加一条角色变更历史。
-	AppendRoleHistory(ctx context.Context, entry *model.OrgMemberRoleHistory) error
-	// ListRoleHistoryByMember 列出某成员的角色变更历史(按时间倒序)。
-	ListRoleHistoryByMember(ctx context.Context, orgID, userID uint64, limit int) ([]*model.OrgMemberRoleHistory, error)
+	// ListInvitationsByEmail 列出某 email 收到的邀请(被邀请人收件箱视图)。
+	// email 大小写不敏感比较。statusFilter 为空时返所有状态;非空只返指定状态。
+	// JOIN orgs + org_roles 一次性回填展示字段,省去 service 再 foreach 查。
+	ListInvitationsByEmail(ctx context.Context, email, statusFilter string) ([]*MyInvitationRow, error)
 
-	// ─── User Lookup(只读查询 users,供邀请候选人查找使用) ────────────
+	// ListInvitationsByInviter 列出某用户作为 inviter 发出的邀请(发件箱视图)。
+	// 跨 org 聚合,只返 orgs.status='active' 的行;statusFilter 语义同上。
+	ListInvitationsByInviter(ctx context.Context, inviterUserID uint64, statusFilter string) ([]*SentInvitationRow, error)
 
-	// FindUserProfileByID 按 user_id 查找,不存在返回 nil。
-	FindUserProfileByID(ctx context.Context, userID uint64) (*UserProfile, error)
-	// FindUserProfilesByEmail 按邮箱模糊查找,返回候选列表。
-	FindUserProfilesByEmail(ctx context.Context, email string, limit int) ([]*UserProfile, error)
-	// SearchUserProfilesByDisplayName 按昵称模糊查找(返回候选列表)。
-	SearchUserProfilesByDisplayName(ctx context.Context, name string, limit int) ([]*UserProfile, error)
+	// SearchInviteCandidates 按 (type, query) 在 users 表中搜候选邀请对象。
+	// type:
+	//   - "email"   → LOWER(email) = LOWER(?)，精确,limit 1
+	//   - "user_id" → id = ?，精确,limit 1
+	//   - "name"    → display_name LIKE '%q%'，模糊
+	// 只返 users.status=active(=1) 的行。
+	// 每条带 IsMember / HasPendingInvite 标记(LEFT JOIN + EXISTS 子查询)。
+	SearchInviteCandidates(ctx context.Context, orgID uint64, searchType, query string, limit int) ([]*InviteCandidate, error)
 }
 
-// OrgWithMember 是 ListOrgsByUser 的结果元组,把 org 和当前查询用户的 member 行
-// 打包一起返回,避免 handler 侧再跑一次查询拿角色。
+// OrgWithMember 是 ListOrgsByUser 的结果元组。
 type OrgWithMember struct {
 	Org    *model.Org
 	Member *model.OrgMember
-	Role   *model.OrgRole
 }
 
-// MemberWithRole 是 ListMembersByOrg 的结果元组,携带成员的角色展示信息。
-type MemberWithRole struct {
-	Member *model.OrgMember
-	Role   *model.OrgRole
+// MemberWithProfile 是 ListMembersByOrg 的结果元组,JOIN users + org_roles 把展示字段带回。
+// Email / DisplayName / AvatarURL / Status / EmailVerifiedAt / LastLoginAt 来自 users 表,
+// Role* 来自 org_roles;任一 JOIN 记录缺失时对应字段为空/零值/nil。
+type MemberWithProfile struct {
+	Member          *model.OrgMember
+	Email           string
+	DisplayName     string
+	AvatarURL       string
+	Status          int32
+	EmailVerifiedAt *time.Time
+	LastLoginAt     *time.Time
+	RoleSlug        string
+	RoleDisplayName string
+	RoleIsSystem    bool
 }
+
+// InvitationWithRole 是 ListInvitationsByOrg 的结果元组,JOIN org_roles 带回角色展示字段。
+// JOIN 失败(角色被删等极端情况)时 Role* 为零值。
+type InvitationWithRole struct {
+	Invitation      *model.OrgInvitation
+	RoleSlug        string
+	RoleDisplayName string
+	RoleIsSystem    bool
+}
+
+// InviteCandidate SearchInviteCandidates 的单条返回。
+// IsMember / HasPendingInvite 由 SQL 直接打标,前端据此灰掉不可点的条目。
+type InviteCandidate struct {
+	UserID           uint64
+	Email            string
+	DisplayName      string
+	AvatarURL        string
+	IsMember         bool
+	HasPendingInvite bool
+}
+
+// MyInvitationRow ListInvitationsByEmail 的结果元组。
+// invitation 本体 + JOIN orgs 带回的 org 展示字段 + JOIN org_roles 带回的角色字段。
+// 角色 JOIN 失败(role 被删等极端)时 Role* 为零值。
+type MyInvitationRow struct {
+	Invitation      *model.OrgInvitation
+	OrgSlug         string
+	OrgDisplayName  string
+	RoleSlug        string
+	RoleDisplayName string
+	RoleIsSystem    bool
+}
+
+// SentInvitationRow ListInvitationsByInviter 的结果元组。
+// 形状和 MyInvitationRow 一致,语义不同 —— 这里看的是"我发出的",email 字段需带给前端展示。
+type SentInvitationRow struct {
+	Invitation      *model.OrgInvitation
+	OrgSlug         string
+	OrgDisplayName  string
+	RoleSlug        string
+	RoleDisplayName string
+	RoleIsSystem    bool
+}
+
+// 搜索类型枚举,供 repository 和 service 共用。
+const (
+	InviteSearchTypeEmail  = "email"
+	InviteSearchTypeUserID = "user_id"
+	InviteSearchTypeName   = "name"
+)
 
 // gormRepository 基于 GORM 的统一实现。
-// 所有 resource 分组的方法都定义在同包的其他文件里(org.go / member.go / ...)。
 type gormRepository struct {
 	db *gorm.DB
 }
 
 // New 构造一个 Repository 实例。
-// 传入的 db 必须是业务连接池(已设置 logger / slow-query / pooling 等)。
 func New(db *gorm.DB) Repository {
 	return &gormRepository{db: db}
 }
 
 // WithTx 开启事务并在其中执行 fn。
-// fn 接收的 tx Repository 走同一个 tx,对调用方来说看起来和普通 repo 一模一样。
 func (r *gormRepository) WithTx(ctx context.Context, fn func(tx Repository) error) error {
 	//sayso-lint:ignore log-coverage
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

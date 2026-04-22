@@ -78,7 +78,7 @@ service  → 根包（const/errors）、dto、model、common
 
 ### 8. 异步 goroutine 管理
 
-- 使用 `internal/common.AsyncRunner`，禁止裸 `go func()`
+- 使用 `internal/common/async.AsyncRunner`，禁止裸 `go func()`
 - AsyncRunner 由 main.go 创建并注入 service，shutdown 时由 main.go 调用 `runner.Wait()`
 
 ### 9. main.go 中的初始化模式

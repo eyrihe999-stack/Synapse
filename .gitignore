@@ -7,20 +7,17 @@ bin/
 *.test
 *.out
 
-# Project binaries
-synapse
-nexus
-sayso-lint
-evalretrieval
-feishu-sync
-goldrefresh
-goldseed
-reingest
+# Project binaries(go build 产出在 repo 根;前导 / 限定只在根目录,避免误伤 cmd/ 下同名源码目录)
+/synapse
+/sayso-lint
 
 # Environment
 .env
 .env.*
 !.env.example
+
+# Local config overrides with real secrets (see config.dev.yaml for template)
+/config/config.local.yaml
 
 # Logs
 logs/
@@ -38,9 +35,6 @@ vendor/
 # Claude Code tmp
 .claude/tmp/
 .claude/scheduled_tasks.lock
-
-# Evaluation outputs
-runs/
 
 # OS
 .DS_Store

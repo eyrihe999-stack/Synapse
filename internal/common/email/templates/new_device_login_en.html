@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>New sign-in to your Synapse account</title>
+    <style>
+        :root {
+            --system-gray: #86868b;
+            --system-red: #d70015;
+            --bg-color: #f5f5f7;
+            --card-bg: #ffffff;
+            --text-primary: #1d1d1f;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            line-height: 1.47059;
+            padding: 40px 20px;
+            -webkit-font-smoothing: antialiased;
+        }
+        .container {
+            max-width: 580px; margin: 0 auto; background: var(--card-bg);
+            border-radius: 18px; padding: 60px 48px;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.04);
+        }
+        .header { text-align: center; margin-bottom: 48px; }
+        .logo { font-size: 24px; font-weight: 600; color: var(--text-primary); }
+        .content { text-align: center; }
+        .title { font-size: 28px; font-weight: 700; margin-bottom: 16px; }
+        .subtitle { font-size: 17px; color: #1d1d1f; margin-bottom: 40px; }
+        .details {
+            border-top: 1px solid #d2d2d7; border-bottom: 1px solid #d2d2d7;
+            padding: 24px 0; margin-bottom: 32px; text-align: left;
+        }
+        .detail-row { display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 14px; }
+        .detail-row:last-child { margin-bottom: 0; }
+        .detail-label { color: var(--system-gray); }
+        .detail-value { color: #1d1d1f; font-weight: 500; word-break: break-all; text-align: right; max-width: 60%; }
+        .alert {
+            font-size: 14px; color: var(--system-red); margin-top: 24px;
+            padding: 16px; background: rgba(215, 0, 21, 0.06); border-radius: 12px;
+            text-align: left;
+        }
+        .footer {
+            text-align: center; font-size: 12px; color: var(--system-gray); margin-top: 40px;
+        }
+        .footer-divider { margin: 24px 0; border: 0; border-top: 1px solid #d2d2d7; }
+        @media (max-width: 600px) {
+            .container { padding: 40px 24px; border-radius: 0; box-shadow: none; background: transparent; }
+            body { background: #ffffff; padding: 0; }
+            .title { font-size: 24px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <div class="logo">Synapse</div>
+    </div>
+    <div class="content">
+        <h1 class="title">New sign-in detected</h1>
+        <p class="subtitle">
+            A new device has signed in to your Synapse account.<br>
+            If this was you, no action is needed.
+        </p>
+        <div class="details">
+            <div class="detail-row">
+                <span class="detail-label">When</span>
+                <span class="detail-value">{{.When}}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">IP address</span>
+                <span class="detail-value">{{.IP}}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Device</span>
+                <span class="detail-value">{{.UserAgent}}</span>
+            </div>
+        </div>
+        <div class="alert">
+            <strong>Don't recognize this activity?</strong><br>
+            Sign in, reset your password, and kick the session from <em>Settings → Sessions</em>.
+        </div>
+    </div>
+    <div class="footer">
+        <hr class="footer-divider">
+        <p>&copy; 2025 Synapse. All rights reserved.</p>
+    </div>
+</div>
+</body>
+</html>

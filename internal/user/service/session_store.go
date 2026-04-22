@@ -3,6 +3,9 @@
 // Redis key: synapse:session:{user_id}:{device_id}
 // Value: JSON 序列化的 user.SessionInfo
 // TTL: refresh token 有效期,每次 Save 时重置。
+//
+// 这是本项目两类 Redis key 之一。完整 key 登记见 internal/common/database/redis.go 顶部
+// Synapse Redis Key Registry(新增/改名前先同步更新)。
 package service
 
 import (
@@ -13,8 +16,8 @@ import (
 	"time"
 
 	"github.com/eyrihe999-stack/Synapse/internal/user"
-	"github.com/eyrihe999-stack/Synapse/pkg/database"
-	"github.com/eyrihe999-stack/Synapse/pkg/logger"
+	"github.com/eyrihe999-stack/Synapse/internal/common/database"
+	"github.com/eyrihe999-stack/Synapse/internal/common/logger"
 )
 
 const sessionKeyPrefix = "synapse:session"
@@ -42,11 +45,11 @@ func sessionPattern(userID uint64) string {
 func (s *redisSessionStore) Save(ctx context.Context, userID uint64, deviceID string, info user.SessionInfo, ttl time.Duration) error {
 	data, err := json.Marshal(info)
 	if err != nil {
-		s.log.ErrorCtx(ctx, "序列化 session 失败", err, map[string]any{"user_id": userID, "device_id": deviceID})
+		s.log.ErrorCtx(ctx, "序列化 session 失败", err, map[string]interface{}{"user_id": userID, "device_id": deviceID})
 		return fmt.Errorf("marshal session info: %w", err)
 	}
 	if err := s.redis.Set(ctx, sessionKey(userID, deviceID), string(data), ttl); err != nil {
-		s.log.ErrorCtx(ctx, "保存 session 到 Redis 失败", err, map[string]any{"user_id": userID, "device_id": deviceID})
+		s.log.ErrorCtx(ctx, "保存 session 到 Redis 失败", err, map[string]interface{}{"user_id": userID, "device_id": deviceID})
 		return fmt.Errorf("redis set session: %w", err)
 	}
 	return nil
@@ -62,7 +65,7 @@ func (s *redisSessionStore) Get(ctx context.Context, userID uint64, deviceID str
 	}
 	var info user.SessionInfo
 	if err := json.Unmarshal([]byte(val), &info); err != nil {
-		s.log.ErrorCtx(ctx, "反序列化 session 失败", err, map[string]any{"user_id": userID, "device_id": deviceID})
+		s.log.ErrorCtx(ctx, "反序列化 session 失败", err, map[string]interface{}{"user_id": userID, "device_id": deviceID})
 		return nil, fmt.Errorf("unmarshal session info: %w", err)
 	}
 	return &info, nil
@@ -78,7 +81,7 @@ func (s *redisSessionStore) List(ctx context.Context, userID uint64) ([]user.Ses
 	for {
 		batch, nextCursor, err := client.Scan(ctx, cursor, pattern, 100).Result()
 		if err != nil {
-			s.log.ErrorCtx(ctx, "扫描 session keys 失败", err, map[string]any{"user_id": userID})
+			s.log.ErrorCtx(ctx, "扫描 session keys 失败", err, map[string]interface{}{"user_id": userID})
 			return nil, fmt.Errorf("scan sessions: %w", err)
 		}
 		keys = append(keys, batch...)
@@ -97,7 +100,7 @@ func (s *redisSessionStore) List(ctx context.Context, userID uint64) ([]user.Ses
 		}
 		var info user.SessionInfo
 		if err := json.Unmarshal([]byte(val), &info); err != nil {
-			s.log.WarnCtx(ctx, "解析 session 失败", map[string]any{"key": key})
+			s.log.WarnCtx(ctx, "解析 session 失败", map[string]interface{}{"key": key})
 			continue
 		}
 		deviceID := strings.TrimPrefix(key, prefix)
@@ -115,7 +118,7 @@ func (s *redisSessionStore) List(ctx context.Context, userID uint64) ([]user.Ses
 //sayso-lint:ignore sentinel-wrap
 func (s *redisSessionStore) Delete(ctx context.Context, userID uint64, deviceID string) error {
 	if err := s.redis.Del(ctx, sessionKey(userID, deviceID)); err != nil {
-		s.log.ErrorCtx(ctx, "删除 session 失败", err, map[string]any{"user_id": userID, "device_id": deviceID})
+		s.log.ErrorCtx(ctx, "删除 session 失败", err, map[string]interface{}{"user_id": userID, "device_id": deviceID})
 		return fmt.Errorf("redis del session: %w", err)
 	}
 	return nil
@@ -132,12 +135,12 @@ func (s *redisSessionStore) DeleteAll(ctx context.Context, userID uint64) error 
 	for {
 		keys, nextCursor, err := client.Scan(ctx, cursor, pattern, 100).Result()
 		if err != nil {
-			s.log.ErrorCtx(ctx, "扫描 session keys 失败(删除)", err, map[string]any{"user_id": userID})
+			s.log.ErrorCtx(ctx, "扫描 session keys 失败(删除)", err, map[string]interface{}{"user_id": userID})
 			return fmt.Errorf("scan sessions for delete: %w", err)
 		}
 		if len(keys) > 0 {
 			if err := s.redis.Del(ctx, keys...); err != nil {
-				s.log.ErrorCtx(ctx, "批量删除 session 失败", err, map[string]any{"user_id": userID})
+				s.log.ErrorCtx(ctx, "批量删除 session 失败", err, map[string]interface{}{"user_id": userID})
 				return fmt.Errorf("delete sessions: %w", err)
 			}
 		}

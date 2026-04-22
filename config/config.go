@@ -19,13 +19,32 @@ type Config struct {
 	JWT          JWTConfig          `yaml:"jwt"`
 	Snowflake    SnowflakeConfig    `yaml:"snowflake"`
 	Organization OrganizationConfig `yaml:"organization"`
-	Agent        AgentConfig        `yaml:"agent"`
-	OSS          OSSConfig          `yaml:"oss"`
-	Document     DocumentConfig     `yaml:"document"`
 	Embedding    EmbeddingConfig    `yaml:"embedding"`
-	Reranker     RerankerConfig     `yaml:"reranker"`
-	Feishu       FeishuConfig       `yaml:"feishu"`
-	OAuth        OAuthConfig        `yaml:"oauth"`
+	Email        EmailConfig        `yaml:"email"`
+	User         UserConfig         `yaml:"user"`
+	OAuthLogin   OAuthLoginConfig   `yaml:"oauth_login"`
+	OSS          OSSConfig          `yaml:"oss"`
+}
+
+// OSSConfig 阿里云 OSS 接入参数 + 文档版本策略。
+//
+// 字段语义:
+//
+//	AccessKeyID / AccessKeySecret   访问凭证。本地部署直接写 yaml。
+//	Region / Bucket                  bucket 归属 region(cn-hangzhou 等) + bucket 名。
+//	Endpoint                         可选;为空时自动拼 oss-<region>.aliyuncs.com。
+//	Domain                           可选;为空时走 bucket 的默认域(用于返还给前端的 URL)。
+//	PathPrefix                       OSS key 顶层前缀,默认 "synapse"。同一 bucket 多服务共用时用它隔离。
+//	MaxVersionsPerDocument           单文档最多保留几个历史版本,超过就删最老的。默认 10。
+type OSSConfig struct {
+	AccessKeyID            string `yaml:"access_key_id"`
+	AccessKeySecret        string `yaml:"access_key_secret"`
+	Region                 string `yaml:"region"`
+	Bucket                 string `yaml:"bucket"`
+	Endpoint               string `yaml:"endpoint"`
+	Domain                 string `yaml:"domain"`
+	PathPrefix             string `yaml:"path_prefix"`
+	MaxVersionsPerDocument int    `yaml:"max_versions_per_document"`
 }
 
 type ServerConfig struct {
@@ -35,7 +54,11 @@ type ServerConfig struct {
 	WriteTimeout    time.Duration `yaml:"write_timeout"`
 	IdleTimeout     time.Duration `yaml:"idle_timeout"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"` // 优雅关闭时等待 in-flight 请求的最长时间
-	Host            string        `yaml:"host"`
+	// TrustedProxies 可信反代 CIDR / IP 列表,gin 仅在白名单内解析 X-Forwarded-For / X-Real-IP。
+	// 空 = 不信任任何代理,直接用 socket IP(安全默认,防伪造)。
+	// 生产:填 ingress / LB 的 IP 段,如 ["10.0.0.0/8", "172.16.0.0/12"]。
+	// 直接暴露公网时务必保持空。
+	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
 type DatabaseConfig struct {
@@ -86,14 +109,35 @@ type RedisConfig struct {
 }
 
 type LogConfig struct {
-	Level      string `yaml:"level"`
-	Format     string `yaml:"format"` // json, text
-	Output     string `yaml:"output"` // stdout, file
-	FilePath   string `yaml:"file_path"`
-	MaxSize    int    `yaml:"max_size"`    // MB
-	MaxAge     int    `yaml:"max_age"`     // days
-	MaxBackups int    `yaml:"max_backups"` // number of files
-	Compress   bool   `yaml:"compress"`
+	Level      string    `yaml:"level"`
+	Format     string    `yaml:"format"` // json, text
+	Output     string    `yaml:"output"` // stdout, file
+	FilePath   string    `yaml:"file_path"`
+	MaxSize    int       `yaml:"max_size"`    // MB
+	MaxAge     int       `yaml:"max_age"`     // days
+	MaxBackups int       `yaml:"max_backups"` // number of files
+	Compress   bool      `yaml:"compress"`
+	SLS        SLSConfig `yaml:"sls"` // 阿里云 SLS 日志投递;enabled=false 时不构造 hook。
+}
+
+// SLSConfig 与 sayso-server 字段完全对齐,便于以后跨服务查询相同 trace_id。
+// 生产环境把 access_key_* 放 env(SLS_ACCESS_KEY_ID / SLS_ACCESS_KEY_SECRET),
+// 本地 dev 直接在 yaml 里填明文即可(默认 enabled: false 也不会真的发)。
+type SLSConfig struct {
+	Enabled             bool              `yaml:"enabled"`
+	Endpoint            string            `yaml:"endpoint"`
+	AccessKeyID         string            `yaml:"access_key_id"`
+	AccessKeySecret     string            `yaml:"access_key_secret"`
+	Project             string            `yaml:"project"`
+	Logstore            string            `yaml:"logstore"`
+	Topic               string            `yaml:"topic"`
+	Source              string            `yaml:"source"`
+	MaxBatchSize        int               `yaml:"max_batch_size"`        // Max batch size in bytes
+	MaxBatchCount       int               `yaml:"max_batch_count"`       // Max logs per batch
+	LingerMs            int               `yaml:"linger_ms"`             // Max wait before flushing a batch (ms)
+	Retries             int               `yaml:"retries"`               // Retries for failed requests
+	MaxReservedAttempts int               `yaml:"max_reserved_attempts"` // Max reserved retry attempts
+	Metadata            map[string]string `yaml:"metadata"`              // Extra metadata attached to every log
 }
 
 type JWTConfig struct {
@@ -102,23 +146,10 @@ type JWTConfig struct {
 	RefreshTokenDuration time.Duration `yaml:"refresh_token_duration"`
 	Issuer               string        `yaml:"issuer"`
 	MaxSessionsPerUser   int           `yaml:"max_sessions_per_user"`
-}
-
-// OAuthConfig OAuth 2.1 Authorization Server(MCP 远端接入)相关配置。
-//
-// Issuer:对外 base URL,写入 JWT iss claim + .well-known 发现端点;部署时必须和用户访问的公网
-// 域名严格一致(含 scheme + 去尾斜杠)。不设 = 整个 OAuth 模块禁用。
-//
-// SigningKey:HS256 access token 签名密钥,建议 ≥ 32 字节强随机。和 web 登录 JWT 的 secret_key 分开。
-// CookieSecret:/oauth 流程 cookie 的 HMAC-SHA256 密钥;可和 SigningKey 同值也可独立(推荐独立)。
-// MCPResourceURL:/.well-known/oauth-protected-resource 指向的 MCP endpoint 绝对 URL。
-// CookieSecure:生产必须 true(HTTPS-only);本地 dev 才设 false。
-type OAuthConfig struct {
-	Issuer         string `yaml:"issuer"`
-	SigningKey     string `yaml:"signing_key"`
-	CookieSecret   string `yaml:"cookie_secret"`
-	MCPResourceURL string `yaml:"mcp_resource_url"`
-	CookieSecure   bool   `yaml:"cookie_secure"`
+	// AbsoluteSessionTTL session 的绝对过期时间(首次登录起算,不因 refresh 延长)。
+	// 超过即便 refresh token 还在有效期也强制重登。0 = 走代码默认 30d;
+	// 设 0 意味着长期活跃用户 session 永不过期,被盗 token 如定期 refresh 可持续等同账号寿命。
+	AbsoluteSessionTTL time.Duration `yaml:"absolute_session_ttl"`
 }
 
 type SnowflakeConfig struct {
@@ -129,47 +160,14 @@ type SnowflakeConfig struct {
 // OrganizationConfig 组织模块配置。
 // 0 值表示走 organization/service.DefaultConfig 的默认值。
 type OrganizationConfig struct {
-	MaxOwnedOrgs          int `yaml:"max_owned_orgs"`
-	MaxJoinedOrgs         int `yaml:"max_joined_orgs"`
-	InvitationExpiresDays int `yaml:"invitation_expires_days"`
-}
+	MaxOwnedOrgs  int `yaml:"max_owned_orgs"`
+	MaxJoinedOrgs int `yaml:"max_joined_orgs"`
 
-// AgentConfig agent 模块配置。
-// 0 值表示走 agent/service.DefaultConfig 的默认值。
-// AES-GCM master key 从环境变量 SYNAPSE_AGENT_SECRET_KEY 读取,不放 yaml。
-// 注:agent 请求超时上下界(MinTimeoutSeconds/MaxTimeoutSeconds)是硬编码常量,
-// 在 internal/agent/const.go 里调整,不走 yaml。
-type AgentConfig struct {
-	DefaultMaxContextRounds int `yaml:"default_max_context_rounds"`
-	ChatRateLimitPerMinute  int `yaml:"chat_rate_limit_per_minute"`
-	// AllowPrivateEndpoints 是否允许 agent endpoint 指向 RFC1918 / IPv6 ULA 私网地址。
-	// 未设置(nil)时默认 true,兼容 Docker / K8s 同网络部署场景。
-	// loopback 和 link-local(含云元数据 169.254.169.254)始终拦截,与此开关无关。
-	// 详见 internal/agent/endpoint_guard.go。
-	AllowPrivateEndpoints *bool `yaml:"allow_private_endpoints"`
-}
-
-// OSSConfig 对象存储配置。当前仅支持 aliyun provider。
-// 所有上传对象的 key 会带上 PathPrefix + "/" + {org_id} + ...,实现租户隔离。
-type OSSConfig struct {
-	Provider        string `yaml:"provider"`
-	AccessKeyID     string `yaml:"access_key_id"`
-	AccessKeySecret string `yaml:"access_key_secret"`
-	Region          string `yaml:"region"`
-	Bucket          string `yaml:"bucket"`
-	Endpoint        string `yaml:"endpoint"`
-	Domain          string `yaml:"domain"`
-	PathPrefix      string `yaml:"path_prefix"`
-}
-
-// DocumentConfig 文档模块配置(仅上传限制)。
-type DocumentConfig struct {
-	Upload DocumentUploadConfig `yaml:"upload"`
-}
-
-type DocumentUploadConfig struct {
-	MaxFileSizeBytes int64    `yaml:"max_file_size_bytes"`
-	AllowedMIMETypes []string `yaml:"allowed_mime_types"`
+	// InvitationFrontendBaseURL 邀请邮件里落地页的 URL 前缀,邮件里会拼成
+	// "{InvitationFrontendBaseURL}?token={raw_token}"。
+	// dev 可留空,service 层退化为直接把 raw token 放进邮件(打日志即可 end-to-end 测)。
+	// 例:"https://app.example.com/invite"
+	InvitationFrontendBaseURL string `yaml:"invitation_frontend_base_url"`
 }
 
 // EmbeddingConfig 顶层向量化配置。各模态独立一块:text 现在,image/code 未来。
@@ -195,33 +193,109 @@ type AzureEmbeddingConfig struct {
 	APIVersion string `yaml:"api_version"` // 默认 2024-10-21
 }
 
-// RerankerConfig T1.2 二阶段重排 provider 配置。Provider 空串 = 禁用。
-// 当前仅 bge_tei 一家(BGE-reranker 走 HuggingFace TEI 服务),未来可扩 cohere / voyage。
-type RerankerConfig struct {
-	// Provider "" | "bge_tei";其他值在 main 构造期 warn 然后降级为禁用。
-	Provider string `yaml:"provider"`
-	BGETEI   BGETEIConfig `yaml:"bge_tei"`
+// EmailConfig 邮件发送配置(用于邮箱验证码等场景)。
+//
+// Provider 决定发送通道:
+//   - "resend"  走 Resend HTTP API,只需 APIKey
+//   - "smtp"    走 SMTP + TLS,需要 SMTPHost/Port/Username/Password
+//   - ""        不发送(dev 本地可只写 Redis 然后看日志取码)
+//
+// 敏感字段(api_key / password / from / smtp_host 等)统一留空 yaml,
+// 生产环境通过 EMAIL_* env 注入,和 OSS/OAuth 的做法一致。
+//
+// DailyVerificationLimit: 每邮箱每天最多允许的发码次数,0 走代码默认值(10)。
+// CodeTTL:  单条验证码的有效期,0 走默认 10min。
+// MaxAttempts: 单条码最多允许验错几次,超过即作废,0 走默认 5。
+// Locale:   模板选择,"zh" 走中文模板,其他值回退英文。
+type EmailConfig struct {
+	Provider               string `yaml:"provider"`
+	SMTPHost               string `yaml:"smtp_host"`
+	SMTPPort               int    `yaml:"smtp_port"`
+	Username               string `yaml:"username"`
+	Password               string `yaml:"password"`
+	From                   string `yaml:"from"`
+	FromName               string `yaml:"from_name"`
+	APIKey                 string `yaml:"api_key"`
+	DailyVerificationLimit int    `yaml:"daily_verification_limit"`
+	CodeTTL                string `yaml:"code_ttl"`    // 解析为 time.Duration,空=10m
+	MaxAttempts            int    `yaml:"max_attempts"`
+	Locale                 string `yaml:"locale"`
+	// PasswordResetTTL 密码重置 token 有效期,空=15m。
+	PasswordResetTTL string `yaml:"password_reset_ttl"`
+	// PasswordResetLinkBase 重置邮件里 confirm 链接的前端基础 URL
+	// (末尾不带斜杠,service 拼 "/reset-password?token=...")。空 = 用 From 域名猜不出,必须显式配。
+	PasswordResetLinkBase string `yaml:"password_reset_link_base"`
+	// VerificationTTL M1.1 邮箱激活 token 有效期,空=24h。
+	VerificationTTL string `yaml:"verification_ttl"`
+	// VerificationLinkBase 激活邮件里的前端基础 URL (末尾不带斜杠),
+	// service 会拼 "/auth/email/verify?token=..."。空 = 落回 PasswordResetLinkBase,都为空则激活流程不可用。
+	VerificationLinkBase string `yaml:"verification_link_base"`
 }
 
-// BGETEIConfig BGE-reranker 走 HuggingFace text-embeddings-inference 服务的参数。
-// 启动方式(参考 docs/reranker.md):
-//   docker run -p 8082:80 ghcr.io/huggingface/text-embeddings-inference:cpu-latest --model-id BAAI/bge-reranker-v2-m3
-// 生产按量装 GPU 版本。Timeout 建议 2-5s 覆盖冷启动和批量高位。
-type BGETEIConfig struct {
-	BaseURL string `yaml:"base_url"` // 例如 http://127.0.0.1:8082
-	Timeout string `yaml:"timeout"`  // 解析为 time.Duration,空串 = 5s
+// UserConfig user 模块的安全相关配置。
+//
+// 所有时长 / 计数的 0 值都走代码默认,便于生产只注入关键字段即可起。
+//
+//	LoginFail.Max          连续登录失败多少次锁账号,默认 10
+//	LoginFail.LockTTL      锁定多久,默认 15m (Go duration string)
+//	RegisterRate.Max       每 IP 滑动窗口内允许多少次 /register,默认 5
+//	RegisterRate.WindowSec 滑动窗口时长(秒),默认 60
+//	Password.MinLen        密码最短长度,默认 10(M1.5)
+//	Password.CheckWeakList 是否启用 top-10k 弱密 bloom 校验,默认 true
+type UserConfig struct {
+	LoginFail    LoginFailConfig      `yaml:"login_fail"`
+	RegisterRate RegisterRateConfig   `yaml:"register_rate"`
+	Password     PasswordPolicyConfig `yaml:"password"`
+	// PendingVerifyExpireDays M1.7 OAuth 未验证账号的过期清理天数,超过此天数且仍 pending_verify
+	// 会被 synapse-cleanup CLI pseudo 化(不是硬删),释放原 email 供真用户注册。0=用代码默认 7 天。
+	PendingVerifyExpireDays int `yaml:"pending_verify_expire_days"`
 }
 
-// FeishuConfig 飞书 OAuth 集成的部署级配置。
-// 注意:应用凭证 app_id / app_secret **不在此结构**,改为 per org 存在 org_feishu_configs 表,
-// 由 org admin 在前端填入。这里只保留部署级(所有 org 共享)的配置:
-//   - BaseURL:飞书区域(国内/海外),部署绑定
-//   - RedirectURI:OAuth 回调地址,域名级,所有 org 共享同一回调
-//   - FrontendRedirectURL:回调完成后 302 跳回前端的页面(带 ?feishu=success|error)
-type FeishuConfig struct {
-	BaseURL             string `yaml:"base_url"`     // 空 = 默认中国区 https://open.feishu.cn
-	RedirectURI         string `yaml:"redirect_uri"` // 例如 https://synapse.example.com/api/v2/integrations/feishu/callback
-	FrontendRedirectURL string `yaml:"frontend_redirect_url"`
+type LoginFailConfig struct {
+	Max     int    `yaml:"max"`
+	LockTTL string `yaml:"lock_ttl"`
+}
+
+type RegisterRateConfig struct {
+	Max       int `yaml:"max"`
+	WindowSec int `yaml:"window_sec"`
+}
+
+// OAuthLoginConfig M1.6 第三方登录(Synapse 作为 RP,IdP=Google/Feishu/...)。
+//
+// 敏感字段统一放 env:
+//
+//	GOOGLE_OAUTH_CLIENT_ID=...
+//	GOOGLE_OAUTH_CLIENT_SECRET=...
+//
+// RedirectURI:必须和 Google 开发者后台登记的一致;公网部署走 https。
+// FrontendRedirectBase:前端回调页的 origin,callback 成功后后端 302 到
+// "{base}/auth/oauth/callback?exchange={code}" 让前端换取 tokens。
+// StateCookieSecret:HMAC 状态 cookie 用;不设时启动 fatal(避免明文 state 被篡改)。
+// CookieSecure:HTTPS-only 标志,生产 true,本地 dev false。
+type OAuthLoginConfig struct {
+	StateCookieSecret string            `yaml:"state_cookie_secret"`
+	CookieSecure      bool              `yaml:"cookie_secure"`
+	Google            GoogleOAuthConfig `yaml:"google"`
+}
+
+// GoogleOAuthConfig Google OIDC 客户端参数。Enabled 为 false 时 /auth/oauth/google/* 全部 404。
+type GoogleOAuthConfig struct {
+	Enabled              bool   `yaml:"enabled"`
+	ClientID             string `yaml:"client_id"`
+	ClientSecret         string `yaml:"client_secret"`
+	RedirectURI          string `yaml:"redirect_uri"`
+	FrontendRedirectBase string `yaml:"frontend_redirect_base"`
+}
+
+// PasswordPolicyConfig M1.5 密码策略。
+//
+//	MinLen        最短长度,0/负值 → 默认 10
+//	CheckWeakList 是否启用 top-10k 弱密 bloom 校验;本地调试可临时关
+//	              (用 *bool 区分"未设"和"显式 false":nil=走默认 true)
+type PasswordPolicyConfig struct {
+	MinLen        int   `yaml:"min_len"`
+	CheckWeakList *bool `yaml:"check_weak_list"`
 }
 
 // Load loads configuration from YAML file and environment variables
@@ -284,12 +358,6 @@ func overrideWithEnvVars(cfg *Config) {
 	if v := os.Getenv("JWT_SECRET_KEY"); v != "" {
 		cfg.JWT.SecretKey = v
 	}
-	if v := os.Getenv("OSS_ACCESS_KEY_ID"); v != "" {
-		cfg.OSS.AccessKeyID = v
-	}
-	if v := os.Getenv("OSS_ACCESS_KEY_SECRET"); v != "" {
-		cfg.OSS.AccessKeySecret = v
-	}
 	if v := os.Getenv("PG_HOST"); v != "" {
 		cfg.Database.Postgres.Host = v
 	}
@@ -313,17 +381,50 @@ func overrideWithEnvVars(cfg *Config) {
 	if v := os.Getenv("AZURE_EMBEDDING_API_KEY"); v != "" {
 		cfg.Embedding.Text.Azure.APIKey = v
 	}
-	if v := os.Getenv("OAUTH_SIGNING_KEY"); v != "" {
-		cfg.OAuth.SigningKey = v
+	if v := os.Getenv("EMAIL_PROVIDER"); v != "" {
+		cfg.Email.Provider = v
 	}
-	if v := os.Getenv("OAUTH_COOKIE_SECRET"); v != "" {
-		cfg.OAuth.CookieSecret = v
+	if v := os.Getenv("EMAIL_SMTP_HOST"); v != "" {
+		cfg.Email.SMTPHost = v
 	}
-	if v := os.Getenv("OAUTH_ISSUER"); v != "" {
-		cfg.OAuth.Issuer = v
+	if v := os.Getenv("EMAIL_SMTP_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			cfg.Email.SMTPPort = p
+		}
 	}
-	if v := os.Getenv("OAUTH_MCP_RESOURCE_URL"); v != "" {
-		cfg.OAuth.MCPResourceURL = v
+	if v := os.Getenv("EMAIL_USERNAME"); v != "" {
+		cfg.Email.Username = v
+	}
+	if v := os.Getenv("EMAIL_PASSWORD"); v != "" {
+		cfg.Email.Password = v
+	}
+	if v := os.Getenv("EMAIL_FROM"); v != "" {
+		cfg.Email.From = v
+	}
+	if v := os.Getenv("EMAIL_FROM_NAME"); v != "" {
+		cfg.Email.FromName = v
+	}
+	if v := os.Getenv("EMAIL_API_KEY"); v != "" {
+		cfg.Email.APIKey = v
+	}
+	if v := os.Getenv("EMAIL_DAILY_VERIFICATION_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Email.DailyVerificationLimit = n
+		}
+	}
+	if v := os.Getenv("EMAIL_LOCALE"); v != "" {
+		cfg.Email.Locale = v
+	}
+
+	// ── OAuth login(M1.6)──
+	if v := os.Getenv("GOOGLE_OAUTH_CLIENT_ID"); v != "" {
+		cfg.OAuthLogin.Google.ClientID = v
+	}
+	if v := os.Getenv("GOOGLE_OAUTH_CLIENT_SECRET"); v != "" {
+		cfg.OAuthLogin.Google.ClientSecret = v
+	}
+	if v := os.Getenv("OAUTH_LOGIN_STATE_COOKIE_SECRET"); v != "" {
+		cfg.OAuthLogin.StateCookieSecret = v
 	}
 }
 
@@ -395,31 +496,12 @@ func applyDefaults(cfg *Config) {
 	if cfg.JWT.RefreshTokenDuration == 0 {
 		cfg.JWT.RefreshTokenDuration = 168 * time.Hour
 	}
+	if cfg.JWT.AbsoluteSessionTTL <= 0 {
+		cfg.JWT.AbsoluteSessionTTL = 30 * 24 * time.Hour
+	}
 	if cfg.JWT.MaxSessionsPerUser == 0 {
 		cfg.JWT.MaxSessionsPerUser = 5
 	}
-	if cfg.Agent.AllowPrivateEndpoints == nil {
-		t := true
-		cfg.Agent.AllowPrivateEndpoints = &t
-	}
-
-	// OSS 默认值
-	if cfg.OSS.Provider == "" {
-		cfg.OSS.Provider = "aliyun"
-	}
-
-	// Document 默认值
-	if cfg.Document.Upload.MaxFileSizeBytes == 0 {
-		cfg.Document.Upload.MaxFileSizeBytes = 10 * 1024 * 1024 // 10MB
-	}
-	if len(cfg.Document.Upload.AllowedMIMETypes) == 0 {
-		cfg.Document.Upload.AllowedMIMETypes = []string{
-			"text/markdown",
-			"text/plain",
-			"text/x-markdown",
-		}
-	}
-
 	// Postgres 默认值(仅在 Host 已配置时有意义;Host 为空代表"整段不启用")。
 	if cfg.Database.Postgres.Port == 0 {
 		cfg.Database.Postgres.Port = 5432
@@ -446,6 +528,72 @@ func applyDefaults(cfg *Config) {
 		cfg.Embedding.Text.Azure.APIVersion = "2024-10-21"
 	}
 
+	// Email 默认值:provider 为空则整个模块 no-op(码只写 Redis,靠日志发给 dev)。
+	// 其余给行业常规默认,方便生产侧只注入敏感字段。
+	if cfg.Email.DailyVerificationLimit == 0 {
+		cfg.Email.DailyVerificationLimit = 10
+	}
+	if cfg.Email.CodeTTL == "" {
+		cfg.Email.CodeTTL = "10m"
+	}
+	if cfg.Email.MaxAttempts == 0 {
+		cfg.Email.MaxAttempts = 5
+	}
+	if cfg.Email.Locale == "" {
+		cfg.Email.Locale = "zh"
+	}
+	if cfg.Email.SMTPPort == 0 {
+		cfg.Email.SMTPPort = 465
+	}
+	if cfg.Email.PasswordResetTTL == "" {
+		cfg.Email.PasswordResetTTL = "15m"
+	}
+	if cfg.Email.VerificationTTL == "" {
+		cfg.Email.VerificationTTL = "24h"
+	}
+	// VerificationLinkBase 缺省回退到 PasswordResetLinkBase,让本地 dev 只配一个 FE host 就能跑。
+	if cfg.Email.VerificationLinkBase == "" {
+		cfg.Email.VerificationLinkBase = cfg.Email.PasswordResetLinkBase
+	}
+	// User 默认值:per-email 登录失败 10 次锁 15min;per-IP 注册 5 次/60s 滑动窗口。
+	if cfg.User.LoginFail.Max == 0 {
+		cfg.User.LoginFail.Max = 10
+	}
+	if cfg.User.LoginFail.LockTTL == "" {
+		cfg.User.LoginFail.LockTTL = "15m"
+	}
+	if cfg.User.RegisterRate.Max == 0 {
+		cfg.User.RegisterRate.Max = 5
+	}
+	if cfg.User.RegisterRate.WindowSec == 0 {
+		cfg.User.RegisterRate.WindowSec = 60
+	}
+	// M1.5 密码策略默认:最短 10 位 + 开启弱密名单。
+	if cfg.User.Password.MinLen <= 0 {
+		cfg.User.Password.MinLen = 10
+	}
+	// M1.7 Pending_verify 过期清理默认 7 天。
+	if cfg.User.PendingVerifyExpireDays <= 0 {
+		cfg.User.PendingVerifyExpireDays = 7
+	}
+	if cfg.User.Password.CheckWeakList == nil {
+		t := true
+		cfg.User.Password.CheckWeakList = &t
+	}
+	// M1.6 OAuth login:状态 cookie 密钥缺省给个固定 dev 值,生产必须覆盖。
+	// StartupSanityCheck(见 main.go)会在 Google.Enabled=true 且此处仍为默认时 fatal。
+	if cfg.OAuthLogin.StateCookieSecret == "" {
+		cfg.OAuthLogin.StateCookieSecret = "synapse-dev-oauth-login-state-change-me"
+	}
+
+	// OSS:PathPrefix 缺省 "synapse" 供同 bucket 多服务共用;
+	// MaxVersionsPerDocument 缺省 10(够用,避免 OSS 空间无节制膨胀)。
+	if cfg.OSS.PathPrefix == "" {
+		cfg.OSS.PathPrefix = "synapse"
+	}
+	if cfg.OSS.MaxVersionsPerDocument <= 0 {
+		cfg.OSS.MaxVersionsPerDocument = 10
+	}
 }
 
 func getEnv(key, fallback string) string {

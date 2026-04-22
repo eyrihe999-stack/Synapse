@@ -1,12 +1,12 @@
 // Package handler asyncjob 模块的 HTTP 入口。
 //
-// 暴露两条通用查询端点 —— 所有 kind 共用:
+// 暴露单条轮询端点 —— 所有 kind 共用:
 //
 //	GET /api/v2/async-jobs/:id            单条任务(轮询进度用)
-//	GET /api/v2/async-jobs?kind=X&limit=N 当前用户最近 N 条任务(历史列表用)
 //
-// 触发端点按业务模块自己挂(如 integration 模块挂 POST .../feishu/sync),
-// 这样路径直观 /integrations/feishu/sync,查进度走共享路径。
+// 触发端点按业务模块自己挂(如 document 模块挂 POST .../documents/upload),
+// 这样路径直观,查进度走共享路径。列表端点(按 kind 翻历史)前端未使用,保留接口定义
+// 只会堆积死代码,已下线;将来真有同步历史视图需求再按需补回。
 //
 // 权限:owner 可查自己的 job —— (user_id == current_user)。
 // 未来要让组织管理员看成员 job,在此基础上加 role check。
@@ -21,15 +21,14 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/eyrihe999-stack/Synapse/internal/asyncjob/model"
-	"github.com/eyrihe999-stack/Synapse/internal/middleware"
-	"github.com/eyrihe999-stack/Synapse/pkg/logger"
-	"github.com/eyrihe999-stack/Synapse/pkg/response"
+	"github.com/eyrihe999-stack/Synapse/internal/common/middleware"
+	"github.com/eyrihe999-stack/Synapse/internal/common/logger"
+	"github.com/eyrihe999-stack/Synapse/internal/common/response"
 )
 
 // JobService Handler 依赖的 service 方法集。签名和 *asyncjob/service.Service 精确匹配。
 type JobService interface {
 	GetJob(ctx context.Context, id uint64) (*model.Job, error)
-	ListRecent(ctx context.Context, userID uint64, kind string, limit int) ([]*model.Job, error)
 }
 
 // Handler HTTP 入口。
@@ -38,7 +37,8 @@ type Handler struct {
 	log logger.LoggerInterface
 }
 
-// New 构造。
+// New 构造 asyncjob HTTP handler。svc 为 service.Service(或兼容接口),
+// log 用于业务日志 + 错误兜底。两者都不可为 nil,调用方保证传入。
 func New(svc JobService, log logger.LoggerInterface) *Handler {
 	return &Handler{svc: svc, log: log}
 }
@@ -48,7 +48,9 @@ func New(svc JobService, log logger.LoggerInterface) *Handler {
 // Payload 不回传 —— 前端已知自己提交了什么,无需回看。
 // Result 的明细(失败条目 / 成功计数等)嵌在里面,前端按 kind 解析。
 type JobResponse struct {
-	ID             uint64       `json:"id"`
+	// ID 走 `,string` tag 序列化成 JSON 字符串:snowflake uint64 超过 JS Number 精度(2^53),
+	// 直接发数字会被前端 JSON.parse 截断末尾几位。
+	ID             uint64       `json:"id,string"`
 	Kind           string       `json:"kind"`
 	Status         model.Status `json:"status"`
 	ProgressTotal  int          `json:"progress_total"`
@@ -85,8 +87,7 @@ func (h *Handler) GetJob(c *gin.Context) {
 	}
 	job, err := h.svc.GetJob(c.Request.Context(), id)
 	if err != nil {
-		h.log.ErrorCtx(c.Request.Context(), "async-jobs get: svc error", err, map[string]any{"job_id": id})
-		response.InternalServerError(c, "load job failed", err.Error())
+		h.handleServiceError(c, err)
 		return
 	}
 	if job == nil {
@@ -101,47 +102,6 @@ func (h *Handler) GetJob(c *gin.Context) {
 	c.JSON(http.StatusOK, response.BaseResponse{
 		Code: http.StatusOK, Message: "ok",
 		Result: toJobResponse(job),
-	})
-}
-
-// ListJobs GET /api/v2/async-jobs?kind=...&limit=N
-//
-//	200 → { jobs: [JobResponse, ...] }
-//
-// 权限:只返当前用户自己的 job。kind 必填(不允许"跨 kind 翻全部"—— 避免遍历风险)。
-// limit 默认 10,上限由 service 层 clamp 到 50。
-func (h *Handler) ListJobs(c *gin.Context) {
-	userID, ok := middleware.GetUserID(c)
-	if !ok {
-		response.Unauthorized(c, "Missing user context", "")
-		return
-	}
-	kind := c.Query("kind")
-	if kind == "" {
-		response.BadRequest(c, "kind query param required", "")
-		return
-	}
-	limit := 0
-	if raw := c.Query("limit"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil {
-			limit = n
-		}
-	}
-	jobs, err := h.svc.ListRecent(c.Request.Context(), userID, kind, limit)
-	if err != nil {
-		h.log.ErrorCtx(c.Request.Context(), "async-jobs list: svc error", err, map[string]any{
-			"user_id": userID, "kind": kind,
-		})
-		response.InternalServerError(c, "list jobs failed", err.Error())
-		return
-	}
-	out := make([]JobResponse, 0, len(jobs))
-	for _, j := range jobs {
-		out = append(out, toJobResponse(j))
-	}
-	c.JSON(http.StatusOK, response.BaseResponse{
-		Code: http.StatusOK, Message: "ok",
-		Result: gin.H{"jobs": out},
 	})
 }
 

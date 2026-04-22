@@ -32,3 +32,18 @@ type ProgressReporter interface {
 	SetTotal(total int) error
 	Inc(deltaDone, deltaFailed int) error
 }
+
+// ConcurrentRunner 可选接口,Runner 如需支持"同 user 同 kind 多任务并发"就实现此接口并返 true。
+//
+// 语义:
+//
+//   - **不实现**(默认):Schedule 走防重,同一 (user_id, kind) 已有 active 任务 → 返 ErrDuplicateJob
+//     适用:飞书 / GitLab sync 这类"天然不该并发"的长任务
+//   - **实现且 AllowConcurrent() == true**:Schedule 跳过防重,允许同 user 同 kind 任意多任务同时排队
+//     适用:文档 upload —— 用户一次拖 N 个文件应当 N 个任务并行
+//
+// 注意:"并发"只是指 FindActive 防重的跳过,实际并发度仍受 Service.cfg.MaxConcurrency 约束。
+type ConcurrentRunner interface {
+	Runner
+	AllowConcurrent() bool
+}

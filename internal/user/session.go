@@ -10,11 +10,17 @@ import (
 )
 
 // SessionInfo 存储在 Redis 中的单条 session 信息。
+//
+// LoginAt 每次 Login/Refresh 都会更新为当前时间(体现"最近活跃"),
+// SessionStartAt 只在首次创建该 device session 时写入,refresh 时保留旧值 ——
+// 中间件用它做"绝对 TTL"校验,超过 cfg.JWT.AbsoluteSessionTTL 强制重登,
+// 避免长期活跃被盗 token 通过定期 refresh 持续等于账号寿命的问题。
 type SessionInfo struct {
-	JTI        string `json:"jti"`
-	DeviceName string `json:"device_name"`
-	LoginIP    string `json:"login_ip"`
-	LoginAt    int64  `json:"login_at"`
+	JTI            string `json:"jti"`
+	DeviceName     string `json:"device_name"`
+	LoginIP        string `json:"login_ip"`
+	LoginAt        int64  `json:"login_at"`
+	SessionStartAt int64  `json:"session_start_at,omitempty"` // 0 兼容历史 session,中间件 fallback LoginAt
 }
 
 // SessionEntry 用于列表展示的 session 条目,包含 device_id。

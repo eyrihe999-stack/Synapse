@@ -1,21 +1,34 @@
 // member.go Repository 接口中 Member 资源的实现。
+//
+// M4:CreateMember / DeleteMember / UpdateMemberRole 在同事务里写一条
+// permission_audit_log(action 见 model.AuditActionMember*)。actor_user_id
+// 由 audit writer 从 ctx 读(logger.GetUserID)。
 package repository
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/eyrihe999-stack/Synapse/internal/organization/model"
+	"github.com/eyrihe999-stack/Synapse/internal/permission/audit"
 	"gorm.io/gorm"
 )
 
-// CreateMember 创建一条成员关系。
+// CreateMember 创建一条成员关系,同事务写 member.add audit。
+//
+// 嵌套事务安全:gorm.Transaction 在已有 tx 内会用 savepoint,不重新开 tx。
 func (r *gormRepository) CreateMember(ctx context.Context, member *model.OrgMember) error {
-	if err := r.db.WithContext(ctx).Create(member).Error; err != nil {
-		return fmt.Errorf("create member: %w", err)
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(member).Error; err != nil {
+			return fmt.Errorf("create member: %w", err)
+		}
+		return audit.Write(ctx, tx, member.OrgID,
+			model.AuditActionMemberAdd, model.AuditTargetMember, member.ID,
+			nil, memberSnapshot(member), nil,
+		)
+	})
 }
 
 // FindMember 按 (org_id, user_id) 查找唯一成员关系。
@@ -30,30 +43,9 @@ func (r *gormRepository) FindMember(ctx context.Context, orgID, userID uint64) (
 	return &member, nil
 }
 
-// FindMemberWithRole 查找成员关系并附带其角色。
-// 角色会在同一个查询中 JOIN 拉回,避免调用方再查一次。
-func (r *gormRepository) FindMemberWithRole(ctx context.Context, orgID, userID uint64) (*MemberWithRole, error) {
-	var member model.OrgMember
-	if err := r.db.WithContext(ctx).
-		Where("org_id = ? AND user_id = ?", orgID, userID).
-		First(&member).Error; err != nil {
-		return nil, err
-	}
-	var role model.OrgRole
-	if err := r.db.WithContext(ctx).
-		Where("id = ?", member.RoleID).
-		First(&role).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("member role missing for member %d: %w", member.ID, err)
-		}
-		return nil, fmt.Errorf("load member role: %w", err)
-	}
-	return &MemberWithRole{Member: &member, Role: &role}, nil
-}
-
-// ListMembersByOrg 分页列出 org 的成员,每条结果带角色。
-// 返回 (列表, 总数, error)。
-func (r *gormRepository) ListMembersByOrg(ctx context.Context, orgID uint64, page, size int) ([]*MemberWithRole, int64, error) {
+// ListMembersByOrg 分页列出 org 的成员,JOIN users + org_roles 把展示字段回填。
+// 返回 (MemberWithProfile 列表, 总数, error)。
+func (r *gormRepository) ListMembersByOrg(ctx context.Context, orgID uint64, page, size int) ([]*MemberWithProfile, int64, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -70,41 +62,104 @@ func (r *gormRepository) ListMembersByOrg(ctx context.Context, orgID uint64, pag
 		return nil, 0, fmt.Errorf("count members: %w", err)
 	}
 	if total == 0 {
-		return []*MemberWithRole{}, 0, nil
+		return []*MemberWithProfile{}, 0, nil
 	}
 
-	var members []*model.OrgMember
-	if err := r.db.WithContext(ctx).
-		Where("org_id = ?", orgID).
-		Order("joined_at ASC").
-		Offset(offset).Limit(size).
-		Find(&members).Error; err != nil {
+	type row struct {
+		MemberID        uint64     `gorm:"column:member_id"`
+		OrgID           uint64     `gorm:"column:org_id"`
+		UserID          uint64     `gorm:"column:user_id"`
+		RoleID          uint64     `gorm:"column:role_id"`
+		JoinedAt        time.Time  `gorm:"column:joined_at"`
+		Email           string     `gorm:"column:email"`
+		DisplayName     string     `gorm:"column:display_name"`
+		AvatarURL       string     `gorm:"column:avatar_url"`
+		Status          int32      `gorm:"column:status"`
+		EmailVerifiedAt *time.Time `gorm:"column:email_verified_at"`
+		LastLoginAt     *time.Time `gorm:"column:last_login_at"`
+		RoleSlug        string     `gorm:"column:role_slug"`
+		RoleDisplayName string     `gorm:"column:role_display_name"`
+		RoleIsSystem    bool       `gorm:"column:role_is_system"`
+	}
+	var rows []row
+	if err := r.db.WithContext(ctx).Raw(`
+		SELECT m.id AS member_id, m.org_id, m.user_id, m.role_id, m.joined_at,
+		       COALESCE(u.email, '')        AS email,
+		       COALESCE(u.display_name, '') AS display_name,
+		       COALESCE(u.avatar_url, '')   AS avatar_url,
+		       COALESCE(u.status, 0)        AS status,
+		       u.email_verified_at          AS email_verified_at,
+		       u.last_login_at              AS last_login_at,
+		       COALESCE(r.slug, '')         AS role_slug,
+		       COALESCE(r.display_name, '') AS role_display_name,
+		       COALESCE(r.is_system, 0)     AS role_is_system
+		FROM org_members m
+		LEFT JOIN users u     ON u.id = m.user_id
+		LEFT JOIN org_roles r ON r.id = m.role_id
+		WHERE m.org_id = ?
+		ORDER BY m.joined_at ASC
+		LIMIT ? OFFSET ?
+	`, orgID, size, offset).Scan(&rows).Error; err != nil {
 		return nil, 0, fmt.Errorf("list members: %w", err)
 	}
-	if len(members) == 0 {
-		return []*MemberWithRole{}, total, nil
-	}
 
-	roleIDs := make([]uint64, 0, len(members))
-	for _, m := range members {
-		roleIDs = append(roleIDs, m.RoleID)
-	}
-	var roles []*model.OrgRole
-	if err := r.db.WithContext(ctx).
-		Where("id IN ?", roleIDs).
-		Find(&roles).Error; err != nil {
-		return nil, 0, fmt.Errorf("load roles: %w", err)
-	}
-	roleMap := make(map[uint64]*model.OrgRole, len(roles))
-	for _, rl := range roles {
-		roleMap[rl.ID] = rl
-	}
-
-	out := make([]*MemberWithRole, 0, len(members))
-	for _, m := range members {
-		out = append(out, &MemberWithRole{Member: m, Role: roleMap[m.RoleID]})
+	out := make([]*MemberWithProfile, 0, len(rows))
+	for _, rr := range rows {
+		out = append(out, &MemberWithProfile{
+			Member: &model.OrgMember{
+				ID:       rr.MemberID,
+				OrgID:    rr.OrgID,
+				UserID:   rr.UserID,
+				RoleID:   rr.RoleID,
+				JoinedAt: rr.JoinedAt,
+			},
+			Email:           rr.Email,
+			DisplayName:     rr.DisplayName,
+			AvatarURL:       rr.AvatarURL,
+			Status:          rr.Status,
+			EmailVerifiedAt: rr.EmailVerifiedAt,
+			LastLoginAt:     rr.LastLoginAt,
+			RoleSlug:        rr.RoleSlug,
+			RoleDisplayName: rr.RoleDisplayName,
+			RoleIsSystem:    rr.RoleIsSystem,
+		})
 	}
 	return out, total, nil
+}
+
+// UpdateMemberRole 更新 (org_id, user_id) 成员的 role_id,同事务写 member.role_change audit。
+//
+// 不存在或 role_id 没变 → 不写 audit。
+func (r *gormRepository) UpdateMemberRole(ctx context.Context, orgID, userID, roleID uint64) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var before model.OrgMember
+		if err := tx.Where("org_id = ? AND user_id = ?", orgID, userID).First(&before).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				// service 层有 FindMember 预检;走到这里也按 no-op 处理(不报错不写 audit)
+				return nil
+			}
+			return fmt.Errorf("find member for role change: %w", err)
+		}
+		if before.RoleID == roleID {
+			return nil
+		}
+		afterSnap := before
+		afterSnap.RoleID = roleID
+
+		if err := tx.Model(&model.OrgMember{}).
+			Where("org_id = ? AND user_id = ?", orgID, userID).
+			Update("role_id", roleID).Error; err != nil {
+			return fmt.Errorf("update member role: %w", err)
+		}
+		return audit.Write(ctx, tx, before.OrgID,
+			model.AuditActionMemberRoleChange, model.AuditTargetMember, before.ID,
+			memberSnapshot(&before), memberSnapshot(&afterSnap),
+			map[string]any{
+				"old_role_id": before.RoleID,
+				"new_role_id": roleID,
+			},
+		)
+	})
 }
 
 // CountMembersByOrg 统计某 org 的成员数。
@@ -134,25 +189,44 @@ func (r *gormRepository) CountMembersByUser(ctx context.Context, userID uint64) 
 	return count, nil
 }
 
-// UpdateMemberRole 变更某成员的角色(按 (org_id, user_id) 定位)。
-func (r *gormRepository) UpdateMemberRole(ctx context.Context, orgID, userID, roleID uint64) error {
-	if err := r.db.WithContext(ctx).
-		Model(&model.OrgMember{}).
-		Where("org_id = ? AND user_id = ?", orgID, userID).
-		Update("role_id", roleID).Error; err != nil {
-		return fmt.Errorf("update member role: %w", err)
-	}
-	return nil
+// DeleteMember 删除一条成员关系(踢出或主动退出),同事务写 member.remove audit。
+//
+// 不存在 → no-op,不写 audit(保持原有幂等语义)。actor==target 由 audit row
+// 的 actor_user_id == metadata.user_id 区分(self-leave vs kicked)。
+func (r *gormRepository) DeleteMember(ctx context.Context, orgID, userID uint64) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var before model.OrgMember
+		err := tx.Where("org_id = ? AND user_id = ?", orgID, userID).First(&before).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil // 幂等
+		}
+		if err != nil {
+			return fmt.Errorf("find member before delete: %w", err)
+		}
+		res := tx.Where("org_id = ? AND user_id = ?", orgID, userID).Delete(&model.OrgMember{})
+		if res.Error != nil {
+			return fmt.Errorf("delete member: %w", res.Error)
+		}
+		if res.RowsAffected == 0 {
+			return nil // 并发被别人删了
+		}
+		return audit.Write(ctx, tx, before.OrgID,
+			model.AuditActionMemberRemove, model.AuditTargetMember, before.ID,
+			memberSnapshot(&before), nil,
+			map[string]any{"user_id": before.UserID},
+		)
+	})
 }
 
-// DeleteMember 删除一条成员关系(踢出或主动退出)。
-func (r *gormRepository) DeleteMember(ctx context.Context, orgID, userID uint64) error {
-	if err := r.db.WithContext(ctx).
-		Where("org_id = ? AND user_id = ?", orgID, userID).
-		Delete(&model.OrgMember{}).Error; err != nil {
-		return fmt.Errorf("delete member: %w", err)
+// memberSnapshot 把 OrgMember 转为 audit before/after 用的快照。
+func memberSnapshot(m *model.OrgMember) map[string]any {
+	return map[string]any{
+		"id":        m.ID,
+		"org_id":    m.OrgID,
+		"user_id":   m.UserID,
+		"role_id":   m.RoleID,
+		"joined_at": m.JoinedAt.Unix(),
 	}
-	return nil
 }
 
 // DeleteMembersByOrg 删除 org 下所有成员(解散时级联)。

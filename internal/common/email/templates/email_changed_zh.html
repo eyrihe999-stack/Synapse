@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>您的 Synapse 邮箱已变更</title>
+    <style>
+        :root {
+            --system-gray: #86868b;
+            --system-red: #d70015;
+            --bg-color: #f5f5f7;
+            --card-bg: #ffffff;
+            --text-primary: #1d1d1f;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            line-height: 1.47059;
+            padding: 40px 20px;
+            -webkit-font-smoothing: antialiased;
+        }
+        .container {
+            max-width: 580px; margin: 0 auto; background: var(--card-bg);
+            border-radius: 18px; padding: 60px 48px;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.04);
+        }
+        .header { text-align: center; margin-bottom: 48px; }
+        .logo { font-size: 24px; font-weight: 600; color: var(--text-primary); }
+        .content { text-align: center; }
+        .title { font-size: 28px; font-weight: 700; margin-bottom: 16px; }
+        .subtitle { font-size: 17px; color: #1d1d1f; margin-bottom: 40px; }
+        .details {
+            border-top: 1px solid #d2d2d7; border-bottom: 1px solid #d2d2d7;
+            padding: 24px 0; margin-bottom: 32px; text-align: left;
+        }
+        .detail-row { display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 14px; }
+        .detail-row:last-child { margin-bottom: 0; }
+        .detail-label { color: var(--system-gray); }
+        .detail-value { color: #1d1d1f; font-weight: 500; word-break: break-all; text-align: right; max-width: 60%; }
+        .alert {
+            font-size: 14px; color: var(--system-red); margin-top: 24px;
+            padding: 16px; background: rgba(215, 0, 21, 0.06); border-radius: 12px;
+            text-align: left;
+        }
+        .footer {
+            text-align: center; font-size: 12px; color: var(--system-gray); margin-top: 40px;
+        }
+        .footer-divider { margin: 24px 0; border: 0; border-top: 1px solid #d2d2d7; }
+        @media (max-width: 600px) {
+            .container { padding: 40px 24px; border-radius: 0; box-shadow: none; background: transparent; }
+            body { background: #ffffff; padding: 0; }
+            .title { font-size: 24px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <div class="logo">Synapse</div>
+    </div>
+    <div class="content">
+        <h1 class="title">邮箱地址已变更</h1>
+        <p class="subtitle">
+            您的 Synapse 账号邮箱地址刚刚完成变更。<br>
+            如果是您本人操作，忽略此邮件即可。
+        </p>
+        <div class="details">
+            <div class="detail-row">
+                <span class="detail-label">时间</span>
+                <span class="detail-value">{{.When}}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">原邮箱</span>
+                <span class="detail-value">{{.OldEmail}}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">新邮箱</span>
+                <span class="detail-value">{{.NewEmail}}</span>
+            </div>
+        </div>
+        <div class="alert">
+            <strong>不是您本人？</strong><br>
+            您的账号可能已被入侵，请立即联系 Synapse 客服处理。
+        </div>
+    </div>
+    <div class="footer">
+        <hr class="footer-divider">
+        <p>&copy; 2025 Synapse. All rights reserved.</p>
+    </div>
+</div>
+</body>
+</html>

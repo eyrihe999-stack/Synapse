@@ -1,7 +1,10 @@
 services:
   synapse:
     image: localhost:5001/synapse:${SERVER_TAG:-latest}
-    build: .
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     ports:
       - "8080:8080"
     environment:
@@ -20,6 +23,11 @@ services:
       - PG_PASSWORD=synapse123
       - PG_DATABASE=synapse
       - PG_SSL_MODE=disable
+      # Azure OpenAI embedding key;真实值从 ./env 注入,yaml 里只留引用
+      - AZURE_EMBEDDING_API_KEY=${AZURE_EMBEDDING_API_KEY:-}
+      # Aliyun OSS key(没填时 Synapse 启动期 document 模块自动禁用 → /documents 路由 404)
+      - OSS_ACCESS_KEY_ID=${OSS_ACCESS_KEY_ID:-}
+      - OSS_ACCESS_KEY_SECRET=${OSS_ACCESS_KEY_SECRET:-}
     networks:
       - synapse-net
     restart: unless-stopped
@@ -29,7 +37,7 @@ services:
     build:
       context: ../Synapse-Web
     ports:
-      - "3080:80"
+      - "3080:8080"
     depends_on:
       - synapse
     networks:

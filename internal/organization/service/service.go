@@ -1,25 +1,81 @@
 // service.go 组织模块 service 层的共享类型、配置与转换工具。
-//
-// 本文件不定义具体的业务逻辑接口,而是提供:
-//   - Config: service 层所需的配置项(从 config.yaml 装填)
-//   - model → dto 的转换函数
-//   - 权限集合的 JSON 序列化/反序列化工具
-//   - 角色预设集合的构造函数(OrgService.CreateOrg 使用)
-//
-// 具体的业务接口定义在 org_service.go / member_service.go / invitation_service.go /
-// role_service.go 中。
 package service
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 
 	"github.com/eyrihe999-stack/Synapse/internal/organization"
 	"github.com/eyrihe999-stack/Synapse/internal/organization/dto"
 	"github.com/eyrihe999-stack/Synapse/internal/organization/model"
 	"github.com/eyrihe999-stack/Synapse/internal/organization/repository"
-	"gorm.io/datatypes"
+	userpkg "github.com/eyrihe999-stack/Synapse/internal/user"
+	"github.com/eyrihe999-stack/Synapse/internal/common/logger"
 )
+
+// UserVerifier M1.1 跨模块前置 guard。
+// main.go 用 user service 的 IsUserVerified 作为实现注入;
+// nil 时 org service 跳过检查(单测/旧部署兼容)。
+type UserVerifier interface {
+	IsUserVerified(ctx context.Context, userID uint64) (bool, error)
+}
+
+// UserLookup 跨模块读依赖:邀请流程需要 inviter 的 display_name(邮件文案)
+// 和 accepting user 的 email(Accept 时校验 email 匹配)。
+//
+// main.go 从 user service 装适配器注入;nil 时 InvitationService 不可用。
+type UserLookup interface {
+	// LookupUser 按 user_id 返回邀请邮件/校验所需的用户信息。
+	// 用户不存在 / 已删 / banned 时返 sentinel error(service 层按需翻译)。
+	LookupUser(ctx context.Context, userID uint64) (*InviteUserInfo, error)
+}
+
+// InviteUserInfo 邀请流程需要的用户侧摘要信息。
+type InviteUserInfo struct {
+	Email       string
+	DisplayName string // 空串 → 邮件模板里用 email 前缀兜底
+	Locale      string // "zh" / "en";其他值视作 en
+}
+
+// UserLookupFunc 把一个 func 适配为 UserLookup 接口,main.go 用 closure 注入时省去建 struct。
+type UserLookupFunc func(ctx context.Context, userID uint64) (*InviteUserInfo, error)
+
+// LookupUser 让 UserLookupFunc 满足 UserLookup 接口。
+func (f UserLookupFunc) LookupUser(ctx context.Context, userID uint64) (*InviteUserInfo, error) {
+	return f(ctx, userID)
+}
+
+// OwnerCheckerAdapter M3.7 反向跨模块依赖:user 注销流程要查"此用户是否为某 org 的 owner"。
+type OwnerCheckerAdapter struct {
+	repo   repository.Repository
+	logger logger.LoggerInterface
+}
+
+// NewOwnerCheckerAdapter 构造 user 模块 OwnerChecker 的适配器。
+func NewOwnerCheckerAdapter(repo repository.Repository, log logger.LoggerInterface) *OwnerCheckerAdapter {
+	return &OwnerCheckerAdapter{repo: repo, logger: log}
+}
+
+// ListActiveOrgsOwnedBy 返回该 user 持有的 active org 摘要(slug + display_name),
+// 供 user.DeleteAccount 决定是否阻塞注销。
+//
+// 可能的错误:
+//   - ErrOrgInternal:repo 查询失败
+func (a *OwnerCheckerAdapter) ListActiveOrgsOwnedBy(ctx context.Context, userID uint64) ([]userpkg.OwnedOrgSummary, error) {
+	orgs, err := a.repo.ListActiveOrgsOwnedBy(ctx, userID)
+	if err != nil {
+		a.logger.ErrorCtx(ctx, "查询用户持有的 active org 失败", err, map[string]any{"user_id": userID})
+		return nil, fmt.Errorf("list active orgs owned by: %w: %w", err, organization.ErrOrgInternal)
+	}
+	out := make([]userpkg.OwnedOrgSummary, 0, len(orgs))
+	for _, o := range orgs {
+		out = append(out, userpkg.OwnedOrgSummary{
+			Slug:        o.Slug,
+			DisplayName: o.DisplayName,
+		})
+	}
+	return out, nil
+}
 
 // Config service 层需要的配置项,从应用配置中装填。
 type Config struct {
@@ -27,116 +83,14 @@ type Config struct {
 	MaxOwnedOrgs int
 	// MaxJoinedOrgs 每用户最多加入的 org 数
 	MaxJoinedOrgs int
-	// InvitationExpiresDays 邀请默认过期天数
-	InvitationExpiresDays int
 }
 
 // DefaultConfig 返回默认配置值,用于测试或主流程缺省回退。
 func DefaultConfig() Config {
 	return Config{
-		MaxOwnedOrgs:          organization.DefaultMaxOwnedOrgs,
-		MaxJoinedOrgs:         organization.DefaultMaxJoinedOrgs,
-		InvitationExpiresDays: organization.DefaultInvitationExpiresDays,
+		MaxOwnedOrgs:  organization.DefaultMaxOwnedOrgs,
+		MaxJoinedOrgs: organization.DefaultMaxJoinedOrgs,
 	}
-}
-
-// ─── 预设角色构造 ─────────────────────────────────────────────────────────────
-
-// BuildPresetRoles 返回新 org 需要种入的 3 条预设角色记录(owner / admin / member)。
-// 调用方需设置 OrgID 并在同一个事务内插入。
-//
-// 权限分配规则:
-//   - owner:拥有 AllPermissions 的全部内容(含 owner 独占)
-//   - admin:拥有 AllPermissions 减去 OwnerOnlyPermissions
-//   - member:基础权限:publish / unpublish.self / invoke / audit.read.self
-func BuildPresetRoles() []*model.OrgRole {
-	// 使用 mustMarshalPermissions:输入是编译期常量,Marshal 不可能失败;
-	// 若失败意味着代码有 bug,panic 是正确行为(fail-fast)。
-	ownerPerms := mustMarshalPermissions(organization.AllPermissions)
-	adminPerms := mustMarshalPermissions(subtract(organization.AllPermissions, organization.OwnerOnlyPermissions))
-	memberPerms := mustMarshalPermissions([]string{
-		organization.PermAgentPublish,
-		organization.PermAgentUnpublishSelf,
-		organization.PermAgentInvoke,
-		organization.PermAuditReadSelf,
-		// 文档权限:成员默认可读 + 可上传;删除留给 admin+(走 AllPermissions - OwnerOnly)。
-		organization.PermDocumentRead,
-		organization.PermDocumentWrite,
-	})
-
-	return []*model.OrgRole{
-		{
-			Name:        organization.RoleOwner,
-			DisplayName: "所有者",
-			IsPreset:    true,
-			Permissions: ownerPerms,
-		},
-		{
-			Name:        organization.RoleAdmin,
-			DisplayName: "管理员",
-			IsPreset:    true,
-			Permissions: adminPerms,
-		},
-		{
-			Name:        organization.RoleMember,
-			DisplayName: "成员",
-			IsPreset:    true,
-			Permissions: memberPerms,
-		},
-	}
-}
-
-// marshalPermissions 把 []string 权限列表序列化为 JSON(供 GORM datatypes.JSON 字段使用)。
-// 纯工具函数无 logger,调用方会记录失败上下文。
-func marshalPermissions(perms []string) (datatypes.JSON, error) {
-	if perms == nil {
-		perms = []string{}
-	}
-	b, err := json.Marshal(perms)
-	if err != nil {
-		//sayso-lint:ignore log-coverage
-		return nil, fmt.Errorf("marshal permissions: %w", err)
-	}
-	return datatypes.JSON(b), nil
-}
-
-// mustMarshalPermissions 是 marshalPermissions 的不可失败变体,用于内部常量数据。
-// 若 Marshal 失败说明代码有 bug,panic 是正确行为。
-func mustMarshalPermissions(perms []string) datatypes.JSON {
-	data, err := marshalPermissions(perms)
-	if err != nil {
-		//sayso-lint:ignore fatal-panic
-		panic(fmt.Sprintf("mustMarshalPermissions: %v", err))
-	}
-	return data
-}
-
-// unmarshalPermissions 把 JSON 权限列表反序列化为 []string。
-// 空或 null 返回空切片。
-func unmarshalPermissions(data datatypes.JSON) []string {
-	if len(data) == 0 {
-		return []string{}
-	}
-	var out []string
-	if err := json.Unmarshal(data, &out); err != nil {
-		return []string{}
-	}
-	return out
-}
-
-// subtract 返回 a 中不在 b 里的元素(保持 a 的顺序)。
-func subtract(a, b []string) []string {
-	bs := make(map[string]struct{}, len(b))
-	for _, x := range b {
-		bs[x] = struct{}{}
-	}
-	out := make([]string, 0, len(a))
-	for _, x := range a {
-		if _, ok := bs[x]; !ok {
-			out = append(out, x)
-		}
-	}
-	return out
 }
 
 // ─── model → dto 转换 ────────────────────────────────────────────────────────
@@ -144,67 +98,79 @@ func subtract(a, b []string) []string {
 // orgToDTO 将 Org 模型转为 OrgResponse。
 func orgToDTO(m *model.Org) dto.OrgResponse {
 	return dto.OrgResponse{
-		ID:                 m.ID,
-		Slug:               m.Slug,
-		DisplayName:        m.DisplayName,
-		Description:        m.Description,
-		OwnerUserID:        m.OwnerUserID,
-		Status:             m.Status,
-		RequireAgentReview: m.RequireAgentReview,
-		RecordFullPayload:  m.RecordFullPayload,
-		CreatedAt:          m.CreatedAt.Unix(),
-		UpdatedAt:          m.UpdatedAt.Unix(),
-	}
-}
-
-// roleToSummary 角色 → RoleSummary(列表场景)。
-func roleToSummary(m *model.OrgRole) dto.RoleSummary {
-	return dto.RoleSummary{
 		ID:          m.ID,
-		Name:        m.Name,
+		Slug:        m.Slug,
 		DisplayName: m.DisplayName,
-		IsPreset:    m.IsPreset,
-		Permissions: unmarshalPermissions(m.Permissions),
-	}
-}
-
-// roleToDTO 角色 → 完整 RoleResponse。
-func roleToDTO(m *model.OrgRole) dto.RoleResponse {
-	return dto.RoleResponse{
-		ID:          m.ID,
-		OrgID:       m.OrgID,
-		Name:        m.Name,
-		DisplayName: m.DisplayName,
-		IsPreset:    m.IsPreset,
-		Permissions: unmarshalPermissions(m.Permissions),
+		Description: m.Description,
+		OwnerUserID: m.OwnerUserID,
+		Status:      m.Status,
 		CreatedAt:   m.CreatedAt.Unix(),
 		UpdatedAt:   m.UpdatedAt.Unix(),
 	}
 }
 
-// memberToDTO 组合 member + role + 用户 profile 为 MemberResponse。
-// profile 可为 nil(当用户信息查询失败时),此时 display_name 和 avatar_url 为空。
-func memberToDTO(m *model.OrgMember, role *model.OrgRole, profile *repository.UserProfile) dto.MemberResponse {
+// memberWithProfileToDTO 把 MemberWithProfile(member + users + org_roles JOIN 出的展示字段)
+// 转为 MemberResponse。role 信息在 Role 字段里;若 JOIN 记录缺失(极端情况)角色字段退化为 zero 值。
+// EmailVerifiedAt / LastLoginAt 用指针 —— 为 nil 时序列化为 null,前端区分"未验证/从未登录"与
+// "已验证/已登录"。
+func memberWithProfileToDTO(mp *repository.MemberWithProfile) dto.MemberResponse {
 	resp := dto.MemberResponse{
-		UserID:   m.UserID,
-		JoinedAt: m.JoinedAt.Unix(),
+		UserID:      mp.Member.UserID,
+		Email:       mp.Email,
+		DisplayName: mp.DisplayName,
+		AvatarURL:   mp.AvatarURL,
+		Status:      mp.Status,
+		JoinedAt:    mp.Member.JoinedAt.Unix(),
+		Role: dto.RoleSummary{
+			Slug:        mp.RoleSlug,
+			DisplayName: mp.RoleDisplayName,
+			IsSystem:    mp.RoleIsSystem,
+		},
 	}
-	if role != nil {
-		resp.Role = roleToSummary(role)
+	if mp.EmailVerifiedAt != nil {
+		ts := mp.EmailVerifiedAt.Unix()
+		resp.EmailVerifiedAt = &ts
 	}
-	if profile != nil {
-		resp.DisplayName = profile.DisplayName
-		resp.AvatarURL = profile.AvatarURL
+	if mp.LastLoginAt != nil {
+		ts := mp.LastLoginAt.Unix()
+		resp.LastLoginAt = &ts
 	}
 	return resp
 }
 
-// userProfileToCandidate 把 UserProfile 转成 InviteeCandidate。
-func userProfileToCandidate(p *repository.UserProfile) dto.InviteeCandidate {
-	return dto.InviteeCandidate{
-		UserID:      p.UserID,
-		DisplayName: p.DisplayName,
-		AvatarURL:   p.AvatarURL,
-		MaskedEmail: p.MaskedEmail,
+// roleToDTO 把 OrgRole 模型转为 RoleResponse。
+func roleToDTO(m *model.OrgRole) dto.RoleResponse {
+	perms := []string(m.Permissions)
+	if perms == nil {
+		perms = []string{}
+	}
+	return dto.RoleResponse{
+		Slug:        m.Slug,
+		DisplayName: m.DisplayName,
+		IsSystem:    m.IsSystem,
+		Permissions: perms,
+		CreatedAt:   m.CreatedAt.Unix(),
+		UpdatedAt:   m.UpdatedAt.Unix(),
+	}
+}
+
+// invitationWithRoleToDTO 把 InvitationWithRole(邀请 + JOIN 出的角色字段)转为 InvitationResponse。
+func invitationWithRoleToDTO(iw *repository.InvitationWithRole) dto.InvitationResponse {
+	inv := iw.Invitation
+	var acceptedAt int64
+	if inv.AcceptedAt != nil {
+		acceptedAt = inv.AcceptedAt.Unix()
+	}
+	return dto.InvitationResponse{
+		ID:             inv.ID,
+		Email:          inv.Email,
+		Role:           dto.RoleSummary{Slug: iw.RoleSlug, DisplayName: iw.RoleDisplayName, IsSystem: iw.RoleIsSystem},
+		Status:         inv.Status,
+		InviterUserID:  inv.InviterUserID,
+		ExpiresAt:      inv.ExpiresAt.Unix(),
+		AcceptedAt:     acceptedAt,
+		AcceptedUserID: inv.AcceptedUserID,
+		CreatedAt:      inv.CreatedAt.Unix(),
+		UpdatedAt:      inv.UpdatedAt.Unix(),
 	}
 }

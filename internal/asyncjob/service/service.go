@@ -3,7 +3,7 @@
 // 职责:
 //   - 按 kind 路由到已注册的 Runner
 //   - 管状态机推进(queued → running → terminal)
-//   - 用 common.AsyncRunner 跑 goroutine,获得并发上限 + 优雅 shutdown
+//   - 用 async.AsyncRunner 跑 goroutine,获得并发上限 + 优雅 shutdown
 //   - 提供 Schedule / GetJob 给 HTTP handler
 //   - 启动时 ReapStale 回收前次进程崩掉留下的 running 记录
 //
@@ -22,29 +22,23 @@ import (
 
 	"gorm.io/datatypes"
 
+	"github.com/eyrihe999-stack/Synapse/internal/asyncjob"
 	"github.com/eyrihe999-stack/Synapse/internal/asyncjob/model"
 	"github.com/eyrihe999-stack/Synapse/internal/asyncjob/repository"
-	"github.com/eyrihe999-stack/Synapse/internal/common"
-	"github.com/eyrihe999-stack/Synapse/pkg/logger"
+	"github.com/eyrihe999-stack/Synapse/internal/common/async"
+	"github.com/eyrihe999-stack/Synapse/internal/common/logger"
 )
-
-// ErrDuplicateJob Schedule 时发现该 (user_id, kind) 已有 queued/running 任务。
-// HTTP handler 捕这个错返 409 Conflict 并把活跃 job_id 一起返,前端直接轮询已有任务。
-var ErrDuplicateJob = errors.New("async job: duplicate active job")
-
-// ErrUnknownKind 调 Schedule 传了没注册 Runner 的 kind —— 配置/代码 bug,返 500。
-var ErrUnknownKind = errors.New("async job: unknown kind")
 
 // Config 调度器可调参数。
 type Config struct {
 	// MaxConcurrency 全局并发上限。超过会阻塞在 AsyncRunner.Go 最多 5s 再拒。
-	// 默认 8:考虑每个 Runner 可能跑好几分钟并发多了压后端(OSS / embed)。
+	// 默认 asyncjob.DefaultMaxConcurrency:考虑每个 Runner 可能跑好几分钟并发多了压后端(OSS / embed)。
 	MaxConcurrency int64
 
-	// StaleThreshold 心跳多久没更新算崩。默认 60s —— Runner 每 10s 心跳,留 6 倍余量。
+	// StaleThreshold 心跳多久没更新算崩。默认 asyncjob.DefaultStaleThreshold —— Runner 每 10s 心跳,留 6 倍余量。
 	StaleThreshold time.Duration
 
-	// HeartbeatInterval Runner 内部心跳间隔。默认 10s。
+	// HeartbeatInterval Runner 内部心跳间隔。默认 asyncjob.DefaultHeartbeatInterval。
 	HeartbeatInterval time.Duration
 }
 
@@ -53,7 +47,7 @@ type Service struct {
 	cfg     Config
 	repo    repository.Repository
 	runners map[string]Runner
-	async   *common.AsyncRunner
+	async   *async.AsyncRunner
 	log     logger.LoggerInterface
 }
 
@@ -61,13 +55,13 @@ type Service struct {
 // 调用方(cmd/synapse)应在启动后调一次 ReapStale 收拾前次崩进程遗留。
 func NewService(cfg Config, repo repository.Repository, runners []Runner, log logger.LoggerInterface) *Service {
 	if cfg.MaxConcurrency <= 0 {
-		cfg.MaxConcurrency = 8
+		cfg.MaxConcurrency = asyncjob.DefaultMaxConcurrency
 	}
 	if cfg.StaleThreshold <= 0 {
-		cfg.StaleThreshold = 60 * time.Second
+		cfg.StaleThreshold = asyncjob.DefaultStaleThreshold
 	}
 	if cfg.HeartbeatInterval <= 0 {
-		cfg.HeartbeatInterval = 10 * time.Second
+		cfg.HeartbeatInterval = asyncjob.DefaultHeartbeatInterval
 	}
 	reg := make(map[string]Runner, len(runners))
 	for _, r := range runners {
@@ -77,7 +71,7 @@ func NewService(cfg Config, repo repository.Repository, runners []Runner, log lo
 		cfg:     cfg,
 		repo:    repo,
 		runners: reg,
-		async:   common.NewAsyncRunner("asyncjob", cfg.MaxConcurrency, log),
+		async:   async.NewAsyncRunner("asyncjob", cfg.MaxConcurrency, log),
 		log:     log,
 	}
 }
@@ -92,26 +86,51 @@ type ScheduleInput struct {
 
 // Schedule 创建 queued job 并提交 goroutine。幂等性:同 (user_id, kind) 已有 active → 返
 // ErrDuplicateJob + 已存在的 Job。调用方按场景自己决定是视为成功(返 existing id)还是报错。
+//
+// 可能返回:
+//   - asyncjob.ErrAsyncJobInvalidRequest: user_id/kind 空,或 payload 序列化失败
+//   - asyncjob.ErrUnknownKind: 未注册该 kind 的 Runner
+//   - asyncjob.ErrDuplicateJob: (user_id, kind) 已有 active 任务
+//   - asyncjob.ErrAsyncJobInternal: DB / goroutine 提交失败
 func (s *Service) Schedule(ctx context.Context, in ScheduleInput) (*model.Job, error) {
 	if in.UserID == 0 || in.Kind == "" {
-		return nil, fmt.Errorf("schedule: user_id + kind required")
+		s.log.WarnCtx(ctx, "asyncjob: schedule missing fields", map[string]any{
+			"user_id": in.UserID, "kind": in.Kind,
+		})
+		return nil, fmt.Errorf("schedule: user_id + kind required: %w", asyncjob.ErrAsyncJobInvalidRequest)
 	}
 	runner, ok := s.runners[in.Kind]
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrUnknownKind, in.Kind)
+		s.log.WarnCtx(ctx, "asyncjob: schedule unknown kind", map[string]any{"kind": in.Kind})
+		return nil, fmt.Errorf("schedule: %s: %w", in.Kind, asyncjob.ErrUnknownKind)
 	}
-	// 防重:查 active。有则抛 ErrDuplicateJob + 把现有 job 带出去,由 handler 决定展示行为。
-	if existing, err := s.repo.FindActive(ctx, in.UserID, in.Kind); err != nil {
-		return nil, fmt.Errorf("schedule: check active: %w", err)
-	} else if existing != nil {
-		return existing, ErrDuplicateJob
+	// 防重:同 (user_id, kind) 已有 active 任务 → 返 ErrDuplicateJob。
+	// Runner 实现 ConcurrentRunner 且返 true 则跳过(见接口注释)—— 适用 upload 这类天然并行场景。
+	allowConcurrent := false
+	if cr, ok := runner.(ConcurrentRunner); ok && cr.AllowConcurrent() {
+		allowConcurrent = true
+	}
+	if !allowConcurrent {
+		existing, err := s.repo.FindActive(ctx, in.UserID, in.Kind)
+		if err != nil {
+			s.log.ErrorCtx(ctx, "asyncjob: schedule check active failed", err, map[string]any{
+				"user_id": in.UserID, "kind": in.Kind,
+			})
+			return nil, fmt.Errorf("schedule: check active: %w: %w", err, asyncjob.ErrAsyncJobInternal)
+		}
+		if existing != nil {
+			return existing, asyncjob.ErrDuplicateJob
+		}
 	}
 
 	var payloadJSON datatypes.JSON
 	if in.Payload != nil {
 		raw, err := json.Marshal(in.Payload)
 		if err != nil {
-			return nil, fmt.Errorf("schedule: marshal payload: %w", err)
+			s.log.WarnCtx(ctx, "asyncjob: schedule payload marshal failed", map[string]any{
+				"kind": in.Kind, "err": err.Error(),
+			})
+			return nil, fmt.Errorf("schedule: marshal payload: %w: %w", err, asyncjob.ErrAsyncJobInvalidRequest)
 		}
 		payloadJSON = raw
 	}
@@ -123,7 +142,10 @@ func (s *Service) Schedule(ctx context.Context, in ScheduleInput) (*model.Job, e
 		Payload: payloadJSON,
 	}
 	if err := s.repo.Create(ctx, job); err != nil {
-		return nil, err
+		s.log.ErrorCtx(ctx, "asyncjob: schedule create failed", err, map[string]any{
+			"user_id": in.UserID, "kind": in.Kind,
+		})
+		return nil, fmt.Errorf("schedule: create: %w: %w", err, asyncjob.ErrAsyncJobInternal)
 	}
 
 	// 提交 goroutine。runner ctx 独立于 request ctx —— handler return 后任务继续跑。
@@ -131,62 +153,89 @@ func (s *Service) Schedule(ctx context.Context, in ScheduleInput) (*model.Job, e
 		s.runJob(runCtx, job, runner)
 	}); err != nil {
 		// 调度失败:标 failed 方便前端看到,不留 queued 悬而未决。
-		_ = s.repo.MarkRunning(context.Background(), job.ID) // 占位推进,便于 MarkFinished 通过状态校验
-		_ = s.repo.MarkFinished(context.Background(), job.ID, model.StatusFailed, nil,
-			fmt.Sprintf("schedule: submit goroutine failed: %v", err))
-		return nil, err
+		// 用独立 background ctx 确保落库(request ctx 在 submit 失败时可能已异常)。
+		//sayso-lint:ignore ctx-background
+		persistCtx, cancel := context.WithTimeout(context.Background(), asyncjob.PersistTimeout)
+		defer cancel()
+		if mrErr := s.repo.MarkRunning(persistCtx, job.ID); mrErr != nil {
+			s.log.WarnCtx(ctx, "asyncjob: schedule submit-failed mark running also failed", map[string]any{
+				"job_id": job.ID, "err": mrErr.Error(),
+			})
+		}
+		if mfErr := s.repo.MarkFinished(persistCtx, job.ID, model.StatusFailed, nil,
+			fmt.Sprintf("schedule: submit goroutine failed: %v", err)); mfErr != nil {
+			s.log.WarnCtx(ctx, "asyncjob: schedule submit-failed mark finished also failed", map[string]any{
+				"job_id": job.ID, "err": mfErr.Error(),
+			})
+		}
+		s.log.ErrorCtx(ctx, "asyncjob: schedule submit goroutine failed", err, map[string]any{
+			"job_id": job.ID, "kind": in.Kind,
+		})
+		return nil, fmt.Errorf("schedule: submit: %w: %w", err, asyncjob.ErrAsyncJobInternal)
 	}
 	return job, nil
 }
 
 // GetJob HTTP 轮询接口。权限校验(userID 是否 match)由 handler 层决定,本层只做查找。
+// 找不到返 (nil, nil);DB 异常返 asyncjob.ErrAsyncJobInternal。
 func (s *Service) GetJob(ctx context.Context, id uint64) (*model.Job, error) {
-	return s.repo.Get(ctx, id)
+	job, err := s.repo.Get(ctx, id)
+	if err != nil {
+		s.log.ErrorCtx(ctx, "asyncjob: get job failed", err, map[string]any{"job_id": id})
+		return nil, fmt.Errorf("get: %w: %w", err, asyncjob.ErrAsyncJobInternal)
+	}
+	return job, nil
 }
 
 // FindActive 查当前用户是否有指定 kind 的活跃任务(queued 或 running)。
 // 用途:前端切页面 / F5 回来时,拿这个接口续上已在跑的任务 id,不需要重启新任务。
-// 返 (nil, nil) 表示没有活跃任务。
+// 返 (nil, nil) 表示没有活跃任务;DB 异常返 asyncjob.ErrAsyncJobInternal。
 func (s *Service) FindActive(ctx context.Context, userID uint64, kind string) (*model.Job, error) {
-	return s.repo.FindActive(ctx, userID, kind)
+	job, err := s.repo.FindActive(ctx, userID, kind)
+	if err != nil {
+		s.log.ErrorCtx(ctx, "asyncjob: find active failed", err, map[string]any{
+			"user_id": userID, "kind": kind,
+		})
+		return nil, fmt.Errorf("find active: %w: %w", err, asyncjob.ErrAsyncJobInternal)
+	}
+	return job, nil
 }
 
 // FindLatest 查当前用户该 kind 最近一次任务(按创建顺序,不论状态)。
 // 用途:前端 mount 时判断"上次有没有失败过",失败则展示常驻横幅 + 重试按钮。
-// 返 (nil, nil) 表示该用户从未跑过此类任务。
+// 返 (nil, nil) 表示该用户从未跑过此类任务;DB 异常返 asyncjob.ErrAsyncJobInternal。
 func (s *Service) FindLatest(ctx context.Context, userID uint64, kind string) (*model.Job, error) {
-	return s.repo.FindLatest(ctx, userID, kind)
+	job, err := s.repo.FindLatest(ctx, userID, kind)
+	if err != nil {
+		s.log.ErrorCtx(ctx, "asyncjob: find latest failed", err, map[string]any{
+			"user_id": userID, "kind": kind,
+		})
+		return nil, fmt.Errorf("find latest: %w: %w", err, asyncjob.ErrAsyncJobInternal)
+	}
+	return job, nil
 }
 
-// ListRecent 列出当前用户该 kind 的最近 limit 条任务(按 id DESC)。
-// 用途:前端"同步历史"视图。limit 上限在此 clamp(保护 DB),0 / 负数走默认。
-func (s *Service) ListRecent(ctx context.Context, userID uint64, kind string, limit int) ([]*model.Job, error) {
-	const maxLimit = 50
-	if limit <= 0 {
-		limit = 10
-	}
-	if limit > maxLimit {
-		limit = maxLimit
-	}
-	return s.repo.ListByUser(ctx, userID, kind, limit)
-}
-
-// ReapStale 启动时扫一次。返回被回收数量。错误仅 log,不 fatal(DB 临时问题不应阻塞启动)。
+// ReapStale 启动时扫一次。错误仅 log,不 fatal(DB 临时问题不应阻塞启动)。
 func (s *Service) ReapStale(ctx context.Context) {
 	n, err := s.repo.ReapStale(ctx, s.cfg.StaleThreshold)
 	if err != nil {
-		s.log.Warn("asyncjob: reap stale failed", map[string]any{"err": err.Error()})
+		s.log.WarnCtx(ctx, "asyncjob: reap stale failed", map[string]any{"err": err.Error()})
 		return
 	}
 	if n > 0 {
-		s.log.Info("asyncjob: reaped stale jobs", map[string]any{"count": n})
+		s.log.InfoCtx(ctx, "asyncjob: reaped stale jobs", map[string]any{"count": n})
 	}
 }
 
 // Shutdown 触发 runner ctx 取消并等待 in-flight 任务结束或超时。
 // 超时后 goroutine 仍可能在跑,service 本身不再接受新任务。返回 nil 表示全部结束。
+// 超时或 ctx cancel 导致未全部结束 → 返 asyncjob.ErrAsyncJobInternal 包装。
 func (s *Service) Shutdown(ctx context.Context) error {
-	return s.async.Shutdown(ctx)
+	if err := s.async.Shutdown(ctx); err != nil {
+		s.log.ErrorCtx(ctx, "asyncjob: shutdown failed", err, nil)
+		return fmt.Errorf("shutdown: %w: %w", err, asyncjob.ErrAsyncJobInternal)
+	}
+	return nil
 }
 
 // ─── 内部 ────────────────────────────────────────────────────────────────────
@@ -195,7 +244,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 func (s *Service) runJob(ctx context.Context, job *model.Job, runner Runner) {
 	// 状态推进到 running。失败(比如前面崩进程已被 reap 成 failed)就早退。
 	if err := s.repo.MarkRunning(ctx, job.ID); err != nil {
-		s.log.Warn("asyncjob: mark running failed", map[string]any{
+		s.log.WarnCtx(ctx, "asyncjob: mark running failed", map[string]any{
 			"job_id": job.ID, "kind": job.Kind, "err": err.Error(),
 		})
 		return
@@ -204,16 +253,18 @@ func (s *Service) runJob(ctx context.Context, job *model.Job, runner Runner) {
 	// 心跳 ticker。单独 goroutine 每 HeartbeatInterval 打一次,直到 ctx/结束信号 done。
 	hbCtx, cancelHB := context.WithCancel(ctx)
 	defer cancelHB()
+	//sayso-lint:ignore bare-goroutine
 	go s.heartbeatLoop(hbCtx, job.ID)
 
-	reporter := &dbReporter{repo: s.repo, jobID: job.ID, log: s.log}
+	reporter := &dbReporter{repo: s.repo, jobID: job.ID, log: s.log, ctx: ctx}
 
 	result, runErr := s.safeRun(ctx, runner, job, reporter)
 	cancelHB()
 
 	// 终态写入。服务 shutdown 中 ctx 已 cancel,此时用 background ctx 做最后回写,
 	// 确保状态落库(否则重启时被 reap 误判)。
-	persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	//sayso-lint:ignore ctx-background
+	persistCtx, cancel := context.WithTimeout(context.Background(), asyncjob.PersistTimeout)
 	defer cancel()
 
 	if runErr != nil {
@@ -224,7 +275,7 @@ func (s *Service) runJob(ctx context.Context, job *model.Job, runner Runner) {
 			errMsg = "canceled: service shutdown"
 		}
 		if err := s.repo.MarkFinished(persistCtx, job.ID, model.StatusFailed, nil, errMsg); err != nil {
-			s.log.Error("asyncjob: mark failed persist error", err, map[string]any{"job_id": job.ID})
+			s.log.ErrorCtx(ctx, "asyncjob: mark failed persist error", err, map[string]any{"job_id": job.ID})
 		}
 		return
 	}
@@ -234,7 +285,7 @@ func (s *Service) runJob(ctx context.Context, job *model.Job, runner Runner) {
 		raw, err := json.Marshal(result)
 		if err != nil {
 			// result marshal 失败退化成 succeeded + 空 result,不影响任务本身结果。
-			s.log.Warn("asyncjob: marshal result failed", map[string]any{
+			s.log.WarnCtx(ctx, "asyncjob: marshal result failed", map[string]any{
 				"job_id": job.ID, "err": err.Error(),
 			})
 		} else {
@@ -242,20 +293,22 @@ func (s *Service) runJob(ctx context.Context, job *model.Job, runner Runner) {
 		}
 	}
 	if err := s.repo.MarkFinished(persistCtx, job.ID, model.StatusSucceeded, resultJSON, ""); err != nil {
-		s.log.Error("asyncjob: mark succeeded persist error", err, map[string]any{"job_id": job.ID})
+		s.log.ErrorCtx(ctx, "asyncjob: mark succeeded persist error", err, map[string]any{"job_id": job.ID})
 	}
 }
 
-// safeRun recover panic 包装,把 panic 转 error。
+// safeRun recover panic 包装,把 panic 转 error。panic 已转成 error 不再包 sentinel ——
+// runner 返的 error 直接回传给 runJob 用于判断 context.Canceled。
 func (s *Service) safeRun(ctx context.Context, runner Runner, job *model.Job, reporter ProgressReporter) (result any, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("panic: %v", rec)
-			s.log.Error("asyncjob: runner panic", nil, map[string]any{
+			s.log.ErrorCtx(ctx, "asyncjob: runner panic", nil, map[string]any{
 				"job_id": job.ID, "kind": job.Kind, "panic": rec,
 			})
 		}
 	}()
+	//sayso-lint:ignore sentinel-wrap
 	return runner.Run(ctx, job, reporter)
 }
 
@@ -269,7 +322,7 @@ func (s *Service) heartbeatLoop(ctx context.Context, jobID uint64) {
 			return
 		case <-ticker.C:
 			if err := s.repo.Heartbeat(ctx, jobID); err != nil {
-				s.log.Warn("asyncjob: heartbeat failed", map[string]any{
+				s.log.WarnCtx(ctx, "asyncjob: heartbeat failed", map[string]any{
 					"job_id": jobID, "err": err.Error(),
 				})
 			}
@@ -280,16 +333,33 @@ func (s *Service) heartbeatLoop(ctx context.Context, jobID uint64) {
 // dbReporter 把 Runner 的 SetTotal/Inc 调用转发到 repo。
 // 没做合批:Runner 层以"每条处理完调一次"的频率,飞书 Sync 一次上百条也能接受,
 // 将来 hot path 真出问题再加 ring buffer + flush interval。
+//
+// ctx 持有 runJob 的 runner ctx —— shutdown 时与任务一起被 cancel。
 type dbReporter struct {
 	repo  repository.Repository
 	jobID uint64
 	log   logger.LoggerInterface
+	ctx   context.Context
 }
 
+// SetTotal 设置 Job.ProgressTotal。失败返 asyncjob.ErrAsyncJobInternal 包装。
 func (r *dbReporter) SetTotal(total int) error {
-	return r.repo.SetTotal(context.Background(), r.jobID, total)
+	if err := r.repo.SetTotal(r.ctx, r.jobID, total); err != nil {
+		r.log.ErrorCtx(r.ctx, "asyncjob: reporter set total failed", err, map[string]any{
+			"job_id": r.jobID, "total": total,
+		})
+		return fmt.Errorf("reporter set total: %w: %w", err, asyncjob.ErrAsyncJobInternal)
+	}
+	return nil
 }
 
+// Inc 累加 ProgressDone/ProgressFailed。失败返 asyncjob.ErrAsyncJobInternal 包装。
 func (r *dbReporter) Inc(deltaDone, deltaFailed int) error {
-	return r.repo.IncProgress(context.Background(), r.jobID, deltaDone, deltaFailed)
+	if err := r.repo.IncProgress(r.ctx, r.jobID, deltaDone, deltaFailed); err != nil {
+		r.log.ErrorCtx(r.ctx, "asyncjob: reporter inc progress failed", err, map[string]any{
+			"job_id": r.jobID, "delta_done": deltaDone, "delta_failed": deltaFailed,
+		})
+		return fmt.Errorf("reporter inc: %w: %w", err, asyncjob.ErrAsyncJobInternal)
+	}
+	return nil
 }
