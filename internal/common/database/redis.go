@@ -97,6 +97,46 @@
 //   │   用途: per-org 每日发邀上限(兜底)      │        │       │ 防整个 org 被滥用成邀请邮件喷射源    │
 //   +─────────────────────────────────────────+────────+───────+────────────────────────────────────────+
 //
+// ═════════════════════════════════════════════════════════════════════════════
+//  Streams 登记(事件总线,PR #3 起)
+//  (和上面 KV 表结构不同:Stream 没 TTL,有 MAXLEN;value 是字段集不是单值)
+//  实现 / 配置:internal/common/eventbus + config.EventBus(*_stream / max_len)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+//   +─────────────────────────────────────────+─────────+─────────────────────────+─────────────────────────────+
+//   │ Stream Key                              │ MAXLEN  │ 发布者 / 消费 group     │ 字段集                     │
+//   +─────────────────────────────────────────+─────────+─────────────────────────+─────────────────────────────+
+//   │ synapse:asyncjob:events                 │ ~100000 │ 发布:internal/asyncjob/ │ job_id / org_id / user_id   │
+//   │   用途: job 进终态(succeeded/failed/    │ (可配)  │       service           │ / kind / status             │
+//   │        canceled)时广播完成事件,给      │         │ 消费:workflow-advancer │ / idempotency_key / error   │
+//   │        workflow 引擎推进 step           │         │       (PR #5 落)        │ / result (JSON string)     │
+//   +─────────────────────────────────────────+─────────+─────────────────────────+─────────────────────────────+
+//   │ synapse:workflow:events                 │ ~100000 │ 发布:workflow 引擎      │ event_type / workflow_id    │
+//   │   用途: workflow 内部跃迁(step.ready/   │ (可配)  │       (PR #5 落)        │ / step_id                   │
+//   │        step.completed / approval...),  │         │ 消费:workflow-advancer │ / payload (JSON string)    │
+//   │        驱动 advancer 推进下游 step      │         │                         │                             │
+//   │        PR #3 只占位,PR #5 正式启用       │         │                         │                             │
+//   +─────────────────────────────────────────+─────────+─────────────────────────+─────────────────────────────+
+//   │ synapse:channel:events                  │ ~100000 │ 发布:channel/service    │ event_type / org_id         │
+//   │   用途: channel 层业务事件              │ (可配)  │ 消费:                   │ / channel_id / message_id   │
+//   │        message.posted / channel.created │         │  - channel-event-card-  │ / author_principal_id       │
+//   │        channel.archived / member.added/ │         │    writer (PR #4'起)    │ / mentioned_principal_ids   │
+//   │        removed / kb_ref.* / project.*   │         │  - top-orchestrator     │   (csv)                     │
+//   │                                         │         │    (PR #6')             │                             │
+//   +─────────────────────────────────────────+─────────+─────────────────────────+─────────────────────────────+
+//   │ synapse:task:events                     │ ~100000 │ 发布:task/service       │ event_type / org_id         │
+//   │   用途: task 状态变化                   │ (可配)  │ 消费:                   │ / channel_id / task_id      │
+//   │        task.created / claimed /         │         │  - channel-event-card-  │ / status / assignee_*       │
+//   │        submitted / reviewed / ...       │         │    writer (PR #4'起)    │ / reviewer_* / ...          │
+//   +─────────────────────────────────────────+─────────+─────────────────────────+─────────────────────────────+
+//
+// Streams 使用纪律:
+//   - 嵌套结构(如 result / payload)由发布侧 JSON marshal 成 string 塞进字段,
+//     消费侧自行 unmarshal;eventbus 层只做 k/v string 传输
+//   - 幂等由消费端业务保障(UPDATE ... WHERE status=running 返 RowsAffected=0 视为已处理)
+//   - at-least-once 投递:同一事件可能被投递多次,handler 必须幂等
+//   - DB 是真相源;publish 失败不回滚 DB,由 reaper 扫状态差兜底对账
+//
 // 实现注记:
 //   - session:
 //     * 7d TTL = refresh token 有效期,每次 Save 重置为完整 7d
@@ -108,7 +148,8 @@
 // 不落 Redis 的相关数据(避免误以为在这里):
 //   - IP 限流 (middleware/ip_rate_limit.go) —— 内存 sync.Map
 //   - OAuth auth code / refresh token —— MySQL 表
-//   - asyncjob 状态 —— MySQL 表
+//   - asyncjob 状态 —— MySQL 表(async_jobs.status 是唯一真相;Streams 只是完成事件的通知通道)
+//   - workflow 审计日志 —— MySQL workflow_events 表(和 Redis Streams 职责分离,表管"记录",Streams 管"通知")
 //   - 各模块 session / chunk 元数据 —— MySQL/PG
 //
 // ═════════════════════════════════════════════════════════════════════════════

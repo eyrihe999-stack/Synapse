@@ -87,6 +87,18 @@ type Repository interface {
 	// CountChunks 统计某 doc 的 chunks 数量,按状态分组。retrieval / 诊断 UI 用。
 	CountChunks(ctx context.Context, docID uint64) (indexed, failed int64, err error)
 
+	// ListChunksByDocOrdered 按 chunk_idx ASC 拉某 doc 全部 chunks(不读 embedding 列)。
+	// 给 MCP `get_kb_document` 用 —— 把 chunks 按顺序拼回原文供 agent 阅读。
+	// chunks 为空表示文档未分块或 ingestion 未完成。
+	ListChunksByDocOrdered(ctx context.Context, orgID, docID uint64) ([]model.DocumentChunk, error)
+
+	// SearchByEmbedding 按向量近邻在 org 内搜 chunks,scope 由 sourceIDs ∪ docIDs 限定
+	// (调用方负责把 channel 可见集传进来)。
+	//
+	// 实现走 HNSW + JOIN documents,返回 chunk 内容 + 必要的 doc 元数据(title/mime/source_id)。
+	// 失败返 ErrDocumentInternal wrap;空可见集 / topK ≤ 0 返 (nil, nil)。
+	SearchByEmbedding(ctx context.Context, orgID uint64, sourceIDs, docIDs []uint64, queryVec []float32, topK int) ([]ChunkSearchHit, error)
+
 	// CountBySource 统计某 source 下属的 doc 数量。source 删除前的前置守卫用。
 	// 0 表示该 source 下没有任何 doc;source.DeleteSource 仅在计数为 0 时放行。
 	CountBySource(ctx context.Context, orgID, sourceID uint64) (int64, error)

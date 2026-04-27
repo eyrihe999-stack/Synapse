@@ -40,6 +40,7 @@ ultrathink
 3. 如果 TARGETS 包含 synapse-web：确认 `../Synapse-Web/Dockerfile` 存在。
 4. 确认 `docker-compose.yml` 存在。
 5. 执行 `curl -sf http://localhost:5001/v2/` 确认本地 Registry 可用。
+6. 如果 TARGETS 包含 synapse：确认 `config/config.local.yaml` 存在(gitignored,放真秘钥;compose 以只读挂载进容器,APP_ENV=local 让 loader 读它)。缺失时停止并提示用户照 `config.dev.yaml` 模板补一份。
 
 ## 步骤 2：确定版本号 + GIT_SHA
 

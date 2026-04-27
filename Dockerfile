@@ -36,7 +36,11 @@ RUN apk add --no-cache ca-certificates tzdata wget \
 WORKDIR /app
 
 COPY --from=builder --chown=app:app /bin/synapse /app/synapse
+# config.local.yaml 在 .dockerignore 里排除,不烘进镜像;由 compose 挂载到 /app/config/config.local.yaml
 COPY --chown=app:app config/ /app/config/
+
+# 本地部署默认读 config.local.yaml(gitignored 真秘钥),compose 会挂载进来
+ENV APP_ENV=local
 
 USER app
 

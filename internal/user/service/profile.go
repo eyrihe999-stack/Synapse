@@ -50,6 +50,7 @@ func (s *userService) UpdateProfile(ctx context.Context, userID uint64, req Upda
 func toUserProfile(u *model.User) *UserProfile {
 	return &UserProfile{
 		ID:              u.ID,
+		PrincipalID:     u.PrincipalID,
 		Email:           u.Email,
 		DisplayName:     u.DisplayName,
 		AvatarURL:       u.AvatarURL,

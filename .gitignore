@@ -39,3 +39,6 @@ vendor/
 # OS
 .DS_Store
 Thumbs.db
+
+# build artifacts (cmd/agent-bridge/build.sh 产出)
+dist/

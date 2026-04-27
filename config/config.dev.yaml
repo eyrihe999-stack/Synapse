@@ -50,6 +50,41 @@ redis:
   password: ""
   db: 0
 
+# 事件总线(Redis Streams)。asyncjob 终态完成事件 + workflow 内部跃迁事件走这里。
+# 物理复用 redis 连接,不另建 client。
+# 详见 internal/common/database/redis.go 文件头的 Streams 小节注册表。
+eventbus:
+  # 单 stream 近似 MAXLEN(XADD 裁剪)。0 / 缺省 → 代码默认 100000。
+  max_len: 100000
+  # asyncjob 完成事件 stream key;空串 → 代码默认 "synapse:asyncjob:events"。
+  asyncjob_stream: "synapse:asyncjob:events"
+  # workflow 内部跃迁事件 stream key(已冻结,保留兼容);空串 → 代码默认 "synapse:workflow:events"。
+  workflow_stream: "synapse:workflow:events"
+  # channel 消息 / @mention / 归档事件(PR #4' 起);空串 → 代码默认 "synapse:channel:events"。
+  channel_stream: "synapse:channel:events"
+  # task 状态变更事件(PR #4' 起);空串 → 代码默认 "synapse:task:events"。
+  task_stream: "synapse:task:events"
+  # 启动时 destroy + 重建 channel/task stream 上的 consumer group
+  # (top-orchestrator + channel-event-card-writer)。清光 stale consumer + PEL。
+  #
+  # 一般保持 false:正常路径上 graceful shutdown 已经会自己 DELCONSUMER 摘掉自己,
+  # 配合 SYNAPSE_INSTANCE_ID env 让重启复用同名 consumer,group 里不会累积 stale。
+  #
+  # 临时改 true 用于:历史累积太多 stale 想一次清光、协议升级等。
+  # **多实例部署绝对不要开**,否则启动晚的实例会清掉先启动实例的 in-flight 事件。
+  reset_groups_on_start: false
+
+# MCP OAuth 2.1 AS(PR #5' 起)—— 给 Claude Desktop / Cursor / Codex remote 接入用。
+# Issuer 决定 .well-known metadata 和 token 里的 iss 字段;生产必须 https 且对外可达。
+# dev 本地可填 http://localhost:8080(Claude Desktop 允许 localhost 回调)。
+oauth:
+  issuer: "http://localhost:8080"
+  access_token_ttl: "24h"
+  refresh_token_ttl: "720h"            # 30d
+  authorization_code_ttl: "10m"
+  dcr_rate_limit_window: 60
+  dcr_rate_limit_max: 10
+
 log:
   level: debug
   format: text             # json 或 text
@@ -120,6 +155,23 @@ embedding:
       api_key: ""
       api_version: "2024-10-21"
 
+# LLM chat completions(PR #6' 起)—— 顶级系统 agent / 后续专项 agent 调用的
+# LLM provider。与 embedding 独立配置,允许指向不同 Azure 资源 / 额度池。
+# 生产侧把 azure.api_key 放 env:AZURE_LLM_API_KEY;或写入 gitignored config.local.yaml。
+# **没有 fake provider**:dev/staging/prod 行为完全一致,测试替身靠 mock llm.Chat。
+llm:
+  provider: azure
+  azure:
+    endpoint: "https://lunalabs-api.openai.azure.com/openai/v1/"
+    deployment: "gpt-5.4"
+    api_key: ""                 # 留空模板;真凭证走 config.local.yaml 或 AZURE_LLM_API_KEY env
+    api_version: "2024-10-21"
+  # 每 org 每日 LLM 花费上限(美元)。0 = 不限(dev 默认不限,生产视预算调整)。
+  # runtime 每次响应前查 llm_usage 当天 SUM 比较,超限回"今日预算已用完"并 ACK。
+  daily_budget_per_org_usd: 0
+  # 单次 LLM HTTP 请求超时(秒)。默认 60 足够 gpt-5.4 长回答。
+  request_timeout_sec: 60
+
 # 邮件发送 —— 用于邮箱验证码等场景。
 # 敏感字段统一走 env:
 #   EMAIL_PROVIDER=resend | smtp           # 选通道,空串 = 不发邮件(dev 本地看日志拿码)
@@ -186,3 +238,9 @@ oss:
   domain: ""                        # 空 = 用 bucket 默认域(走 OSS 直链)
   path_prefix: "synapse"            # OSS key 顶层前缀,synapse/{orgID}/{docID}/{versionHash}.md
   max_versions_per_document: 10     # 单文档最多保留几个历史版本,超过自动删最老的
+
+# 顶级系统 agent(internal/agentsys)runtime 运行参数。
+# concurrency:进程内并发消费 channel @ 事件的 consumer 数,Redis Streams group 内自动分派。
+# 0 / 缺省 → 3;上限 32(防配错把 LLM rate limit 打爆)。多 pod 部署时每个 pod 独立扩。
+agentsys:
+  concurrency: 3

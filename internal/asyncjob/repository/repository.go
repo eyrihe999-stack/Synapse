@@ -37,6 +37,13 @@ type Repository interface {
 	// 找不到返 (nil, nil)。
 	FindLatest(ctx context.Context, userID uint64, kind string) (*model.Job, error)
 
+	// FindByIdempotencyKey 按幂等键查已存在的 job(不论状态)。
+	//
+	// 用途:workflow 引擎 re-drive 同一 step_run 时用相同 key,命中则直接复用 —— 含终态。
+	// key 空串返 (nil, nil)(语义:不启用幂等判断);无匹配也返 (nil, nil)。
+	// 唯一索引保证"同 (org_id, kind, key) 至多一条",所以直接 Take 即可。
+	FindByIdempotencyKey(ctx context.Context, orgID uint64, kind, key string) (*model.Job, error)
+
 	// MarkRunning queued → running,填 StartedAt + 首次 HeartbeatAt。幂等:状态不是 queued 返 error。
 	MarkRunning(ctx context.Context, id uint64) error
 
@@ -115,6 +122,23 @@ func (r *gormRepo) FindLatest(ctx context.Context, userID uint64, kind string) (
 			return nil, nil
 		}
 		return nil, fmt.Errorf("async job find latest: %w", err)
+	}
+	return &row, nil
+}
+
+func (r *gormRepo) FindByIdempotencyKey(ctx context.Context, orgID uint64, kind, key string) (*model.Job, error) {
+	if key == "" {
+		return nil, nil
+	}
+	var row model.Job
+	err := r.db.WithContext(ctx).
+		Where("org_id = ? AND kind = ? AND idempotency_key = ?", orgID, kind, key).
+		Take(&row).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("async job find by idempotency key: %w", err)
 	}
 	return &row, nil
 }

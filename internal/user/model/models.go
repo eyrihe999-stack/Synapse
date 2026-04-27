@@ -2,6 +2,10 @@ package model
 
 import (
 	"time"
+
+	"gorm.io/gorm"
+
+	principalmodel "github.com/eyrihe999-stack/Synapse/internal/principal/model"
 )
 
 // 用户生命周期状态枚举(M1.7)。
@@ -41,7 +45,15 @@ const (
 //   - 现在仅作为"注销发生时间"记录,由 DeleteAccount 显式写入,给 GDPR purge 冷却期用;
 //   - 列名保留 deleted_at 兼容历史数据,但 GORM 不再自动过滤 —— 生命周期完全由 status 表达。
 type User struct {
-	ID             uint64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	ID uint64 `gorm:"primaryKey;autoIncrement" json:"id"`
+	// PrincipalID 指向 principals 表的身份根。
+	//   - PR #1 过渡期:default 0 占位;AutoMigrate 给存量 user 加列时全部落 0,
+	//     随后 user.RunMigrations 的 backfill 逻辑补齐为真实 principal id
+	//   - 新建 user 时由 User.BeforeCreate hook 自动建 principal 行并回填 —— 保证
+	//     数据库里不再出现 PrincipalID=0 的 user(backfill 完成之后)
+	//   - 唯一约束通过 user.RunMigrations 在 backfill 之后用 EnsureIndex 建
+	//     (不能放 struct tag 里,因为 AutoMigrate 添加新列时会触发 unique 冲突)
+	PrincipalID    uint64     `gorm:"column:principal_id;not null;default:0" json:"principal_id"`
 	Email          string     `gorm:"size:255;not null;uniqueIndex:uk_users_email" json:"email"`
 	PasswordHash   string     `gorm:"size:255;not null" json:"-"`
 	DisplayName    string     `gorm:"size:64" json:"display_name"`
@@ -61,3 +73,25 @@ type User struct {
 }
 
 func (User) TableName() string { return "users" }
+
+// BeforeCreate GORM hook:新建 user 时若 PrincipalID 未设置,自动插入一条
+// principals(kind='user') 行并回填 PrincipalID。保证 user / principal 同事务。
+//
+// 调用方不感知这个 hook —— 现有 CreateUser 逻辑无需改,插 user 就会自动带出 principal。
+// 迁移期的存量 user(PrincipalID=0)不走这里,由 user.RunMigrations 的 backfill 补齐。
+func (u *User) BeforeCreate(tx *gorm.DB) error {
+	if u.PrincipalID != 0 {
+		return nil
+	}
+	p := &principalmodel.Principal{
+		Kind:        principalmodel.KindUser,
+		DisplayName: u.DisplayName,
+		AvatarURL:   u.AvatarURL,
+		Status:      u.Status,
+	}
+	if err := tx.Create(p).Error; err != nil {
+		return err
+	}
+	u.PrincipalID = p.ID
+	return nil
+}

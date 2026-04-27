@@ -4,6 +4,7 @@ sayso-lint
 .env
 .env.*
 !.env.example
+config/config.local.yaml
 .git/
 .idea/
 .vscode/

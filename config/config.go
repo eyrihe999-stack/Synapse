@@ -20,10 +20,68 @@ type Config struct {
 	Snowflake    SnowflakeConfig    `yaml:"snowflake"`
 	Organization OrganizationConfig `yaml:"organization"`
 	Embedding    EmbeddingConfig    `yaml:"embedding"`
+	LLM          LLMConfig          `yaml:"llm"`
 	Email        EmailConfig        `yaml:"email"`
 	User         UserConfig         `yaml:"user"`
 	OAuthLogin   OAuthLoginConfig   `yaml:"oauth_login"`
 	OSS          OSSConfig          `yaml:"oss"`
+	EventBus     EventBusConfig     `yaml:"eventbus"`
+	OAuth        OAuthConfig        `yaml:"oauth"`
+	AgentSys     AgentSysConfig     `yaml:"agentsys"`
+}
+
+// OAuthConfig MCP 专用 OAuth 2.1 AS 配置。
+//
+// 服务于 Claude Desktop / Cursor 等 remote MCP 接入(详见 docs/collaboration-design.md §3.6.2)。
+// **不**用于 user 登录(Google OIDC 是另一条链,在 OAuthLogin 配置)。
+//
+// 字段语义:
+//
+//	Issuer              AS 的基 URL,出现在 .well-known metadata 里;必须匹配外网可达域名。
+//	                    dev 本地 docker 可填 "http://localhost:8080",生产必须 https
+//	AccessTokenTTL      access_token 存活时长;默认 24h
+//	RefreshTokenTTL     refresh_token 存活时长;默认 30d
+//	AuthorizationCodeTTL  authorize → token exchange 的窗口;默认 10m
+//	DCRRateLimitWindow  DCR per-IP 滑动窗口秒数;默认 60
+//	DCRRateLimitMax     DCR 单 IP 每窗口最多注册次数;默认 10
+type OAuthConfig struct {
+	Issuer               string        `yaml:"issuer"`
+	AccessTokenTTL       time.Duration `yaml:"access_token_ttl"`
+	RefreshTokenTTL      time.Duration `yaml:"refresh_token_ttl"`
+	AuthorizationCodeTTL time.Duration `yaml:"authorization_code_ttl"`
+	DCRRateLimitWindow   int           `yaml:"dcr_rate_limit_window"` // seconds
+	DCRRateLimitMax      int           `yaml:"dcr_rate_limit_max"`
+}
+
+// EventBusConfig 基于 Redis Streams 的事件总线配置。
+//
+// 职责:asyncjob 完成事件 / channel 消息事件 / task 状态事件等的发布通道。
+// 物理后端复用 Config.Redis 已连上的 client(不另建连接),这里只放 stream 相关参数。
+//
+// 字段语义:
+//
+//	MaxLen            单 stream 的近似 MAXLEN(XADD 裁剪)。默认 100000,保近 10 万条够审计 + 冷启动重放。
+//	AsyncJobStream    asyncjob 完成事件 stream key。默认 "synapse:asyncjob:events"。
+//	WorkflowStream    workflow 内部跃迁 stream key。默认 "synapse:workflow:events"(已冻结,保留兼容,PR #5' 之后废弃)。
+//	ChannelStream     channel 消息 / @mention / 归档事件 stream key。默认 "synapse:channel:events"。
+//	TaskStream        task 状态变更事件 stream key。默认 "synapse:task:events"。
+//
+// 未来扩展:若换 NATS / Kafka 作为后端,这里加 `Backend string` + 对应 provider 子块。
+type EventBusConfig struct {
+	MaxLen         int    `yaml:"max_len"`
+	AsyncJobStream string `yaml:"asyncjob_stream"`
+	WorkflowStream string `yaml:"workflow_stream"`
+	ChannelStream  string `yaml:"channel_stream"`
+	TaskStream     string `yaml:"task_stream"`
+
+	// ResetGroupsOnStart 启动时是否 destroy + 重建 channel/task stream 上注册的 consumer group
+	// (top-orchestrator + channel-event-card-writer)。
+	//
+	// true:每次重启清光 stale consumer + PEL,group 从干净状态开始
+	//   适合:dev / 单实例部署 / 不在乎 in-flight 事件
+	// false(默认):保留 group 跨重启,stale consumer 累积(SweepIdleConsumers 保守清理)
+	//   适合:生产 / 多实例部署(否则启动时会互相清掉 in-flight)
+	ResetGroupsOnStart bool `yaml:"reset_groups_on_start"`
 }
 
 // OSSConfig 阿里云 OSS 接入参数 + 文档版本策略。
@@ -191,6 +249,50 @@ type AzureEmbeddingConfig struct {
 	Deployment string `yaml:"deployment"`  // 例如 text-embedding-3-large
 	APIKey     string `yaml:"api_key"`     // dev 可写 yaml;生产走 env 覆盖
 	APIVersion string `yaml:"api_version"` // 默认 2024-10-21
+}
+
+// AgentSysConfig 顶级系统 agent runtime(internal/agentsys)的运行参数。
+//
+// 字段语义:
+//
+//	Concurrency 同一进程内并发消费 channel @ 事件的 consumer 数。Redis Streams
+//	            consumer group 天然把事件轮派给 N 个 consumer(name=hostname-0/1/...),
+//	            实现进程内 N 路并行处理;多 pod 部署时再叠加 pod 级扩展。
+//	            0/<=1 视为串行(老路径兼容);缺省 3;上限 32(防配错把 LLM rate limit 打爆)。
+//	            注意:不做 per-channel 串行化,同 channel 两条消息**可能**并行,
+//	            在活跃场景概率低;真出问题再加 channelID 维度的 mutex。
+type AgentSysConfig struct {
+	Concurrency int `yaml:"concurrency"`
+}
+
+// LLMConfig 顶级 / 专项系统 agent 调用 LLM 的配置(PR #6' 起)。
+//
+// 与 EmbeddingConfig **独立分离**,因为 LLM 与 embedding 常落在不同的 Azure 资源 /
+// 额度池上(生产里也可能是不同的 endpoint 和 key)。这里只支持 Azure provider 一种 ——
+// **不提供 fake**,以保证 dev / staging / prod 的行为完全一致:测试替身通过 mock
+// llm.Chat 接口实现,不走 factory。
+//
+// 字段语义:
+//
+//	Provider             当前只允许 "azure";非法值在 llm.NewFromConfig 构造时 fatal
+//	Azure                Azure OpenAI chat completions 接入参数
+//	DailyBudgetPerOrgUSD 每 org 每日 LLM 花费上限(美元);0 = 不限
+//	                      runtime 每次回复前查 llm_usage 当天 SUM(cost_usd) 比较
+//	RequestTimeoutSec    单次 LLM HTTP 请求超时;缺省 60
+type LLMConfig struct {
+	Provider             string         `yaml:"provider"`
+	Azure                AzureLLMConfig `yaml:"azure"`
+	DailyBudgetPerOrgUSD float64        `yaml:"daily_budget_per_org_usd"`
+	RequestTimeoutSec    int            `yaml:"request_timeout_sec"`
+}
+
+// AzureLLMConfig Azure OpenAI chat completions 接入参数。
+// APIKey 支持通过 AZURE_LLM_API_KEY 环境变量覆盖。
+type AzureLLMConfig struct {
+	Endpoint   string `yaml:"endpoint"`    // 例如 https://{resource}.openai.azure.com/openai/v1/
+	Deployment string `yaml:"deployment"`  // 例如 gpt-5.4(对应 Azure 部署名)
+	APIKey     string `yaml:"api_key"`     // dev 留空 yaml 模板,真值走 config.local.yaml 或 env
+	APIVersion string `yaml:"api_version"` // v1 surface 下用不到;传统 surface 默认 2024-10-21
 }
 
 // EmailConfig 邮件发送配置(用于邮箱验证码等场景)。
@@ -381,6 +483,9 @@ func overrideWithEnvVars(cfg *Config) {
 	if v := os.Getenv("AZURE_EMBEDDING_API_KEY"); v != "" {
 		cfg.Embedding.Text.Azure.APIKey = v
 	}
+	if v := os.Getenv("AZURE_LLM_API_KEY"); v != "" {
+		cfg.LLM.Azure.APIKey = v
+	}
 	if v := os.Getenv("EMAIL_PROVIDER"); v != "" {
 		cfg.Email.Provider = v
 	}
@@ -478,6 +583,44 @@ func applyDefaults(cfg *Config) {
 		// 略大于 ReadTimeout 即可,池满时短等让请求快速失败 → 触发限流的本地降级。
 		cfg.Redis.PoolTimeout = 1 * time.Second
 	}
+	if cfg.EventBus.MaxLen == 0 {
+		// 10 万条:单条事件 KB 级时占 Redis 约 100MB,够近 1 小时高吞吐 + 冷启动 PEL 重放回看。
+		cfg.EventBus.MaxLen = 100000
+	}
+	if cfg.EventBus.AsyncJobStream == "" {
+		cfg.EventBus.AsyncJobStream = "synapse:asyncjob:events"
+	}
+	if cfg.EventBus.WorkflowStream == "" {
+		cfg.EventBus.WorkflowStream = "synapse:workflow:events"
+	}
+	if cfg.EventBus.ChannelStream == "" {
+		cfg.EventBus.ChannelStream = "synapse:channel:events"
+	}
+	if cfg.EventBus.TaskStream == "" {
+		cfg.EventBus.TaskStream = "synapse:task:events"
+	}
+	if cfg.OAuth.AccessTokenTTL == 0 {
+		cfg.OAuth.AccessTokenTTL = 24 * time.Hour
+	}
+	if cfg.OAuth.RefreshTokenTTL == 0 {
+		cfg.OAuth.RefreshTokenTTL = 30 * 24 * time.Hour
+	}
+	if cfg.OAuth.AuthorizationCodeTTL == 0 {
+		cfg.OAuth.AuthorizationCodeTTL = 10 * time.Minute
+	}
+	if cfg.OAuth.DCRRateLimitWindow == 0 {
+		cfg.OAuth.DCRRateLimitWindow = 60
+	}
+	if cfg.OAuth.DCRRateLimitMax == 0 {
+		cfg.OAuth.DCRRateLimitMax = 10
+	}
+	// AgentSys.Concurrency:0/负数 → 3(默认);>32 夹到 32 避免 LLM rate limit 打爆
+	if cfg.AgentSys.Concurrency <= 0 {
+		cfg.AgentSys.Concurrency = 3
+	}
+	if cfg.AgentSys.Concurrency > 32 {
+		cfg.AgentSys.Concurrency = 32
+	}
 	if cfg.Log.Level == "" {
 		cfg.Log.Level = "info"
 	}
@@ -526,6 +669,15 @@ func applyDefaults(cfg *Config) {
 	// Embedding 默认值:未填 provider 时留空(调用方检测并降级);Azure API 版本兜底。
 	if cfg.Embedding.Text.Azure.APIVersion == "" {
 		cfg.Embedding.Text.Azure.APIVersion = "2024-10-21"
+	}
+
+	// LLM(PR #6' 起):provider 留空时 factory 会 fatal,这里不替它填默认,
+	// 强制用户显式写 "azure" 表达意图。Azure API 版本和 timeout 给兜底值。
+	if cfg.LLM.Azure.APIVersion == "" {
+		cfg.LLM.Azure.APIVersion = "2024-10-21"
+	}
+	if cfg.LLM.RequestTimeoutSec == 0 {
+		cfg.LLM.RequestTimeoutSec = 60
 	}
 
 	// Email 默认值:provider 为空则整个模块 no-op(码只写 Redis,靠日志发给 dev)。

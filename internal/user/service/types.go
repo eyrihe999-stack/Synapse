@@ -55,8 +55,14 @@ type AuthResponse struct {
 }
 
 // UserProfile 用户公开资料。
+//
+// PrincipalID 是 user 在 principals 表的身份根 id,channel_members / task.assignee
+// / channel_message_reactions 等都存 principal_id。前端很多地方(reaction 自己归属
+// 判断 / mention / DM)要用 principal_id 和消息 / 成员行比对,一次冗余到 /users/me
+// 避免每处都反查。JSON `string` 保持和 id 同风格(前端用 Number() 转数字)。
 type UserProfile struct {
 	ID              uint64     `json:"id,string"`
+	PrincipalID     uint64     `json:"principal_id,string"`
 	Email           string     `json:"email"`
 	DisplayName     string     `json:"display_name"`
 	AvatarURL       string     `json:"avatar_url"`

@@ -53,6 +53,8 @@ func (s Status) IsTerminal() bool {
 //   - (user_id, kind, status) 查"当前用户是否有同类任务在跑"(防重复提交)
 //   - (org_id, kind, created_at desc) 组织维度的历史列表(将来做 UI 时用)
 //   - (status, heartbeat_at) 启动时扫 stale running 做僵尸回收
+//   - (org_id, kind, idem_active) UNIQUE 实现幂等键去重(idem_active 是生成列,
+//     空幂等键 → NULL,多 NULL 可并存不冲突;详见 migration.go)
 type Job struct {
 	ID     uint64 `gorm:"primaryKey;autoIncrement"`
 	OrgID  uint64 `gorm:"not null;index:idx_async_jobs_org_kind_created,priority:1"`
@@ -68,6 +70,16 @@ type Job struct {
 	ProgressTotal  int `gorm:"not null;default:0"`
 	ProgressDone   int `gorm:"not null;default:0"`
 	ProgressFailed int `gorm:"not null;default:0"`
+
+	// IdempotencyKey 幂等键,用于"同键调用视为同一次"的去重。
+	//
+	// 场景:workflow 引擎用 step_run_id 作为 key re-drive 某个 step 时,
+	// repository.FindByIdempotencyKey((org_id, kind, key)) 命中已存在 job 直接复用
+	// (含已进终态的);不填则走传统 FindActive(user_id, kind) 防重路径。
+	//
+	// 唯一约束通过 idem_active 生成列 + UNIQUE (org_id, kind, idem_active) 实现
+	// (MySQL UNIQUE 对 NULL 允许并存;空串→NULL 的映射见 migration.go)。
+	IdempotencyKey string `gorm:"size:128;not null;default:'';column:idempotency_key"`
 
 	// Payload 输入参数 —— 每个 kind 自己定义 schema。飞书 sync 暂时无参数,留空。
 	// 扩展:将来前端想选"只同步某几个文件"就序列化 {file_refs: [...]} 进来。

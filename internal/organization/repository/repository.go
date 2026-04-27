@@ -126,10 +126,15 @@ type OrgWithMember struct {
 }
 
 // MemberWithProfile 是 ListMembersByOrg 的结果元组,JOIN users + org_roles 把展示字段带回。
-// Email / DisplayName / AvatarURL / Status / EmailVerifiedAt / LastLoginAt 来自 users 表,
-// Role* 来自 org_roles;任一 JOIN 记录缺失时对应字段为空/零值/nil。
+// Email / DisplayName / AvatarURL / Status / EmailVerifiedAt / LastLoginAt / PrincipalID
+// 来自 users 表,Role* 来自 org_roles;任一 JOIN 记录缺失时对应字段为空/零值/nil。
+//
+// PrincipalID 是前端 @mention 定位 channel_members 用的;org_members 本身只有
+// user_id,但 channel_members / task 等按 principal_id 存,前端需要该映射把"用户"
+// 匹配到 channel 里的身份根。
 type MemberWithProfile struct {
 	Member          *model.OrgMember
+	PrincipalID     uint64
 	Email           string
 	DisplayName     string
 	AvatarURL       string

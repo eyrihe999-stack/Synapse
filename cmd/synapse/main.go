@@ -11,6 +11,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +21,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -38,11 +43,17 @@ import (
 	docpersister "github.com/eyrihe999-stack/Synapse/internal/ingestion/persister/document"
 	"github.com/eyrihe999-stack/Synapse/internal/common/middleware"
 	"github.com/eyrihe999-stack/Synapse/internal/common/ossupload"
+	"github.com/eyrihe999-stack/Synapse/internal/channel"
+	channelhandler "github.com/eyrihe999-stack/Synapse/internal/channel/handler"
+	channelrepo "github.com/eyrihe999-stack/Synapse/internal/channel/repository"
+	channelsvc "github.com/eyrihe999-stack/Synapse/internal/channel/service"
+	"github.com/eyrihe999-stack/Synapse/internal/channel/uploadtoken"
 	"github.com/eyrihe999-stack/Synapse/internal/organization"
 	orghandler "github.com/eyrihe999-stack/Synapse/internal/organization/handler"
 	orgrepo "github.com/eyrihe999-stack/Synapse/internal/organization/repository"
 	orgsvc "github.com/eyrihe999-stack/Synapse/internal/organization/service"
 	"github.com/eyrihe999-stack/Synapse/internal/permission"
+	"github.com/eyrihe999-stack/Synapse/internal/principal"
 	permhandler "github.com/eyrihe999-stack/Synapse/internal/permission/handler"
 	permrepo "github.com/eyrihe999-stack/Synapse/internal/permission/repository"
 	permsvc "github.com/eyrihe999-stack/Synapse/internal/permission/service"
@@ -54,10 +65,35 @@ import (
 	userhandler "github.com/eyrihe999-stack/Synapse/internal/user/handler"
 	userrepo "github.com/eyrihe999-stack/Synapse/internal/user/repository"
 	usersvc "github.com/eyrihe999-stack/Synapse/internal/user/service"
+	"github.com/eyrihe999-stack/Synapse/internal/agents"
+	agenthandler "github.com/eyrihe999-stack/Synapse/internal/agents/handler"
+	agentrepo "github.com/eyrihe999-stack/Synapse/internal/agents/repository"
+	agentsvc "github.com/eyrihe999-stack/Synapse/internal/agents/service"
+	"github.com/eyrihe999-stack/Synapse/internal/agentsys"
+	agentsysrepo "github.com/eyrihe999-stack/Synapse/internal/agentsys/repository"
+	agentsysruntime "github.com/eyrihe999-stack/Synapse/internal/agentsys/runtime"
+	"github.com/eyrihe999-stack/Synapse/internal/agentsys/scoped"
+	"github.com/eyrihe999-stack/Synapse/internal/channel/eventcard"
+	"github.com/eyrihe999-stack/Synapse/internal/mcp"
+	"github.com/eyrihe999-stack/Synapse/internal/oauth"
+	oauthhandler "github.com/eyrihe999-stack/Synapse/internal/oauth/handler"
+	oauthmw "github.com/eyrihe999-stack/Synapse/internal/oauth/middleware"
+	oauthrepo "github.com/eyrihe999-stack/Synapse/internal/oauth/repository"
+	oauthsvc "github.com/eyrihe999-stack/Synapse/internal/oauth/service"
+	"github.com/eyrihe999-stack/Synapse/internal/task"
+	taskhandler "github.com/eyrihe999-stack/Synapse/internal/task/handler"
+	taskrepo "github.com/eyrihe999-stack/Synapse/internal/task/repository"
+	tasksvc "github.com/eyrihe999-stack/Synapse/internal/task/service"
+	"github.com/eyrihe999-stack/Synapse/internal/transport"
+	transporthandler "github.com/eyrihe999-stack/Synapse/internal/transport/handler"
+	transportsvc "github.com/eyrihe999-stack/Synapse/internal/transport/service"
 	"github.com/eyrihe999-stack/Synapse/internal/user_integration"
+	"github.com/eyrihe999-stack/Synapse/internal/common/async"
 	"github.com/eyrihe999-stack/Synapse/internal/common/database"
 	"github.com/eyrihe999-stack/Synapse/internal/common/email"
 	"github.com/eyrihe999-stack/Synapse/internal/common/embedding"
+	"github.com/eyrihe999-stack/Synapse/internal/common/eventbus"
+	"github.com/eyrihe999-stack/Synapse/internal/common/llm"
 	"github.com/eyrihe999-stack/Synapse/internal/common/logger"
 	"github.com/eyrihe999-stack/Synapse/internal/common/oidcclient"
 	"github.com/eyrihe999-stack/Synapse/internal/common/pwdpolicy"
@@ -102,6 +138,15 @@ func main() {
 	defer rdb.Close()
 	appLogger.Info("Redis connected", nil)
 
+	// 4a. EventBus Publisher —— 复用 redis client,asyncjob 终态事件走这里。
+	// Stream 配置来自 cfg.EventBus,默认值在 config.applyDefaults。
+	eventBusPublisher := eventbus.NewRedisPublisher(rdb.GetClient(), int64(cfg.EventBus.MaxLen))
+	appLogger.Info("eventbus publisher ready", map[string]interface{}{
+		"asyncjob_stream": cfg.EventBus.AsyncJobStream,
+		"workflow_stream": cfg.EventBus.WorkflowStream,
+		"max_len":         cfg.EventBus.MaxLen,
+	})
+
 	// 4b. Connect Postgres —— 可选。保留连接通道,新 flow 实现时可直接复用;
 	// 当前无模块消费,只是建立连接 + 启 pgvector extension,不 fatal。
 	var pgDB *gorm.DB
@@ -139,7 +184,13 @@ func main() {
 	})
 
 	// 7. Run migrations(只剩基础设施模块;业务模块 flow 重建后再加回)
+	//
+	// 顺序约束:principal 先于 user / agents —— 后两者的 migration 会向 principals
+	// 表回填身份根记录(详见 docs/collaboration-design.md §3.5.5)。
 	ctx := context.Background()
+	if err := principal.RunMigrations(ctx, db, appLogger, nil); err != nil {
+		appLogger.Fatal("principal migrations failed", err, nil)
+	}
 	if err := user.RunMigrations(ctx, db, appLogger, nil); err != nil {
 		appLogger.Fatal("user migrations failed", err, nil)
 	}
@@ -157,6 +208,22 @@ func main() {
 	}
 	if err := user_integration.RunMigrations(ctx, db, appLogger, nil); err != nil {
 		appLogger.Fatal("user_integration migrations failed", err, nil)
+	}
+	if err := agents.RunMigrations(ctx, db, appLogger, nil); err != nil {
+		appLogger.Fatal("agents migrations failed", err, nil)
+	}
+	if err := channel.RunMigrations(ctx, db, appLogger, nil); err != nil {
+		appLogger.Fatal("channel migrations failed", err, nil)
+	}
+	if err := task.RunMigrations(ctx, db, appLogger, nil); err != nil {
+		appLogger.Fatal("task migrations failed", err, nil)
+	}
+	// PR #6' agentsys:audit_events + llm_usage 两张表,顶级 agent runtime 用
+	if err := agentsys.RunMigrations(ctx, db, appLogger, nil); err != nil {
+		appLogger.Fatal("agentsys migrations failed", err, nil)
+	}
+	if err := oauth.RunMigrations(ctx, db, appLogger, nil); err != nil {
+		appLogger.Fatal("oauth migrations failed", err, nil)
 	}
 	// document migrations 依赖 PG;配置完备才跑。未配置时保持现状(warn 已在 4b 打过)。
 	if pgDB != nil {
@@ -186,7 +253,11 @@ func main() {
 	// 7b. Ingestion pipeline 装配(Layer 2)。
 	//     现阶段只构造,没有 Fetcher 接入 → pipeline 空跑,等 Layer 3+ 加 HTTP / async runner 时喂 fetcher。
 	//     PG / embedding 任一缺失都跳过装配(pipeline = nil),上层调用方自己判空。
+	//
+	//     embedder / documentRepo 提到外层声明,KBQueryService(channel.service)和 MCP 也需要复用。
 	var pipeline *ingestion.Pipeline
+	var embedder embedding.Embedder
+	var documentRepo docrepo.Repository
 	if pgDB != nil {
 		embedCfg := embedding.Config{
 			Provider: cfg.Embedding.Text.Provider,
@@ -198,7 +269,8 @@ func main() {
 				APIVersion: cfg.Embedding.Text.Azure.APIVersion,
 			},
 		}
-		embedder, err := embedding.New(embedCfg)
+		var err error
+		embedder, err = embedding.New(embedCfg)
 		if err != nil {
 			appLogger.Fatal("failed to build embedder", err, nil)
 		}
@@ -213,7 +285,7 @@ func main() {
 			}
 			return plainCk
 		}
-		documentRepo := docrepo.New(pgDB)
+		documentRepo = docrepo.New(pgDB)
 		docPer, err := docpersister.New(documentRepo, appLogger)
 		if err != nil {
 			appLogger.Fatal("failed to build document persister", err, nil)
@@ -245,7 +317,10 @@ func main() {
 		}
 		runners = append(runners, uploadRunner)
 	}
-	asyncJobSvc := asyncsvc.NewService(asyncsvc.Config{}, asyncJobRepo, runners, appLogger)
+	asyncJobSvc := asyncsvc.NewService(
+		asyncsvc.Config{CompletionStream: cfg.EventBus.AsyncJobStream},
+		asyncJobRepo, runners, eventBusPublisher, appLogger,
+	)
 	asyncJobSvc.ReapStale(ctx)
 
 	// 8. Repositories
@@ -347,6 +422,27 @@ func main() {
 	sourceSubjectVal := sourceSubjectValidator{permRepo: permRepo, isMember: orgService.IsMember}
 	sourceSvc := srcsvc.NewSourceService(sourceRepo, permRepo, &sourceSubjectVal, permJudgeSvc, appLogger)
 
+	// 10e. Channel(collaboration Phase 1 PR #2 + PR #4' 扩展:messages / kb_refs)
+	//
+	// uploadSigner:OSS 直传 commit token 签名器。进程启动时随机生成 secret,重启
+	// 后 in-flight token 失效(5min 内的失败,客户端重试即可)。零配置 + 无 rotate 负担。
+	channelRepo := channelrepo.New(db)
+	channelOrgChecker := channelsvc.OrgMembershipCheckerFunc(orgService.IsMember)
+	channelPrincipalResolver := channelsvc.NewPrincipalOrgResolver(db, channelOrgChecker)
+	uploadSigner, err := uploadtoken.NewSigner()
+	if err != nil {
+		appLogger.Fatal("failed to init channel upload signer", err, nil)
+	}
+	channelService := channelsvc.New(
+		channelsvc.Config{
+			ChannelEventStream: cfg.EventBus.ChannelStream,
+			OSSPathPrefix:      cfg.OSS.PathPrefix,
+		},
+		channelRepo, channelOrgChecker, channelPrincipalResolver,
+		eventBusPublisher, ossClient, uploadSigner,
+		documentRepo, embedder, appLogger,
+	)
+
 	// 11. Handlers
 	userH := userhandler.NewHandler(userSvc, appLogger, googleOIDC, cfg.OAuthLogin.Google.FrontendRedirectBase, cfg.OAuthLogin.CookieSecure)
 	orgH := orghandler.NewOrgHandler(orgService, memberService, roleService, invitationService, appLogger)
@@ -357,8 +453,215 @@ func main() {
 	auditH := permhandler.NewAuditHandler(auditQuerySvc)
 	sourceH := srchandler.NewSourceHandler(sourceSvc, appLogger)
 	sourceH.Ready.Store(true)
+	channelH := channelhandler.NewHandler(channelService, appLogger)
+
+	// 10f. Task(PR #4'):channel 内结构化任务
+	taskRepo := taskrepo.New(db)
+	taskService := tasksvc.New(
+		tasksvc.Config{
+			OSSPathPrefix:   cfg.OSS.PathPrefix,
+			TaskEventStream: cfg.EventBus.TaskStream,
+		},
+		taskRepo, ossClient, eventBusPublisher, appLogger,
+	)
+	taskH := taskhandler.NewHandler(taskService, appLogger)
 
 	// asyncjob + document handlers(Layer 3)。document 需要 PG;缺失时路由不挂,HTTP 触不到。
+	// 11a. Transport (agent WS 网关) + agents 模块装配。
+	//
+	//      agentHub:本地内存实现,支持 500-1000 agent 并发 WS 连接
+	//      agentRepo / agentService:DB-backed agent_registry CRUD + rotate + 权限校验
+	//      transportAuth:DBAuthenticator —— 从 agent_registry 表验握手 apikey
+	agentHub := transportsvc.NewLocalHub(appLogger)
+	agentRepoImpl := agentrepo.New(db)
+	agentRoleLookup := agentsRoleLookupAdapter{repo: orgRepo}
+	hubAdapter := &hubAgentIDAdapter{hub: agentHub}
+	agentService := agentsvc.NewAgentService(
+		agentsvc.Config{}, agentRepoImpl, &agentRoleLookup, hubAdapter, appLogger,
+	)
+	transportAuth := agentsvc.NewDBAuthenticator(agentRepoImpl, appLogger)
+	transportH := transporthandler.New(agentHub, transportAuth, appLogger)
+	agentsH := agenthandler.New(agentService, appLogger)
+
+	// 11b. OAuth AS(PR #5' Stage 1)—— OAuth 2.1 AS + DCR + PAT + 统一 Bearer 中间件
+	//
+	// 依赖注入:
+	//   - agentBootstrapper:OAuth consent / PAT 创建时自动建 user-kind agent。
+	//     查 user 的第一个 org → 调 agents.BootstrapUserAgent(kind=user, owner_user_id=<user>)
+	//   - userAuthenticator:OAuth consent 页的 password 登录(不走邮箱验证码,简化 OAuth flow)
+	//   - sessionStore:OAuth flow 期间的短时登录 session(Redis, TTL=10min)
+	//   - dcrRateLimiter:per-IP 限速,包 rdb.SlidingWindowAdd
+	oauthRepoImpl := oauthrepo.New(db)
+	oauthAgentBootstrapper := oauthAgentBootstrapperImpl{
+		orgService:   orgService,
+		userRepo:     userRepo,
+		agentService: agentService,
+		log:          appLogger,
+	}
+	oauthUserAuthenticator := oauthPasswordAuthenticatorImpl{
+		userRepo: userRepo,
+		log:      appLogger,
+	}
+	oauthSessionStore := oauthsvc.NewRedisSessionStore(rdb, 10*time.Minute)
+	oauthService := oauthsvc.New(oauthsvc.Config{}, oauthRepoImpl, &oauthAgentBootstrapper, appLogger)
+	oauthH := oauthhandler.NewHandler(oauthService, oauthhandler.Config{
+		RateLimiter:           oauthhandler.DCRRateLimiterFunc(rdb.SlidingWindowAdd),
+		DCRRateLimitWindowSec: cfg.OAuth.DCRRateLimitWindow,
+		DCRRateLimitMax:       cfg.OAuth.DCRRateLimitMax,
+		Metadata: oauthhandler.MetadataProvider{
+			Issuer:         cfg.OAuth.Issuer,
+			MCPResourceURL: "", // 默认取 Issuer + /api/v2/mcp;PR #5' 阶段 2 MCP 上线后确认
+		},
+		SessionStore:         oauthSessionStore,
+		UserAuthenticator:    &oauthUserAuthenticator,
+		AgentBootstrapper:    &oauthAgentBootstrapper,
+		AccessTokenTTL:       cfg.OAuth.AccessTokenTTL,
+		RefreshTokenTTL:      cfg.OAuth.RefreshTokenTTL,
+		AuthorizationCodeTTL: cfg.OAuth.AuthorizationCodeTTL,
+		CookieSecure:         cfg.Server.Mode == "release", // dev=false 允许 http cookie
+	}, appLogger)
+
+	// 11c. MCP Server(PR #5' Stage 2)—— 把 channel / task / kb tool 暴露给 Claude
+	// Desktop / Cursor / Codex。依赖 OAuth 认证中间件(挂在 MCP 路由组上),tool
+	// 内从 request.Context 取 agent principal。
+	//
+	// KBAdapter 退化成薄壳,delegate 到 channelService.KBQuery(语义检索 / 读文档 /
+	// 列文档)和 channelService.KBRef(列挂载关系)。业务规则在 channelsvc.KBQueryService。
+	mcpServer := mcp.New(mcp.Config{
+		ServerName:    "Synapse",
+		ServerVersion: "0.1.0-stage2",
+	}, mcp.Deps{
+		ChannelSvc: &mcp.ChannelAdapter{
+			ChannelSvc: channelService.Channel,
+			MessageSvc: channelService.Message,
+			MemberSvc:  channelService.Member,
+		},
+		TaskSvc: &mcp.TaskAdapter{TaskSvc: taskService.Task},
+		KBSvc: &mcp.KBAdapter{
+			KBRefSvc:   channelService.KBRef,
+			KBQuerySvc: channelService.KBQuery,
+		},
+		DocumentSvc:   &mcp.DocumentAdapter{DocSvc: channelService.Document},
+		AttachmentSvc: &mcp.AttachmentAdapter{AttachmentSvc: channelService.Attachment},
+		IdentitySvc:   &mcp.IdentityAdapter{DB: db},
+		Log:           appLogger,
+	})
+
+	// 11d. Agentsys(PR #6')—— 顶级系统 agent runtime。
+	//
+	// 依赖:LLM chat client(Azure)+ eventbus consumer + agents repo(查 top-orch
+	// principal_id)+ 审计/使用 repo + scoped deps(channel/task service facade)。
+	//
+	// 行为:常驻 goroutine 消费 synapse:channel:events,被 @ 顶级 agent 时调 LLM
+	// 产出回复或派 task。跨 org 隔离由 scoped.ScopedServices 绑死 (orgID, channelID,
+	// actorPID) 在类型层保证 —— 详见 internal/agentsys/scoped/scoped.go 文件头。
+	llmClient, err := llm.New(llm.Config{
+		Provider: cfg.LLM.Provider,
+		Azure: llm.AzureConfig{
+			Endpoint:   cfg.LLM.Azure.Endpoint,
+			Deployment: cfg.LLM.Azure.Deployment,
+			APIKey:     cfg.LLM.Azure.APIKey,
+			APIVersion: cfg.LLM.Azure.APIVersion,
+		},
+		RequestTimeoutSec: cfg.LLM.RequestTimeoutSec,
+	})
+	if err != nil {
+		appLogger.Fatal("failed to init llm client", err, map[string]any{
+			"provider":   cfg.LLM.Provider,
+			"endpoint":   cfg.LLM.Azure.Endpoint,
+			"deployment": cfg.LLM.Azure.Deployment,
+		})
+	}
+	appLogger.Info("llm client ready", map[string]any{"model": llmClient.Model()})
+
+	agentsysAuditRepo := agentsysrepo.NewAuditRepo(db)
+	agentsysUsageRepo := agentsysrepo.NewUsageRepo(db)
+	orchestratorCtx, orchestratorCancel := context.WithCancel(context.Background())
+	defer orchestratorCancel()
+	eventBusConsumer := eventbus.NewRedisConsumerGroup(rdb.GetClient(), appLogger)
+
+	// 可选:启动时清光 channel/task stream 上注册的 consumer group(stale consumer + PEL)。
+	// 单实例 / dev 部署下保证每次重启 group 从干净状态开始;**生产 / 多实例部署绝对不要开**,
+	// 否则启动晚的实例会把先启动实例的 in-flight 事件清掉。
+	if cfg.EventBus.ResetGroupsOnStart {
+		appLogger.Info("eventbus: resetting consumer groups on start", map[string]any{
+			"channel_stream": cfg.EventBus.ChannelStream,
+			"task_stream":    cfg.EventBus.TaskStream,
+			"groups":         []string{agentsysruntime.ConsumerGroupName, eventcard.ConsumerGroupName},
+		})
+		for _, stream := range []string{cfg.EventBus.ChannelStream, cfg.EventBus.TaskStream} {
+			for _, group := range []string{agentsysruntime.ConsumerGroupName, eventcard.ConsumerGroupName} {
+				if err := rdb.GetClient().XGroupDestroy(ctx, stream, group).Err(); err != nil {
+					// NOGROUP 错误 = group 本身不存在(首次启动)→ 不算错
+					if !strings.Contains(err.Error(), "NOGROUP") {
+						appLogger.Warn("eventbus: reset group failed", map[string]any{
+							"stream": stream, "group": group, "err": err.Error(),
+						})
+					}
+				}
+			}
+		}
+		// group 重建由后续 orchestrator / eventcard.Writer 启动期 EnsureGroup 完成,这里不主动建。
+	}
+
+	orchestrator, err := agentsysruntime.NewOrchestrator(
+		ctx, // 用启动期 ctx 查 top-orchestrator principal_id 即可
+		agentsysruntime.Config{
+			ChannelStream:        cfg.EventBus.ChannelStream,
+			DailyBudgetPerOrgUSD: cfg.LLM.DailyBudgetPerOrgUSD,
+			Concurrency:          cfg.AgentSys.Concurrency,
+		},
+		eventBusConsumer,
+		llmClient,
+		agentRepoImpl,
+		scoped.Deps{
+			Messages: channelService.Message,
+			Tasks:    taskService.Task,
+			KBRefs:   channelService.KBRef,
+			KBQuery:  channelService.KBQuery,
+			Members:  channelService.Member,
+			Logger:   appLogger,
+		},
+		agentsysAuditRepo,
+		agentsysUsageRepo,
+		appLogger,
+	)
+	if err != nil {
+		appLogger.Fatal("failed to init orchestrator", err, nil)
+	}
+	appLogger.Info("agentsys orchestrator ready", map[string]any{
+		"top_orchestrator_pid": orchestrator.TopOrchestratorPrincipalID(),
+	})
+	go func() {
+		if err := orchestrator.Run(orchestratorCtx); err != nil && err != context.Canceled {
+			appLogger.Error("agentsys orchestrator exited", err, nil)
+		}
+	}()
+
+	// Channel 协作时间线 consumer(PR #11'):订阅 channel/task 事件流,把业务事件
+	// 转成 kind=system_event 消息卡片落在对应 channel。和 orchestrator 共用同一
+	// orchestratorCtx(优雅停机顺序对齐)。
+	eventCardWriter := eventcard.New(
+		eventcard.Config{
+			ChannelStream:             cfg.EventBus.ChannelStream,
+			TaskStream:                cfg.EventBus.TaskStream,
+			FallbackAuthorPrincipalID: orchestrator.TopOrchestratorPrincipalID(),
+		},
+		eventBusConsumer,
+		channelService.Message,
+		appLogger,
+	)
+	appLogger.Info("eventcard writer ready", map[string]any{
+		"channel_stream":  cfg.EventBus.ChannelStream,
+		"task_stream":     cfg.EventBus.TaskStream,
+		"fallback_author": orchestrator.TopOrchestratorPrincipalID(),
+	})
+	go func() {
+		if err := eventCardWriter.Run(orchestratorCtx); err != nil && err != context.Canceled {
+			appLogger.Error("eventcard writer exited", err, nil)
+		}
+	}()
+
 	asyncJobH := asynchandler.New(asyncJobSvc, appLogger)
 	var docH *dochandler.Handler
 	if pgDB != nil {
@@ -405,6 +708,62 @@ func main() {
 	if docH != nil {
 		dochandler.RegisterRoutes(r, docH, jwtManager, sessionStore, orgService, permJudgeSvc, appLogger)
 	}
+	transporthandler.RegisterRoutes(r, transportH)
+	agenthandler.RegisterRoutes(r, agentsH, jwtManager, sessionStore, orgService, hubAdapter, appLogger)
+	channelhandler.RegisterRoutes(r, channelH, jwtManager, sessionStore)
+	taskhandler.RegisterRoutes(r, taskH, jwtManager, sessionStore)
+	oauthhandler.RegisterRoutes(r, oauthH, jwtManager, sessionStore)
+
+	// MCP Server 挂载 /api/v2/mcp/*(Streamable HTTP)。
+	// 用 oauthmw.BearerAuth 中间件验 OAuth access_token 或 PAT;通过后把
+	// AgentPrincipalID 注入 request.Context,MCP tool handler 从 ctx 读。
+	// AsyncRunner 管理 last_used_at 的异步 DB 更新:DB 抖动时 goroutine 不无界堆积,
+	// 容量 64 在 ~千 QPS 鉴权下够用(单次 touch < 2s),超了就 reject(touch 是 best-effort)。
+	bearerTouchRunner := async.NewAsyncRunner("bearer-auth-touch", 64, appLogger)
+	mcpGroup := r.Group("/api/v2/mcp")
+	mcpGroup.Use(oauthmw.BearerAuth(oauthRepoImpl, func(s string) string {
+		h := sha256.Sum256([]byte(s))
+		return hex.EncodeToString(h[:])
+	}, bearerTouchRunner, appLogger))
+	mcpGroup.Any("", gin.WrapH(mcpServer.HTTPHandler()))
+	mcpGroup.Any("/*any", gin.WrapH(mcpServer.HTTPHandler()))
+
+	// SSE 事件流:GET /api/v2/users/me/events
+	//
+	// 两类 caller 共用同一端点,通过 ?filter= 区分:
+	//   - filter=mentions(默认):本机 daemon(cmd/agent-bridge),用 PAT 走 BearerAuth
+	//   - filter=channel_activity:浏览器 Synapse Web,用 JWT cookie 走 JWTAuthWithSession
+	//
+	// 鉴权用 BearerOrJWT 复合中间件:有 Authorization Bearer 头走 PAT/OAuth,否则走 JWT。
+	sseHandler := channelhandler.NewSSEHandler(
+		rdb.GetClient(),
+		cfg.EventBus.ChannelStream,
+		func(ctx context.Context, userID uint64) (*usersvc.UserProfile, error) {
+			return userSvc.GetProfile(ctx, userID)
+		},
+		// channel ids lookup:列 caller 所属 channel 的 id 集合(channel_activity filter 用)。
+		// 一次拉到 1000 条,实际用户场景远少于这个数;超限了 v0 不分页,直接截断。
+		func(ctx context.Context, principalID uint64) ([]uint64, error) {
+			rows, err := channelService.Channel.ListByPrincipal(ctx, principalID, 1000, 0)
+			if err != nil {
+				return nil, err
+			}
+			ids := make([]uint64, len(rows))
+			for i := range rows {
+				ids[i] = rows[i].ID
+			}
+			return ids, nil
+		},
+		appLogger,
+	)
+	bearerMW := oauthmw.BearerAuth(oauthRepoImpl, func(s string) string {
+		h := sha256.Sum256([]byte(s))
+		return hex.EncodeToString(h[:])
+	}, bearerTouchRunner, appLogger)
+	jwtMW := middleware.JWTAuthWithSession(jwtManager, sessionStore)
+	sseGroup := r.Group("/api/v2/users/me")
+	sseGroup.Use(oauthmw.BearerOrJWT(bearerMW, jwtMW))
+	sseGroup.GET("/events", sseHandler.HandleEvents)
 
 	r.GET("/health", func(c *gin.Context) {
 		response.Success(c, "ok", nil)
@@ -441,12 +800,62 @@ func main() {
 	appLogger.Info("shutting down server...", map[string]interface{}{
 		"shutdown_timeout": cfg.Server.ShutdownTimeout.String(),
 	})
+	// 先停 orchestrator:ctx cancel → Consume 循环里的 XREADGROUP BLOCK 返回 →
+	// goroutine 退出。**顺序重要**:如果先关 Redis 再 cancel,orchestrator 可能
+	// 会打一堆 connection refused 日志。
+	orchestratorCancel()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		appLogger.Error("server forced to shutdown (in-flight requests cut)", err, nil)
 	}
+	// HTTP 停了之后再关异步 touch runner:此时不会再有新的 last_used_at 更新入队,
+	// 只需把 in-flight 的 touch 尽量跑完或按 shutdown ctx 超时放弃。
+	if err := bearerTouchRunner.Shutdown(shutdownCtx); err != nil {
+		appLogger.Warn("bearer auth touch runner shutdown timed out", map[string]any{"err": err.Error()})
+	}
+	// HTTP server 关闭后再关 agent hub:避免升级中的 ws 升级半途 abort。
+	if err := agentHub.Shutdown(shutdownCtx); err != nil {
+		appLogger.Error("agent hub shutdown failed", err, nil)
+	}
 	appLogger.Info("server stopped", nil)
+}
+
+// hubAgentIDAdapter 把 transport.AgentID 弱类型的 agents 模块接口对齐到 *LocalHub 的强类型方法。
+// 同时实现 agents/service.AgentDisconnector 和 agents/handler.OnlineChecker。
+// 这里的转换零成本 —— AgentID 本就是 string 的类型别名。
+type hubAgentIDAdapter struct {
+	hub *transportsvc.LocalHub
+}
+
+func (a *hubAgentIDAdapter) Disconnect(agentID string, reason string) bool {
+	return a.hub.Disconnect(transport.AgentID(agentID), reason)
+}
+
+func (a *hubAgentIDAdapter) IsOnline(agentID string) bool {
+	return a.hub.IsOnline(transport.AgentID(agentID))
+}
+
+// agentsRoleLookupAdapter 实现 agents/service.OrgRoleLookup,从 org repository 读 role slug。
+// 与 orgRoleLookupAdapter(permission 模块用)并列,因为各自的返回结构体不同,
+// 不能共用一个适配器。逻辑上查的是同一条路径(member → role),未来可统一。
+type agentsRoleLookupAdapter struct {
+	repo orgrepo.Repository
+}
+
+// GetMemberRoleSlug 返回 user 在 org 的系统角色 slug。不是成员 → "",nil(按 forbidden 处理)。
+// DB 错误按内部错向上抛;记录破损(有 member 无对应 role)视作 ""(极端边缘情况)。
+func (a *agentsRoleLookupAdapter) GetMemberRoleSlug(ctx context.Context, orgID, userID uint64) (string, error) {
+	mem, err := a.repo.FindMember(ctx, orgID, userID)
+	if err != nil {
+		// gorm.ErrRecordNotFound → 非成员,返 ""
+		return "", nil //nolint:nilerr // 不存在不是错误
+	}
+	role, err := a.repo.FindRoleByID(ctx, mem.RoleID)
+	if err != nil {
+		return "", nil //nolint:nilerr // role 破损按"无角色"处理
+	}
+	return role.Slug, nil
 }
 
 // ─── 跨模块 adapter ──────────────────────────────────────────────────────────
@@ -525,6 +934,84 @@ func (a *sourceLookupAdapter) ListSourceIDsByOwner(ctx context.Context, orgID, o
 
 func (a *sourceLookupAdapter) ListSourceIDsByVisibility(ctx context.Context, orgID uint64, visibility string) ([]uint64, error) {
 	return a.repo.ListSourceIDsByVisibility(ctx, orgID, visibility)
+}
+
+// ─── OAuth adapters ──────────────────────────────────────────────────────────
+
+// oauthAgentBootstrapperImpl 实现 oauth.service.AgentBootstrapper。
+//
+// 流程:查 ownerUserID 的第一个 org(通过 orgService.ListUserOrgs 或类似) →
+// 调 agents.BootstrapUserAgent(orgID, ownerUserID, displayName) → 返 (agentID, principalID)。
+//
+// MVP 简化:"第一个 org" = 任选一个 user 属于的 org。多 org 场景下未来可以让 consent
+// 页带 org 选项。现在 user 基本只有一个 org,直接取第一个。
+type oauthAgentBootstrapperImpl struct {
+	orgService   orgsvc.OrgService
+	userRepo     userrepo.Repository
+	agentService *agentsvc.AgentService
+	log          logger.LoggerInterface
+}
+
+func (b *oauthAgentBootstrapperImpl) CreateUserAgent(ctx context.Context, ownerUserID uint64, displayName string) (uint64, uint64, error) {
+	orgs, err := b.orgService.ListOrgsByUser(ctx, ownerUserID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("list user orgs: %w", err)
+	}
+	if len(orgs) == 0 {
+		return 0, 0, fmt.Errorf("user has no org membership")
+	}
+	// 取第一个 org —— 多 org 时未来 consent 页加选择器
+	orgID := orgs[0].Org.ID
+
+	// 拼一个可读的 display_name:"{user 人名} 的 {client_name}"。
+	// 比单用 client_name("Claude")更能在多用户 + 多 client 的组织里唯一识别。
+	// fallback:查不到 user 或 user 没 display_name 时退回原 displayName(clientName)。
+	fullName := displayName
+	if b.userRepo != nil {
+		if u, err := b.userRepo.FindActiveByID(ctx, ownerUserID); err == nil && u != nil {
+			userName := u.DisplayName
+			if userName == "" {
+				userName = u.Email
+			}
+			if userName != "" && displayName != "" {
+				fullName = userName + " 的 " + displayName
+			} else if userName != "" {
+				fullName = userName + " 的 agent"
+			}
+		}
+	}
+
+	// 查重:同 (org, owner, display_name) 已有 agent → 直接复用,不重复创建。
+	// 防止 Claude Desktop 每次重连 DCR(生成新 client_id)都在 agents 表里长新行。
+	if existing, err := b.agentService.FindUserAgentByDisplayName(ctx, orgID, ownerUserID, fullName); err == nil && existing != nil {
+		b.log.InfoCtx(ctx, "oauth: reusing existing user agent", map[string]any{
+			"agent_id": existing.AgentID, "owner_user_id": ownerUserID, "display_name": fullName,
+		})
+		return existing.ID, existing.PrincipalID, nil
+	}
+
+	return b.agentService.BootstrapUserAgent(ctx, orgID, ownerUserID, fullName)
+}
+
+// oauthPasswordAuthenticatorImpl 实现 oauth.service.UserAuthenticator。
+//
+// 路径:查 users 表 FindActiveByEmail + bcrypt.CompareHashAndPassword。
+// 不走 user.Login(它强制消费邮箱验证码,对 OAuth consent 不适用)。
+// 也不走邮箱验证码 / login_guard 之类 —— 简化 OAuth flow;后续加 CSRF / 2FA 时再补。
+type oauthPasswordAuthenticatorImpl struct {
+	userRepo userrepo.Repository
+	log      logger.LoggerInterface
+}
+
+func (a *oauthPasswordAuthenticatorImpl) AuthenticateByPassword(ctx context.Context, email, password, _, _ string) (uint64, error) {
+	u, err := a.userRepo.FindActiveByEmail(ctx, strings.ToLower(strings.TrimSpace(email)))
+	if err != nil || u == nil {
+		return 0, fmt.Errorf("user not found")
+	}
+	if bcryptErr := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); bcryptErr != nil {
+		return 0, fmt.Errorf("password mismatch")
+	}
+	return u.ID, nil
 }
 
 // isMarkdownDoc ingestion ChunkerSelector 用:MIMEType + 文件名扩展名兜底判 markdown。

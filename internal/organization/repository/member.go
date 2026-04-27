@@ -71,6 +71,7 @@ func (r *gormRepository) ListMembersByOrg(ctx context.Context, orgID uint64, pag
 		UserID          uint64     `gorm:"column:user_id"`
 		RoleID          uint64     `gorm:"column:role_id"`
 		JoinedAt        time.Time  `gorm:"column:joined_at"`
+		PrincipalID     uint64     `gorm:"column:principal_id"`
 		Email           string     `gorm:"column:email"`
 		DisplayName     string     `gorm:"column:display_name"`
 		AvatarURL       string     `gorm:"column:avatar_url"`
@@ -84,6 +85,7 @@ func (r *gormRepository) ListMembersByOrg(ctx context.Context, orgID uint64, pag
 	var rows []row
 	if err := r.db.WithContext(ctx).Raw(`
 		SELECT m.id AS member_id, m.org_id, m.user_id, m.role_id, m.joined_at,
+		       COALESCE(u.principal_id, 0)  AS principal_id,
 		       COALESCE(u.email, '')        AS email,
 		       COALESCE(u.display_name, '') AS display_name,
 		       COALESCE(u.avatar_url, '')   AS avatar_url,
@@ -113,6 +115,7 @@ func (r *gormRepository) ListMembersByOrg(ctx context.Context, orgID uint64, pag
 				RoleID:   rr.RoleID,
 				JoinedAt: rr.JoinedAt,
 			},
+			PrincipalID:     rr.PrincipalID,
 			Email:           rr.Email,
 			DisplayName:     rr.DisplayName,
 			AvatarURL:       rr.AvatarURL,

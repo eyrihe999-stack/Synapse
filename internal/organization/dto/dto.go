@@ -50,7 +50,10 @@ type OrgWithMembershipResponse struct {
 // EmailVerifiedAt / LastLoginAt 用指针 —— 未验证 / 从未登录时明确为 null,前端据此展示
 // "未验证"徽章或省略"最近活跃"字段,而不是误展示 1970-01-01。
 type MemberResponse struct {
-	UserID          uint64      `json:"user_id,string"`
+	UserID uint64 `json:"user_id,string"`
+	// PrincipalID 是该 user 的身份根 id(users.principal_id),前端用来把"人"
+	// 映射到 channel_members / tasks 里存储的 principal_id。JOIN 缺失时为 0。
+	PrincipalID     uint64      `json:"principal_id,string"`
 	Email           string      `json:"email,omitempty"`
 	DisplayName     string      `json:"display_name,omitempty"`
 	AvatarURL       string      `json:"avatar_url,omitempty"`

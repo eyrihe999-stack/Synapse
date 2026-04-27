@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"gorm.io/datatypes"
@@ -26,6 +27,7 @@ import (
 	"github.com/eyrihe999-stack/Synapse/internal/asyncjob/model"
 	"github.com/eyrihe999-stack/Synapse/internal/asyncjob/repository"
 	"github.com/eyrihe999-stack/Synapse/internal/common/async"
+	"github.com/eyrihe999-stack/Synapse/internal/common/eventbus"
 	"github.com/eyrihe999-stack/Synapse/internal/common/logger"
 )
 
@@ -40,20 +42,31 @@ type Config struct {
 
 	// HeartbeatInterval Runner 内部心跳间隔。默认 asyncjob.DefaultHeartbeatInterval。
 	HeartbeatInterval time.Duration
+
+	// CompletionStream 终态完成事件 Redis Stream key。
+	// 空串 / Publisher 为 nil → 跳过发事件(单测 / 无下游消费者时可空);
+	// 由 cmd/synapse 从 config.EventBus.AsyncJobStream 传入,默认 "synapse:asyncjob:events"。
+	CompletionStream string
 }
 
 // Service asyncjob 对外入口。
 type Service struct {
-	cfg     Config
-	repo    repository.Repository
-	runners map[string]Runner
-	async   *async.AsyncRunner
-	log     logger.LoggerInterface
+	cfg       Config
+	repo      repository.Repository
+	runners   map[string]Runner
+	async     *async.AsyncRunner
+	log       logger.LoggerInterface
+	publisher eventbus.Publisher // 可 nil;nil 时 publishCompletion 跳过发事件
 }
 
 // NewService 构造并注册 runners。传入的 runners 里若两个 Kind() 相同,后者覆盖前者。
+//
+// publisher 可传 nil(单测或尚未接入事件总线的场景)。传入时 runJob 在 DB 落
+// 终态后 XADD 一条完成事件到 cfg.CompletionStream;publish 失败只 warn,
+// DB 才是真相源,下游 reaper 会兜底对账。
+//
 // 调用方(cmd/synapse)应在启动后调一次 ReapStale 收拾前次崩进程遗留。
-func NewService(cfg Config, repo repository.Repository, runners []Runner, log logger.LoggerInterface) *Service {
+func NewService(cfg Config, repo repository.Repository, runners []Runner, publisher eventbus.Publisher, log logger.LoggerInterface) *Service {
 	if cfg.MaxConcurrency <= 0 {
 		cfg.MaxConcurrency = asyncjob.DefaultMaxConcurrency
 	}
@@ -68,11 +81,12 @@ func NewService(cfg Config, repo repository.Repository, runners []Runner, log lo
 		reg[r.Kind()] = r
 	}
 	return &Service{
-		cfg:     cfg,
-		repo:    repo,
-		runners: reg,
-		async:   async.NewAsyncRunner("asyncjob", cfg.MaxConcurrency, log),
-		log:     log,
+		cfg:       cfg,
+		repo:      repo,
+		runners:   reg,
+		async:     async.NewAsyncRunner("asyncjob", cfg.MaxConcurrency, log),
+		log:       log,
+		publisher: publisher,
 	}
 }
 
@@ -82,6 +96,13 @@ type ScheduleInput struct {
 	UserID  uint64
 	Kind    string
 	Payload any // marshal 失败会返 error
+
+	// IdempotencyKey 可选。非空时走"同 (org_id, kind, key) 已存在即复用"语义,命中
+	// 直接返 existing + ErrDuplicateJob,**跳过** FindActive(user_id, kind) 防重 ——
+	// 这是给 workflow 引擎用的精确幂等路径(同一 step_run_id re-drive 不重复执行)。
+	//
+	// 空串 = 不启用幂等,回退到传统 FindActive 防"UI 手抖连发"路径。
+	IdempotencyKey string
 }
 
 // Schedule 创建 queued job 并提交 goroutine。幂等性:同 (user_id, kind) 已有 active → 返
@@ -104,22 +125,37 @@ func (s *Service) Schedule(ctx context.Context, in ScheduleInput) (*model.Job, e
 		s.log.WarnCtx(ctx, "asyncjob: schedule unknown kind", map[string]any{"kind": in.Kind})
 		return nil, fmt.Errorf("schedule: %s: %w", in.Kind, asyncjob.ErrUnknownKind)
 	}
-	// 防重:同 (user_id, kind) 已有 active 任务 → 返 ErrDuplicateJob。
-	// Runner 实现 ConcurrentRunner 且返 true 则跳过(见接口注释)—— 适用 upload 这类天然并行场景。
-	allowConcurrent := false
-	if cr, ok := runner.(ConcurrentRunner); ok && cr.AllowConcurrent() {
-		allowConcurrent = true
-	}
-	if !allowConcurrent {
-		existing, err := s.repo.FindActive(ctx, in.UserID, in.Kind)
+	// 幂等键优先:workflow 等精确 re-drive 场景用,命中任意状态(含终态)都直接复用。
+	// 有幂等键时跳过 FindActive —— 调用方自己管控重复,不需要 service 兜"同 user 同 kind 连发"。
+	if in.IdempotencyKey != "" {
+		existing, err := s.repo.FindByIdempotencyKey(ctx, in.OrgID, in.Kind, in.IdempotencyKey)
 		if err != nil {
-			s.log.ErrorCtx(ctx, "asyncjob: schedule check active failed", err, map[string]any{
-				"user_id": in.UserID, "kind": in.Kind,
+			s.log.ErrorCtx(ctx, "asyncjob: schedule check idempotency failed", err, map[string]any{
+				"org_id": in.OrgID, "kind": in.Kind, "idempotency_key": in.IdempotencyKey,
 			})
-			return nil, fmt.Errorf("schedule: check active: %w: %w", err, asyncjob.ErrAsyncJobInternal)
+			return nil, fmt.Errorf("schedule: check idempotency: %w: %w", err, asyncjob.ErrAsyncJobInternal)
 		}
 		if existing != nil {
 			return existing, asyncjob.ErrDuplicateJob
+		}
+	} else {
+		// 无幂等键:走传统"同 (user_id, kind) 已 queued/running 即复用"路径。
+		// Runner 实现 ConcurrentRunner 且返 true 则跳过(见接口注释)—— 适用 upload 这类天然并行场景。
+		allowConcurrent := false
+		if cr, ok := runner.(ConcurrentRunner); ok && cr.AllowConcurrent() {
+			allowConcurrent = true
+		}
+		if !allowConcurrent {
+			existing, err := s.repo.FindActive(ctx, in.UserID, in.Kind)
+			if err != nil {
+				s.log.ErrorCtx(ctx, "asyncjob: schedule check active failed", err, map[string]any{
+					"user_id": in.UserID, "kind": in.Kind,
+				})
+				return nil, fmt.Errorf("schedule: check active: %w: %w", err, asyncjob.ErrAsyncJobInternal)
+			}
+			if existing != nil {
+				return existing, asyncjob.ErrDuplicateJob
+			}
 		}
 	}
 
@@ -135,11 +171,12 @@ func (s *Service) Schedule(ctx context.Context, in ScheduleInput) (*model.Job, e
 		payloadJSON = raw
 	}
 	job := &model.Job{
-		OrgID:   in.OrgID,
-		UserID:  in.UserID,
-		Kind:    in.Kind,
-		Status:  model.StatusQueued,
-		Payload: payloadJSON,
+		OrgID:          in.OrgID,
+		UserID:         in.UserID,
+		Kind:           in.Kind,
+		Status:         model.StatusQueued,
+		Payload:        payloadJSON,
+		IdempotencyKey: in.IdempotencyKey,
 	}
 	if err := s.repo.Create(ctx, job); err != nil {
 		s.log.ErrorCtx(ctx, "asyncjob: schedule create failed", err, map[string]any{
@@ -274,9 +311,7 @@ func (s *Service) runJob(ctx context.Context, job *model.Job, runner Runner) {
 		if errors.Is(runErr, context.Canceled) {
 			errMsg = "canceled: service shutdown"
 		}
-		if err := s.repo.MarkFinished(persistCtx, job.ID, model.StatusFailed, nil, errMsg); err != nil {
-			s.log.ErrorCtx(ctx, "asyncjob: mark failed persist error", err, map[string]any{"job_id": job.ID})
-		}
+		s.finalize(ctx, persistCtx, job, model.StatusFailed, nil, errMsg)
 		return
 	}
 
@@ -292,9 +327,51 @@ func (s *Service) runJob(ctx context.Context, job *model.Job, runner Runner) {
 			resultJSON = raw
 		}
 	}
-	if err := s.repo.MarkFinished(persistCtx, job.ID, model.StatusSucceeded, resultJSON, ""); err != nil {
-		s.log.ErrorCtx(ctx, "asyncjob: mark succeeded persist error", err, map[string]any{"job_id": job.ID})
+	s.finalize(ctx, persistCtx, job, model.StatusSucceeded, resultJSON, "")
+}
+
+// finalize 写终态 + 发事件。写库失败 → 不发事件(避免消费方把未落库的状态当真);
+// 写库成功 + publish 失败 → 只 warn,reaper 兜底对账。
+func (s *Service) finalize(ctx, persistCtx context.Context, job *model.Job, status model.Status, result datatypes.JSON, errMsg string) {
+	if err := s.repo.MarkFinished(persistCtx, job.ID, status, result, errMsg); err != nil {
+		s.log.ErrorCtx(ctx, "asyncjob: mark finished persist error", err, map[string]any{
+			"job_id": job.ID, "status": status,
+		})
+		return
 	}
+	s.publishCompletion(ctx, job, status, result, errMsg)
+}
+
+// publishCompletion 把终态发到 Redis Stream。publisher nil 或 stream 空 → 直接跳过。
+// 失败不致命:DB 已落库,workflow reaper(PR #5)会扫 "async_jobs 终态 AND steps running" 补推。
+func (s *Service) publishCompletion(ctx context.Context, job *model.Job, status model.Status, result datatypes.JSON, errMsg string) {
+	if s.publisher == nil || s.cfg.CompletionStream == "" {
+		return
+	}
+	// 所有字段都是 string —— Redis Streams field 原生是 k/v 字符串。
+	// 嵌套结构(result)整条 JSON 塞 "payload_*" 字段,消费端自行 unmarshal。
+	fields := map[string]any{
+		"job_id":          strconv.FormatUint(job.ID, 10),
+		"org_id":          strconv.FormatUint(job.OrgID, 10),
+		"user_id":         strconv.FormatUint(job.UserID, 10),
+		"kind":            job.Kind,
+		"status":          string(status),
+		"idempotency_key": job.IdempotencyKey,
+		"error":           errMsg,
+	}
+	if len(result) > 0 {
+		fields["result"] = string(result)
+	}
+	id, err := s.publisher.Publish(ctx, s.cfg.CompletionStream, fields)
+	if err != nil {
+		s.log.WarnCtx(ctx, "asyncjob: publish completion event failed; reaper will reconcile", map[string]any{
+			"job_id": job.ID, "kind": job.Kind, "err": err.Error(),
+		})
+		return
+	}
+	s.log.DebugCtx(ctx, "asyncjob: published completion event", map[string]any{
+		"job_id": job.ID, "stream_id": id,
+	})
 }
 
 // safeRun recover panic 包装,把 panic 转 error。panic 已转成 error 不再包 sentinel ——

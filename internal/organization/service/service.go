@@ -116,6 +116,7 @@ func orgToDTO(m *model.Org) dto.OrgResponse {
 func memberWithProfileToDTO(mp *repository.MemberWithProfile) dto.MemberResponse {
 	resp := dto.MemberResponse{
 		UserID:      mp.Member.UserID,
+		PrincipalID: mp.PrincipalID,
 		Email:       mp.Email,
 		DisplayName: mp.DisplayName,
 		AvatarURL:   mp.AvatarURL,

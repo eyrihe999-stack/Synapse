@@ -8,7 +8,21 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - APP_ENV=dev
+      - APP_ENV=local
+      # SYNAPSE_INSTANCE_ID 固定 Redis Streams consumer name,跨容器重建复用同名 consumer,
+      # 避免 group 里累积 stale。**每实例必须唯一**;同 ID 多个实例会让 Redis 把它们当
+      # 同一 logical consumer,PEL 互相覆盖 + 关闭时互相清掉。
+      #
+      # 单实例(默认):什么都不用做,自动用 "synapse-1"。
+      #
+      # 多实例(同机):每个实例 export 不同 ID + 用不同 -p project 启动,例如:
+      #   SYNAPSE_INSTANCE_ID=synapse-2 docker compose -p synapse-2 up -d synapse
+      #   SYNAPSE_INSTANCE_ID=synapse-3 docker compose -p synapse-3 up -d synapse
+      #
+      # 多实例(swarm/k8s 编排,自动):
+      #   - swarm:  SYNAPSE_INSTANCE_ID=synapse-{{.Task.Slot}}
+      #   - K8s:    valueFrom.fieldRef.fieldPath: metadata.name(synapse-0/1/2)
+      - SYNAPSE_INSTANCE_ID=${SYNAPSE_INSTANCE_ID:-synapse-1}
       - DB_HOST=synapse-mysql
       - DB_PORT=3306
       - DB_USERNAME=root
@@ -28,6 +42,9 @@ services:
       # Aliyun OSS key(没填时 Synapse 启动期 document 模块自动禁用 → /documents 路由 404)
       - OSS_ACCESS_KEY_ID=${OSS_ACCESS_KEY_ID:-}
       - OSS_ACCESS_KEY_SECRET=${OSS_ACCESS_KEY_SECRET:-}
+    volumes:
+      # 真秘钥走 gitignored config.local.yaml,只读挂载进容器;配合 APP_ENV=local 被 config loader 读到
+      - ./config/config.local.yaml:/app/config/config.local.yaml:ro
     networks:
       - synapse-net
     restart: unless-stopped

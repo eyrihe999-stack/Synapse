@@ -225,6 +225,32 @@ func insertChunkBatch(tx *gorm.DB, columns string, docID uint64, batch []ChunkWi
 	return nil
 }
 
+// ListChunksByDocOrdered 按 chunk_idx ASC 拉某 doc 的全部 chunks(不读 embedding 列)。
+//
+// 用途:agent 通过 MCP 拉 KB 文档全文 —— 把 chunks 按顺序拼回原文。
+//
+// 不读 embedding 列(显式 Select 列)的两个理由:
+//   1. struct 上 Embedding 标了 gorm:"-" 不会反序列化,但 GORM 默认 SELECT * 仍会
+//      把 vector 列拉出来再丢弃,白浪费带宽 + pg-vector 长字符串解析
+//   2. 让本方法对 retrieval-style scan 友好(后续 retrieval 单独走自己的 raw SQL)
+//
+// 不返 ErrDocumentNotFound:doc 元数据校验由调用方先行(GetByID),这里只看 doc_id。
+// chunks 为空表示文档未分块或 ingestion 未完成。
+func (r *gormRepository) ListChunksByDocOrdered(ctx context.Context, orgID, docID uint64) ([]model.DocumentChunk, error) {
+	var rows []model.DocumentChunk
+	err := r.db.WithContext(ctx).
+		Select("id, doc_id, org_id, chunk_idx, content, content_type, level, " +
+			"heading_path, token_count, chunker_version, parent_chunk_id, " +
+			"index_status, index_error, metadata, created_at").
+		Where("org_id = ? AND doc_id = ?", orgID, docID).
+		Order("chunk_idx ASC").
+		Find(&rows).Error
+	if err != nil {
+		return nil, fmt.Errorf("list chunks by doc: %w: %w", err, document.ErrDocumentInternal)
+	}
+	return rows, nil
+}
+
 // formatVectorLiteral 把 []float32 转成 pgvector 字面量 "[v1,v2,...]".
 // 用 strconv.FormatFloat + 'f'/'g' 保留精度,避免科学记数法在某些 pgvector 版本上的解析差异。
 func formatVectorLiteral(v []float32) string {
