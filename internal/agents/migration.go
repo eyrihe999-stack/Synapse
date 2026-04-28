@@ -60,6 +60,10 @@ func RunMigrations(ctx context.Context, db *gorm.DB, log logger.LoggerInterface,
 		return fmt.Errorf("agents seed top orchestrator: %w", err)
 	}
 
+	if err := seedProjectArchitect(ctx, db, log); err != nil {
+		return fmt.Errorf("agents seed project architect: %w", err)
+	}
+
 	log.InfoCtx(ctx, "agents: migrations completed", nil)
 	if onReady != nil {
 		onReady()
@@ -127,6 +131,62 @@ func seedTopOrchestrator(ctx context.Context, db *gorm.DB, log logger.LoggerInte
 	log.InfoCtx(ctx, "agents: seeded top orchestrator", map[string]any{
 		"agent_id":     top.AgentID,
 		"principal_id": top.PrincipalID,
+	})
+	return nil
+}
+
+// seedProjectArchitect 幂等种入全局项目编排 agent(PR-B)。
+//
+//	agent_id = ProjectArchitectAgentID (固定)
+//	org_id   = GlobalAgentOrgID (0, sentinel,与 top-orchestrator 共用全局 scope)
+//	kind     = 'system'
+//	auto_include_in_new_channels = false (决策 4:只加 Console,不进所有 channel)
+//	owner_user_id = NULL (系统 agent 无归属 user)
+//
+// 加 channel 的路径:pm 事件 consumer 在 project.created 时显式 INSERT
+// channel_members 把 Architect 加进 Console channel。
+//
+// 幂等性靠 agents.agent_id UNIQUE 约束 + 存在性先查。二次启动跳过。
+func seedProjectArchitect(ctx context.Context, db *gorm.DB, log logger.LoggerInterface) error {
+	var existing model.Agent
+	err := db.WithContext(ctx).
+		Where("agent_id = ?", ProjectArchitectAgentID).
+		Take(&existing).Error
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("check project architect existence: %w", err)
+	}
+
+	apikey, err := genSeedAPIKey()
+	if err != nil {
+		return fmt.Errorf("generate seed apikey: %w", err)
+	}
+
+	architect := &model.Agent{
+		AgentID:                  ProjectArchitectAgentID,
+		OrgID:                    GlobalAgentOrgID,
+		Kind:                     KindSystem,
+		AutoIncludeInNewChannels: false, // 决策 4:不自动加所有 channel
+		APIKey:                   apikey,
+		DisplayName:              ProjectArchitectDisplayName,
+		Enabled:                  true,
+		CreatedByUID:             0,
+	}
+	if err := db.WithContext(ctx).Create(architect).Error; err != nil {
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return nil
+		}
+		var again model.Agent
+		if err2 := db.WithContext(ctx).Where("agent_id = ?", ProjectArchitectAgentID).Take(&again).Error; err2 == nil {
+			return nil
+		}
+		return fmt.Errorf("insert project architect: %w", err)
+	}
+	log.InfoCtx(ctx, "agents: seeded project architect", map[string]any{
+		"agent_id":     architect.AgentID,
+		"principal_id": architect.PrincipalID,
 	})
 	return nil
 }

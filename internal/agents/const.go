@@ -74,6 +74,19 @@ const (
 	// TopOrchestratorDisplayName channel / 审计 UI 展示名。
 	TopOrchestratorDisplayName = "Synapse"
 
+	// ProjectArchitectAgentID 全局项目编排 agent。和 top-orchestrator 平级,
+	// 但职责不同:负责"项目级编排"(分析需求、拆 initiative/workstream/task、
+	// 组织成员)。和 top-orchestrator 跑在不同 LLM 上下文(不同 prompt + 不同
+	// 工具集),由 PR-B 引入。
+	//
+	// 不开启 auto_include_in_new_channels —— Architect 只加入 Project Console
+	// channel(由 pm 事件 consumer 在 project.created 时显式 INSERT channel_members),
+	// 不进 workstream / regular channel,避免每条消息都给它发触发。
+	ProjectArchitectAgentID = "synapse-project-architect"
+
+	// ProjectArchitectDisplayName channel / 审计 UI 展示名。
+	ProjectArchitectDisplayName = "Synapse Architect"
+
 	// GlobalAgentOrgID 全局 agent 的 org_id sentinel 值。orgs.id 从 1 开始 autoincrement,
 	// 0 永远不是合法 org;代码层按 0 判断"全局 scope",业务层不产生对 orgs(0) 的 JOIN。
 	//
