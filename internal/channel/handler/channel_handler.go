@@ -82,60 +82,8 @@ func (h *Handler) ArchiveChannel(c *gin.Context) {
 	response.Success(c, "channel archived", nil)
 }
 
-// AttachChannelVersion POST /api/v2/channels/:id/versions/:version_id
-func (h *Handler) AttachChannelVersion(c *gin.Context) {
-	userID, ok := middleware.GetUserID(c)
-	if !ok {
-		response.Unauthorized(c, "missing user context", "")
-		return
-	}
-	channelID, ok := parseUint64Param(c, "id")
-	if !ok {
-		return
-	}
-	versionID, ok := parseUint64Param(c, "version_id")
-	if !ok {
-		return
-	}
-	if err := h.svc.Channel.AttachVersion(c.Request.Context(), channelID, versionID, userID); err != nil {
-		h.sendServiceError(c, err)
-		return
-	}
-	response.Success(c, "attached", nil)
-}
-
-// DetachChannelVersion DELETE /api/v2/channels/:id/versions/:version_id
-func (h *Handler) DetachChannelVersion(c *gin.Context) {
-	userID, ok := middleware.GetUserID(c)
-	if !ok {
-		response.Unauthorized(c, "missing user context", "")
-		return
-	}
-	channelID, ok := parseUint64Param(c, "id")
-	if !ok {
-		return
-	}
-	versionID, ok := parseUint64Param(c, "version_id")
-	if !ok {
-		return
-	}
-	if err := h.svc.Channel.DetachVersion(c.Request.Context(), channelID, versionID, userID); err != nil {
-		h.sendServiceError(c, err)
-		return
-	}
-	response.Success(c, "detached", nil)
-}
-
-// ListChannelVersions GET /api/v2/channels/:id/versions
-func (h *Handler) ListChannelVersions(c *gin.Context) {
-	channelID, ok := parseUint64Param(c, "id")
-	if !ok {
-		return
-	}
-	vs, err := h.svc.Channel.ListVersions(c.Request.Context(), channelID)
-	if err != nil {
-		h.sendServiceError(c, err)
-		return
-	}
-	response.Success(c, "ok", dto.ToVersionListResponse(vs))
-}
+// ── channel ↔ version 多对多关联的 3 个 handler 已废弃 ──────────────────────
+// AttachChannelVersion / DetachChannelVersion / ListChannelVersions 整体退役;
+// channel.workstream_id → workstream.version_id 是新模型的单向引用,Version 信息
+// 通过 pm 模块查 workstream 反查得到。前端如有渲染需要,改调 pm /api/v2/versions
+// 路由或 workstream 详情接口(PR-B 落地)。

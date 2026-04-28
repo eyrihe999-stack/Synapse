@@ -2,14 +2,7 @@
 //
 // 路由分组(全部需要 JWT 登录):
 //
-//  /api/v2/projects
-//    POST   /                       — 新建 project(body.org_id)
-//    GET    /?org_id=X              — 列出 org 的 project
-//    GET    /:id                    — 获取单个 project
-//    POST   /:id/archive            — 归档 project
-//    POST   /:id/versions           — 新建 version 挂在 project 下
-//    GET    /:id/versions           — 列出 project 的 version
-//    GET    /:id/channels           — 列出 project 的 channel
+//  /api/v2/projects/:id/channels  — 列出 project 的 channel(只剩这一条与 project 有关)
 //
 //  /api/v2/channels
 //    POST   /                       — 新建 channel(body.project_id)
@@ -19,9 +12,9 @@
 //    POST   /:id/members            — 加成员
 //    DELETE /:id/members/:principal_id
 //    PATCH  /:id/members/:principal_id/role
-//    GET    /:id/versions           — 列出 channel 关联的 version
-//    POST   /:id/versions/:version_id   — 关联 version
-//    DELETE /:id/versions/:version_id   — 取消关联
+//
+// Project / Version 的 CRUD 已迁到 pm 模块路由(/api/v2/projects 和
+// /api/v2/versions);channel ↔ version 多对多关联整体退役。
 //
 // 权限校验全部在 service 层(见 service/service.go 顶部注释),handler 只做
 // 参数解析 + 错误翻译 + DTO 转换。
@@ -42,19 +35,11 @@ func RegisterRoutes(
 	jwtManager *jwt.JWTManager,
 	sessionStore user.SessionStore,
 ) {
+	// /api/v2/projects/:id/channels —— project 下属 channel 列表(仅此一条仍归
+	// channel 模块管;其它 project / version CRUD 全在 pm 模块)
 	projects := router.Group("/api/v2/projects")
 	projects.Use(middleware.JWTAuthWithSession(jwtManager, sessionStore))
 	{
-		projects.POST("", h.CreateProject)
-		projects.GET("", h.ListProjects)
-		projects.GET("/:id", h.GetProject)
-		projects.POST("/:id/archive", h.ArchiveProject)
-
-		// version 挂在 project 下
-		projects.POST("/:id/versions", h.CreateVersion)
-		projects.GET("/:id/versions", h.ListVersionsByProject)
-
-		// channel 列表查 project 下的
 		projects.GET("/:id/channels", h.ListChannelsByProject)
 	}
 
@@ -71,19 +56,12 @@ func RegisterRoutes(
 		channels.DELETE("/:id/members/:principal_id", h.RemoveChannelMember)
 		channels.PATCH("/:id/members/:principal_id/role", h.UpdateChannelMemberRole)
 
-		// 关联 version
-		channels.GET("/:id/versions", h.ListChannelVersions)
-		channels.POST("/:id/versions/:version_id", h.AttachChannelVersion)
-		channels.DELETE("/:id/versions/:version_id", h.DetachChannelVersion)
-
 		// 消息(PR #4' 起)
 		channels.POST("/:id/messages", h.PostChannelMessage)
 		channels.GET("/:id/messages", h.ListChannelMessages)
 
-		// KB 挂载(PR #4' 起)
-		channels.POST("/:id/kb-refs", h.AddChannelKBRef)
-		channels.GET("/:id/kb-refs", h.ListChannelKBRefs)
-		channels.DELETE("/:id/kb-refs/:ref_id", h.RemoveChannelKBRef)
+		// KB 挂载已退役 —— /:id/kb-refs 三个老路由全部移除;
+		// 改由 pm 模块的 /api/v2/projects/:id/kb-refs 提供项目级 KB 挂载。
 
 		// 共享文档(PR #9'):channel 内多人共建文档,独占编辑锁
 		channels.POST("/:id/documents", h.CreateChannelDocument)

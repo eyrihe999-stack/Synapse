@@ -73,6 +73,10 @@ type EventBusConfig struct {
 	WorkflowStream string `yaml:"workflow_stream"`
 	ChannelStream  string `yaml:"channel_stream"`
 	TaskStream     string `yaml:"task_stream"`
+	// PMStream 项目管理事件 stream key(project.created / workstream.created 等);
+	// channel 模块的 pm event consumer 订阅它,在收到对应事件时建 Console / Workstream
+	// channel 等。默认 "synapse:pm:events"。
+	PMStream string `yaml:"pm_stream"`
 
 	// ResetGroupsOnStart 启动时是否 destroy + 重建 channel/task stream 上注册的 consumer group
 	// (top-orchestrator + channel-event-card-writer)。
@@ -609,6 +613,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.EventBus.TaskStream == "" {
 		cfg.EventBus.TaskStream = "synapse:task:events"
+	}
+	if cfg.EventBus.PMStream == "" {
+		cfg.EventBus.PMStream = "synapse:pm:events"
 	}
 	if cfg.OAuth.AccessTokenTTL == 0 {
 		cfg.OAuth.AccessTokenTTL = 24 * time.Hour

@@ -18,6 +18,11 @@ import (
 )
 
 // ChannelService channel 子领域业务接口。
+//
+// AttachVersion / DetachVersion / ListVersions 三个老方法已废弃 ——
+// channel ↔ version 多对多关联(channel_versions 表)整体退役。新模型里
+// channel.workstream_id → workstream.version_id 是单向引用,通过 workstream
+// 表反查即可,不需要 channel 模块自己维护关系层。
 type ChannelService interface {
 	Create(ctx context.Context, projectID, actorUserID uint64, name, purpose string) (*model.Channel, error)
 	Get(ctx context.Context, id uint64) (*model.Channel, error)
@@ -26,12 +31,6 @@ type ChannelService interface {
 	// 不做额外 org 校验:channel_members 行本身就是权限源。
 	ListByPrincipal(ctx context.Context, principalID uint64, limit, offset int) ([]model.Channel, error)
 	Archive(ctx context.Context, id, actorUserID uint64) error
-
-	// AttachVersion / DetachVersion 管理 channel ↔ version 弱关联。
-	// 要求 actor 是 channel 成员(owner / member / observer 皆可)。
-	AttachVersion(ctx context.Context, channelID, versionID, actorUserID uint64) error
-	DetachVersion(ctx context.Context, channelID, versionID, actorUserID uint64) error
-	ListVersions(ctx context.Context, channelID uint64) ([]model.Version, error)
 }
 
 type channelService struct {
@@ -76,7 +75,7 @@ func (s *channelService) Create(ctx context.Context, projectID, actorUserID uint
 		return nil, chanerr.ErrChannelNameInvalid
 	}
 
-	p, err := s.repo.FindProjectByID(ctx, projectID)
+	p, err := s.repo.FindProjectInfo(ctx, projectID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, chanerr.ErrProjectNotFound
 	}
@@ -212,57 +211,6 @@ func (s *channelService) Archive(ctx context.Context, id, actorUserID uint64) er
 		"actor_principal_id": strconv.FormatUint(actorPID, 10),
 	})
 	return nil
-}
-
-// AttachVersion 关联 channel 到 version。调用者必须是 channel 成员。
-//
-// 校验:channel 和 version 都存在;version 属于 channel 的 project(同项目)。
-// 重复关联撞 PK,翻译成幂等(返 nil)。
-func (s *channelService) AttachVersion(ctx context.Context, channelID, versionID, actorUserID uint64) error {
-	c, err := s.Get(ctx, channelID)
-	if err != nil {
-		return err
-	}
-	if c.ArchivedAt != nil {
-		return chanerr.ErrChannelArchived
-	}
-	v, err := s.repo.FindVersionByID(ctx, versionID)
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return chanerr.ErrVersionNotFound
-	}
-	if err != nil {
-		return fmt.Errorf("find version: %w: %w", err, chanerr.ErrChannelInternal)
-	}
-	if v.ProjectID != c.ProjectID {
-		return chanerr.ErrVersionNotFound // 不泄漏"别的 project 的 version 存在"
-	}
-	if err := s.requireChannelMember(ctx, channelID, actorUserID); err != nil {
-		return err
-	}
-	if err := s.repo.AttachChannelVersion(ctx, channelID, versionID); err != nil {
-		if isUniqueViolation(err) {
-			return nil // 已关联,幂等
-		}
-		return fmt.Errorf("attach channel-version: %w: %w", err, chanerr.ErrChannelInternal)
-	}
-	return nil
-}
-
-func (s *channelService) DetachVersion(ctx context.Context, channelID, versionID, actorUserID uint64) error {
-	if _, err := s.Get(ctx, channelID); err != nil {
-		return err
-	}
-	if err := s.requireChannelMember(ctx, channelID, actorUserID); err != nil {
-		return err
-	}
-	if err := s.repo.DetachChannelVersion(ctx, channelID, versionID); err != nil {
-		return fmt.Errorf("detach channel-version: %w: %w", err, chanerr.ErrChannelInternal)
-	}
-	return nil
-}
-
-func (s *channelService) ListVersions(ctx context.Context, channelID uint64) ([]model.Version, error) {
-	return s.repo.ListVersionsByChannel(ctx, channelID)
 }
 
 // autoIncludeAgents 把 auto_include_in_new_channels=TRUE 的 agents 作为 member

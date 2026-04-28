@@ -2,7 +2,9 @@
 //
 // 对齐 internal/organization/dto 的做法:所有 gin.ShouldBindJSON 的目标类型都
 // 定义在本包,handler 只负责解构 + 调 service + 转响应。service 层的 struct
-// (model.Project 等)不直接暴露给前端 —— 字段变更不与 API 契约耦合。
+// (model.Channel 等)不直接暴露给前端 —— 字段变更不与 API 契约耦合。
+//
+// Project / Version 的请求 / 响应 DTO 已迁到 pm/dto。
 package dto
 
 import (
@@ -12,17 +14,6 @@ import (
 )
 
 // ─── 请求 DTO ────────────────────────────────────────────────────────────────
-
-type CreateProjectRequest struct {
-	OrgID       uint64 `json:"org_id" binding:"required"`
-	Name        string `json:"name" binding:"required"`
-	Description string `json:"description"`
-}
-
-type CreateVersionRequest struct {
-	Name   string `json:"name" binding:"required"`
-	Status string `json:"status" binding:"required"`
-}
 
 type CreateChannelRequest struct {
 	ProjectID uint64 `json:"project_id" binding:"required"`
@@ -54,57 +45,6 @@ type PostMessageRequest struct {
 }
 
 // ─── 响应 DTO ────────────────────────────────────────────────────────────────
-
-type ProjectResponse struct {
-	ID          uint64     `json:"id"`
-	OrgID       uint64     `json:"org_id"`
-	Name        string     `json:"name"`
-	Description string     `json:"description,omitempty"`
-	CreatedBy   uint64     `json:"created_by"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
-	ArchivedAt  *time.Time `json:"archived_at,omitempty"`
-}
-
-func ToProjectResponse(p *model.Project) ProjectResponse {
-	return ProjectResponse{
-		ID: p.ID, OrgID: p.OrgID, Name: p.Name, Description: p.Description,
-		CreatedBy: p.CreatedBy, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
-		ArchivedAt: p.ArchivedAt,
-	}
-}
-
-func ToProjectListResponse(ps []model.Project) []ProjectResponse {
-	out := make([]ProjectResponse, 0, len(ps))
-	for i := range ps {
-		out = append(out, ToProjectResponse(&ps[i]))
-	}
-	return out
-}
-
-type VersionResponse struct {
-	ID         uint64     `json:"id"`
-	ProjectID  uint64     `json:"project_id"`
-	Name       string     `json:"name"`
-	Status     string     `json:"status"`
-	TargetDate *time.Time `json:"target_date,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-}
-
-func ToVersionResponse(v *model.Version) VersionResponse {
-	return VersionResponse{
-		ID: v.ID, ProjectID: v.ProjectID, Name: v.Name, Status: v.Status,
-		TargetDate: v.TargetDate, CreatedAt: v.CreatedAt,
-	}
-}
-
-func ToVersionListResponse(vs []model.Version) []VersionResponse {
-	out := make([]VersionResponse, 0, len(vs))
-	for i := range vs {
-		out = append(out, ToVersionResponse(&vs[i]))
-	}
-	return out
-}
 
 type ChannelResponse struct {
 	ID         uint64     `json:"id"`
@@ -222,43 +162,9 @@ type ListMessagesResponse struct {
 	Cursor   uint64                   `json:"cursor"` // 0 = 无更多
 }
 
-// ─── KBRef DTOs ──────────────────────────────────────────────────────────────
-
-// AddKBRefRequest 挂载 KB 资源到 channel 的请求体。
-// kb_source_id 和 kb_document_id 二选一(恰好一个非零)。
-type AddKBRefRequest struct {
-	KBSourceID   uint64 `json:"kb_source_id,omitempty"`
-	KBDocumentID uint64 `json:"kb_document_id,omitempty"`
-}
-
-// KBRefResponse 单个 KBRef 响应。
-type KBRefResponse struct {
-	ID           uint64    `json:"id"`
-	ChannelID    uint64    `json:"channel_id"`
-	KBSourceID   uint64    `json:"kb_source_id,omitempty"`
-	KBDocumentID uint64    `json:"kb_document_id,omitempty"`
-	AddedBy      uint64    `json:"added_by"`
-	AddedAt      time.Time `json:"added_at"`
-}
-
-func ToKBRefResponse(r *model.ChannelKBRef) KBRefResponse {
-	return KBRefResponse{
-		ID:           r.ID,
-		ChannelID:    r.ChannelID,
-		KBSourceID:   r.KBSourceID,
-		KBDocumentID: r.KBDocumentID,
-		AddedBy:      r.AddedBy,
-		AddedAt:      r.AddedAt,
-	}
-}
-
-func ToKBRefListResponse(rs []model.ChannelKBRef) []KBRefResponse {
-	out := make([]KBRefResponse, 0, len(rs))
-	for i := range rs {
-		out = append(out, ToKBRefResponse(&rs[i]))
-	}
-	return out
-}
+// ─── KBRef DTOs 已退役 ────────────────────────────────────────────────────────
+// channel_kb_refs 表 + per-channel KB 挂载概念整体废弃,改用 pm 模块的
+// /api/v2/projects/:id/kb-refs。
 
 // ─── Channel 共享文档 DTOs(PR #9') ───────────────────────────────────────────
 

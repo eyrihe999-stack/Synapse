@@ -22,17 +22,14 @@ type Repository interface {
 	// ── 事务 ────────────────────────────────────────────────────────────────
 	WithTx(ctx context.Context, fn func(tx Repository) error) error
 
-	// ── Project ────────────────────────────────────────────────────────────
-	CreateProject(ctx context.Context, p *model.Project) error
-	FindProjectByID(ctx context.Context, id uint64) (*model.Project, error)
-	ListProjectsByOrg(ctx context.Context, orgID uint64, limit, offset int) ([]model.Project, error)
-	UpdateProjectFields(ctx context.Context, id uint64, updates map[string]any) error
-	CountActiveProjectByName(ctx context.Context, orgID uint64, name string) (int64, error)
-
-	// ── Version ────────────────────────────────────────────────────────────
-	CreateVersion(ctx context.Context, v *model.Version) error
-	FindVersionByID(ctx context.Context, id uint64) (*model.Version, error)
-	ListVersionsByProject(ctx context.Context, projectID uint64) ([]model.Version, error)
+	// ── Project lookup(轻量,不持有 Project 实体)──────────────────────────
+	// Project 主体 CRUD 已迁到 pm 模块(internal/pm/repository)。channel 模块
+	// 只保留"读 Project 元信息"的轻量查询,因为创建 channel / 加成员等动作要查
+	// project.org_id / archived_at 做权限检查。
+	//
+	// 返回的 *ChannelProjectInfo 是 channel 视角下需要的最小字段集,避免反向
+	// 引入 pm/model 类型(channel ← pm 单向依赖)。
+	FindProjectInfo(ctx context.Context, projectID uint64) (*ChannelProjectInfo, error)
 
 	// ── Channel ────────────────────────────────────────────────────────────
 	CreateChannel(ctx context.Context, c *model.Channel) error
@@ -44,14 +41,8 @@ type Repository interface {
 	UpdateChannelFields(ctx context.Context, id uint64, updates map[string]any) error
 	// ArchiveOpenChannelsByProject 把指定 project 下所有 status='open' 的 channel
 	// 批量置为 archived + archived_at=now。返回被级联的行数。
-	// 用于归档 project 时级联下属 channel(避免"项目已归档但里面 channel 还在收消息"
-	// 的语义裂开)。原子 UPDATE,不逐行查 / 改,避免 N 次往返。
+	// 给 pm.project.archived 事件 consumer 用(级联归档下属 channel)。
 	ArchiveOpenChannelsByProject(ctx context.Context, projectID uint64, now time.Time) (int64, error)
-
-	// ── ChannelVersion(多对多关联)──────────────────────────────────────────
-	AttachChannelVersion(ctx context.Context, channelID, versionID uint64) error
-	DetachChannelVersion(ctx context.Context, channelID, versionID uint64) error
-	ListVersionsByChannel(ctx context.Context, channelID uint64) ([]model.Version, error)
 
 	// ── ChannelMember ─────────────────────────────────────────────────────
 	AddMember(ctx context.Context, m *model.ChannelMember) error
@@ -100,16 +91,10 @@ type Repository interface {
 	// FindMessagesByIDsInChannel 批量拉取 reply 预览(作者 + 前若干字正文)用,限定 channel_id。
 	FindMessagesByIDsInChannel(ctx context.Context, channelID uint64, messageIDs []uint64) ([]model.ChannelMessage, error)
 
-	// ── ChannelKBRef ──────────────────────────────────────────────────────
-	CreateKBRef(ctx context.Context, r *model.ChannelKBRef) error
-	DeleteKBRef(ctx context.Context, id uint64) error
-	FindKBRefByID(ctx context.Context, id uint64) (*model.ChannelKBRef, error)
-	ListKBRefsByChannel(ctx context.Context, channelID uint64) ([]model.ChannelKBRef, error)
-	// ListKBSourceIDsForChannel 返 channel 当前挂的所有 source_id 集合(非零去重),
-	// 给 MCP `list_kb_documents` / `get_kb_document` 做可见集判断用。
+	// ── KB 可见集查询(走 project_kb_refs,channel_kb_refs 已退役)───────────
+	// 实现见 kb_visibility.go;接 channels.project_id JOIN project_kb_refs。
+	// 给 MCP `list_kb_documents` / `get_kb_document` / `search_kb` 做可见集计算用。
 	ListKBSourceIDsForChannel(ctx context.Context, channelID uint64) ([]uint64, error)
-	// ListKBDocumentIDsForChannel 返 channel 直接挂载的 doc_id 集合(非零去重)。
-	// 主要用于 `get_kb_document` 的权限校验:除了 source 范围,精挑挂的也要可见。
 	ListKBDocumentIDsForChannel(ctx context.Context, channelID uint64) ([]uint64, error)
 
 	// ── ChannelDocument(PR #9' 共享文档)─────────────────────────────────

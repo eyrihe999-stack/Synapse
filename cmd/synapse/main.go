@@ -52,6 +52,10 @@ import (
 	channelrepo "github.com/eyrihe999-stack/Synapse/internal/channel/repository"
 	channelsvc "github.com/eyrihe999-stack/Synapse/internal/channel/service"
 	"github.com/eyrihe999-stack/Synapse/internal/channel/uploadtoken"
+	"github.com/eyrihe999-stack/Synapse/internal/pm"
+	pmhandler "github.com/eyrihe999-stack/Synapse/internal/pm/handler"
+	pmrepo "github.com/eyrihe999-stack/Synapse/internal/pm/repository"
+	pmsvc "github.com/eyrihe999-stack/Synapse/internal/pm/service"
 	"github.com/eyrihe999-stack/Synapse/internal/organization"
 	orghandler "github.com/eyrihe999-stack/Synapse/internal/organization/handler"
 	orgrepo "github.com/eyrihe999-stack/Synapse/internal/organization/repository"
@@ -74,10 +78,12 @@ import (
 	agentrepo "github.com/eyrihe999-stack/Synapse/internal/agents/repository"
 	agentsvc "github.com/eyrihe999-stack/Synapse/internal/agents/service"
 	"github.com/eyrihe999-stack/Synapse/internal/agentsys"
+	"github.com/eyrihe999-stack/Synapse/internal/agentsys/prompts"
 	agentsysrepo "github.com/eyrihe999-stack/Synapse/internal/agentsys/repository"
 	agentsysruntime "github.com/eyrihe999-stack/Synapse/internal/agentsys/runtime"
 	"github.com/eyrihe999-stack/Synapse/internal/agentsys/scoped"
 	"github.com/eyrihe999-stack/Synapse/internal/channel/eventcard"
+	"github.com/eyrihe999-stack/Synapse/internal/channel/pmevent"
 	"github.com/eyrihe999-stack/Synapse/internal/mcp"
 	"github.com/eyrihe999-stack/Synapse/internal/oauth"
 	oauthhandler "github.com/eyrihe999-stack/Synapse/internal/oauth/handler"
@@ -218,11 +224,21 @@ func main() {
 	if err := agents.RunMigrations(ctx, db, appLogger, nil); err != nil {
 		appLogger.Fatal("agents migrations failed", err, nil)
 	}
+	// pm 必须先于 channel 跑 —— Project / Version 的 schema 在 pm 模块管,
+	// channel 模块的 channels 表(project_id 外键)依赖 projects 表先建。
+	if err := pm.RunMigrations(ctx, db, appLogger, nil); err != nil {
+		appLogger.Fatal("pm migrations failed", err, nil)
+	}
 	if err := channel.RunMigrations(ctx, db, appLogger, nil); err != nil {
 		appLogger.Fatal("channel migrations failed", err, nil)
 	}
 	if err := task.RunMigrations(ctx, db, appLogger, nil); err != nil {
 		appLogger.Fatal("task migrations failed", err, nil)
+	}
+	// pm 二阶段迁移:数据回填 + seed,要在 channel / task 已 ALTER 出 kind /
+	// workstream_id 字段之后跑(详见 pm/migration.go RunPostMigrations 注释)。
+	if err := pm.RunPostMigrations(ctx, db, appLogger); err != nil {
+		appLogger.Fatal("pm post-migrations failed", err, nil)
 	}
 	// PR #6' agentsys:audit_events + llm_usage 两张表,顶级 agent runtime 用
 	if err := agentsys.RunMigrations(ctx, db, appLogger, nil); err != nil {
@@ -458,6 +474,16 @@ func main() {
 	sourceSvc.SetPublicBaseURL(publicBaseURL)
 	sourceSvc.SetAsyncJobLookup(asyncJobLookupAdapter{repo: asyncJobRepo})
 
+	// 10da. PM(项目管理关系层 PR-A):Project / Initiative / Version / Workstream /
+	// ProjectKBRef 五张表 + service + HTTP 路由。
+	pmRepo := pmrepo.New(db)
+	pmOrgChecker := pmsvc.OrgMembershipCheckerFunc(orgService.IsMember)
+	pmService := pmsvc.New(
+		pmsvc.Config{PMEventStream: cfg.EventBus.PMStream},
+		pmRepo, pmOrgChecker, eventBusPublisher, appLogger,
+	)
+	pmH := pmhandler.NewHandler(pmService, appLogger)
+
 	// 10e. Channel(collaboration Phase 1 PR #2 + PR #4' 扩展:messages / kb_refs)
 	//
 	// uploadSigner:OSS 直传 commit token 签名器。进程启动时随机生成 secret,重启
@@ -574,12 +600,12 @@ func main() {
 		},
 		TaskSvc: &mcp.TaskAdapter{TaskSvc: taskService.Task},
 		KBSvc: &mcp.KBAdapter{
-			KBRefSvc:   channelService.KBRef,
 			KBQuerySvc: channelService.KBQuery,
 		},
 		DocumentSvc:   &mcp.DocumentAdapter{DocSvc: channelService.Document},
 		AttachmentSvc: &mcp.AttachmentAdapter{AttachmentSvc: channelService.Attachment},
 		IdentitySvc:   &mcp.IdentityAdapter{DB: db},
+		PMSvc:         pmService,
 		Log:           appLogger,
 	})
 
@@ -640,26 +666,34 @@ func main() {
 		// group 重建由后续 orchestrator / eventcard.Writer 启动期 EnsureGroup 完成,这里不主动建。
 	}
 
+	scopedDeps := scoped.Deps{
+		Messages: channelService.Message,
+		Tasks:    taskService.Task,
+		KBQuery:  channelService.KBQuery,
+		Members:  channelService.Member,
+		PM:       pmService,
+		DB:       db,
+		Logger:   appLogger,
+	}
+
 	orchestrator, err := agentsysruntime.NewOrchestrator(
 		ctx, // 用启动期 ctx 查 top-orchestrator principal_id 即可
 		agentsysruntime.Config{
 			ChannelStream:        cfg.EventBus.ChannelStream,
 			DailyBudgetPerOrgUSD: cfg.LLM.DailyBudgetPerOrgUSD,
 			Concurrency:          cfg.AgentSys.Concurrency,
+			AgentID:              agents.TopOrchestratorAgentID,
+			ConsumerGroupName:    "top-orchestrator", // 沿用老常量值
+			SystemPrompt:         "",                 // 空 fallback 到 prompts.TopOrchestrator
+			AgentDisplayName:     "top-orchestrator",
 		},
 		eventBusConsumer,
 		llmClient,
 		agentRepoImpl,
-		scoped.Deps{
-			Messages: channelService.Message,
-			Tasks:    taskService.Task,
-			KBRefs:   channelService.KBRef,
-			KBQuery:  channelService.KBQuery,
-			Members:  channelService.Member,
-			Logger:   appLogger,
-		},
+		scopedDeps,
 		agentsysAuditRepo,
 		agentsysUsageRepo,
+		nil, // top-orch 不需要 channel kind filter
 		appLogger,
 	)
 	if err != nil {
@@ -671,6 +705,45 @@ func main() {
 	go func() {
 		if err := orchestrator.Run(orchestratorCtx); err != nil && err != context.Canceled {
 			appLogger.Error("agentsys orchestrator exited", err, nil)
+		}
+	}()
+
+	// PR-B B2:Project Architect runtime —— 复用同一个 Orchestrator struct,但
+	// 用不同 cfg 区分:
+	//   - AgentID:synapse-project-architect
+	//   - ConsumerGroupName:独立 consumer group 让两个 agent 同时消费 channel events
+	//   - SystemPrompt:Architect 专属 prompt(项目编排哲学)
+	//   - ChannelKindFilter:只响应 kind='project_console' 的 channel
+	architect, err := agentsysruntime.NewOrchestrator(
+		ctx,
+		agentsysruntime.Config{
+			ChannelStream:        cfg.EventBus.ChannelStream,
+			DailyBudgetPerOrgUSD: cfg.LLM.DailyBudgetPerOrgUSD,
+			Concurrency:          cfg.AgentSys.Concurrency,
+			AgentID:              agents.ProjectArchitectAgentID,
+			ConsumerGroupName:    "project-architect",
+			SystemPrompt:         prompts.ProjectArchitect,
+			AgentDisplayName:     "project-architect",
+			ChannelKindFilter:    []string{"project_console"},
+		},
+		eventBusConsumer,
+		llmClient,
+		agentRepoImpl,
+		scopedDeps,
+		agentsysAuditRepo,
+		agentsysUsageRepo,
+		db, // Architect 需要 db 查 channel.kind 过滤
+		appLogger,
+	)
+	if err != nil {
+		appLogger.Fatal("failed to init project architect", err, nil)
+	}
+	appLogger.Info("agentsys project architect ready", map[string]any{
+		"architect_pid": architect.AgentPrincipalID(),
+	})
+	go func() {
+		if err := architect.Run(orchestratorCtx); err != nil && err != context.Canceled {
+			appLogger.Error("agentsys project architect exited", err, nil)
 		}
 	}()
 
@@ -695,6 +768,26 @@ func main() {
 	go func() {
 		if err := eventCardWriter.Run(orchestratorCtx); err != nil && err != context.Canceled {
 			appLogger.Error("eventcard writer exited", err, nil)
+		}
+	}()
+
+	// pm 事件 consumer:订阅 synapse:pm:events,在 project.created / workstream.created
+	// 等事件触发时建 Console / Workstream channel(把 pm 模块和 channel 解耦)。
+	pmEventConsumer, err := pmevent.New(
+		pmevent.Config{PMStream: cfg.EventBus.PMStream},
+		eventBusConsumer,
+		db,
+		appLogger,
+	)
+	if err != nil {
+		appLogger.Fatal("failed to init pm event consumer", err, nil)
+	}
+	appLogger.Info("pmevent consumer ready", map[string]any{
+		"pm_stream": cfg.EventBus.PMStream,
+	})
+	go func() {
+		if err := pmEventConsumer.Run(orchestratorCtx); err != nil && err != context.Canceled {
+			appLogger.Error("pmevent consumer exited", err, nil)
 		}
 	}()
 
@@ -746,6 +839,7 @@ func main() {
 	}
 	transporthandler.RegisterRoutes(r, transportH)
 	agenthandler.RegisterRoutes(r, agentsH, jwtManager, sessionStore, orgService, hubAdapter, appLogger)
+	pmhandler.RegisterRoutes(r, pmH, jwtManager, sessionStore)
 	channelhandler.RegisterRoutes(r, channelH, jwtManager, sessionStore)
 	taskhandler.RegisterRoutes(r, taskH, jwtManager, sessionStore)
 	oauthhandler.RegisterRoutes(r, oauthH, jwtManager, sessionStore)

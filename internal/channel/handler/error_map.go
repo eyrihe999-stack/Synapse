@@ -19,23 +19,14 @@ func (h *Handler) sendServiceError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, chanerr.ErrForbidden):
 		c.JSON(http.StatusOK, response.BaseResponse{Code: chanerr.CodeForbidden, Message: "forbidden", Error: err.Error()})
+
+	// Project / Version 错误从 channel 模块迁到 pm 后,channel.Create 等还会返回
+	// chanerr.ErrProjectNotFound / ErrProjectArchived(校验 channel 创建时所属
+	// project 状态),其它 Project / Version 哨兵已不会从 channel 服务返回。
 	case errors.Is(err, chanerr.ErrProjectNotFound):
 		c.JSON(http.StatusOK, response.BaseResponse{Code: chanerr.CodeProjectNotFound, Message: "project not found"})
-	case errors.Is(err, chanerr.ErrProjectNameInvalid):
-		c.JSON(http.StatusOK, response.BaseResponse{Code: chanerr.CodeProjectNameInvalid, Message: "project name invalid"})
-	case errors.Is(err, chanerr.ErrProjectNameDup):
-		c.JSON(http.StatusOK, response.BaseResponse{Code: chanerr.CodeProjectNameDuplicated, Message: "project name already used"})
 	case errors.Is(err, chanerr.ErrProjectArchived):
 		c.JSON(http.StatusOK, response.BaseResponse{Code: chanerr.CodeProjectArchived, Message: "project archived"})
-
-	case errors.Is(err, chanerr.ErrVersionNotFound):
-		c.JSON(http.StatusOK, response.BaseResponse{Code: chanerr.CodeVersionNotFound, Message: "version not found"})
-	case errors.Is(err, chanerr.ErrVersionNameInvalid):
-		c.JSON(http.StatusOK, response.BaseResponse{Code: chanerr.CodeVersionNameInvalid, Message: "version name invalid"})
-	case errors.Is(err, chanerr.ErrVersionNameDup):
-		c.JSON(http.StatusOK, response.BaseResponse{Code: chanerr.CodeVersionNameDuplicated, Message: "version name duplicated"})
-	case errors.Is(err, chanerr.ErrVersionStatusInvalid):
-		c.JSON(http.StatusOK, response.BaseResponse{Code: chanerr.CodeVersionStatusInvalid, Message: "version status invalid"})
 
 	case errors.Is(err, chanerr.ErrChannelNotFound):
 		c.JSON(http.StatusOK, response.BaseResponse{Code: chanerr.CodeChannelNotFound, Message: "channel not found"})

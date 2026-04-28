@@ -51,33 +51,29 @@ func (Version) TableName() string { return "versions" }
 //
 // 生命周期:open -> archived(不可逆,但 archived_at 保留审计)。
 // archive 时:Phase 1 只改状态;Phase 2 会触发 3.8 的 artifact 晋升 KB。
+//
+// 新字段(PR-A):
+//   - Kind:'regular'(ad-hoc 临时) / 'workstream'(workstream 自动开的协作面)/
+//     'project_console'(每 project 唯一,Architect agent 工作间)。新建 channel
+//     默认 regular;workstream 自动 lazy-create 时由 pm 模块带 'workstream' 入参
+//   - WorkstreamID:NULLABLE,反向引用 pm.workstreams.id;Kind='workstream' 时必填
 type Channel struct {
-	ID         uint64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	OrgID      uint64     `gorm:"not null;index:idx_channels_org" json:"org_id"`
-	ProjectID  uint64     `gorm:"not null;index:idx_channels_project_status,priority:1" json:"project_id"`
-	Name       string     `gorm:"size:128;not null" json:"name"`
-	Purpose    string     `gorm:"size:512" json:"purpose,omitempty"`
-	Status     string     `gorm:"size:16;not null;default:open;index:idx_channels_project_status,priority:2" json:"status"`
-	CreatedBy  uint64     `gorm:"not null" json:"created_by"`
-	CreatedAt  time.Time  `gorm:"not null" json:"created_at"`
-	UpdatedAt  time.Time  `gorm:"not null" json:"updated_at"`
-	ArchivedAt *time.Time `json:"archived_at,omitempty"`
+	ID            uint64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	OrgID         uint64     `gorm:"not null;index:idx_channels_org" json:"org_id"`
+	ProjectID     uint64     `gorm:"not null;index:idx_channels_project_status,priority:1" json:"project_id"`
+	Name          string     `gorm:"size:128;not null" json:"name"`
+	Purpose       string     `gorm:"size:512" json:"purpose,omitempty"`
+	Status        string     `gorm:"size:16;not null;default:open;index:idx_channels_project_status,priority:2" json:"status"`
+	Kind          string     `gorm:"size:32;not null;default:regular;index:idx_channels_kind" json:"kind"`
+	WorkstreamID  *uint64    `gorm:"index:idx_channels_workstream" json:"workstream_id,omitempty"`
+	CreatedBy     uint64     `gorm:"not null" json:"created_by"`
+	CreatedAt     time.Time  `gorm:"not null" json:"created_at"`
+	UpdatedAt     time.Time  `gorm:"not null" json:"updated_at"`
+	ArchivedAt    *time.Time `json:"archived_at,omitempty"`
 }
 
 // TableName 固定表名。
 func (Channel) TableName() string { return "channels" }
-
-// ChannelVersion channel 和 version 的多对多关联(弱关联,见 design §3.3)。
-//
-// 用 (channel_id, version_id) 复合 PK。
-type ChannelVersion struct {
-	ChannelID uint64    `gorm:"primaryKey" json:"channel_id"`
-	VersionID uint64    `gorm:"primaryKey;index:idx_channel_versions_version" json:"version_id"`
-	CreatedAt time.Time `gorm:"not null" json:"created_at"`
-}
-
-// TableName 固定表名。
-func (ChannelVersion) TableName() string { return "channel_versions" }
 
 // ChannelMember channel 成员。principal_id 指向 principals(user 或 agent 统一入口)。
 //
@@ -159,28 +155,8 @@ type ChannelMessageReaction struct {
 // TableName 固定表名。
 func (ChannelMessageReaction) TableName() string { return "channel_message_reactions" }
 
-// ChannelKBRef channel 关联的 KB 资源(source 或 document,二选一)。
-//
-// 用途:channel 成员对挂载的 KB 默认有读权限,直到 channel 归档。不跨越 channel
-// 状态的持久授权 —— channel archive 后 refs 自动失效(service 层按 status 过滤)。
-//
-// 粒度:允许挂整个 `knowledge_sources` 一行(source 级整批)或单独挂 `documents` 一行
-// (文档级精细);二选一靠应用层保证只有一个列非零,DB 端 CHECK 约束会更严格但
-// MySQL 8 的 CHECK 支持有限,先走应用层。
-//
-// 索引:
-//   - idx_channel_kb_refs_channel:查 channel 挂了啥
-type ChannelKBRef struct {
-	ID             uint64    `gorm:"primaryKey;autoIncrement" json:"id"`
-	ChannelID      uint64    `gorm:"not null;index:idx_channel_kb_refs_channel" json:"channel_id"`
-	KBSourceID     uint64    `gorm:"column:kb_source_id;not null;default:0" json:"kb_source_id,omitempty"`
-	KBDocumentID   uint64    `gorm:"column:kb_document_id;not null;default:0" json:"kb_document_id,omitempty"`
-	AddedBy        uint64    `gorm:"not null" json:"added_by"`
-	AddedAt        time.Time `gorm:"not null" json:"added_at"`
-}
-
-// TableName 固定表名。
-func (ChannelKBRef) TableName() string { return "channel_kb_refs" }
+// ChannelKBRef 已退役 —— channel_kb_refs 表 + per-channel KB 挂载概念整体废弃,
+// 改由 pm.ProjectKBRef 在 project 维度管理。表 DROP 由 pm.RunPostMigrations 完成。
 
 // ChannelDocument channel 内的"共享文档"(PR #9')。
 //

@@ -6,10 +6,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	chanerr "github.com/eyrihe999-stack/Synapse/internal/channel"
-	"github.com/eyrihe999-stack/Synapse/internal/channel/dto"
 	"github.com/eyrihe999-stack/Synapse/internal/common/middleware"
 	"github.com/eyrihe999-stack/Synapse/internal/common/response"
+	"github.com/eyrihe999-stack/Synapse/internal/pm"
+	"github.com/eyrihe999-stack/Synapse/internal/pm/dto"
 )
 
 // CreateProject POST /api/v2/projects —— 新建 project。
@@ -22,7 +22,7 @@ func (h *Handler) CreateProject(c *gin.Context) {
 	var req dto.CreateProjectRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusOK, response.BaseResponse{
-			Code: chanerr.CodeChannelInvalidRequest, Message: "invalid request", Error: err.Error(),
+			Code: pm.CodePMInvalidRequest, Message: "invalid request", Error: err.Error(),
 		})
 		return
 	}
@@ -43,7 +43,7 @@ func (h *Handler) ListProjects(c *gin.Context) {
 	orgID, err := strconv.ParseUint(c.Query("org_id"), 10, 64)
 	if err != nil || orgID == 0 {
 		c.JSON(http.StatusOK, response.BaseResponse{
-			Code: chanerr.CodeChannelInvalidRequest, Message: "org_id query required",
+			Code: pm.CodePMInvalidRequest, Message: "org_id query required",
 		})
 		return
 	}
@@ -87,18 +87,4 @@ func (h *Handler) ArchiveProject(c *gin.Context) {
 		return
 	}
 	response.Success(c, "project archived", nil)
-}
-
-// parseUint64Param 提取 gin path param 为 uint64;失败直接写 400 响应并返 false。
-func parseUint64Param(c *gin.Context, name string) (uint64, bool) {
-	raw := c.Param(name)
-	v, err := strconv.ParseUint(raw, 10, 64)
-	if err != nil || v == 0 {
-		c.JSON(http.StatusOK, response.BaseResponse{
-			Code:    chanerr.CodeChannelInvalidRequest,
-			Message: "invalid path param: " + name,
-		})
-		return 0, false
-	}
-	return v, true
 }

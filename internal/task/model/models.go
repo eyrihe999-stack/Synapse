@@ -22,6 +22,9 @@ type Task struct {
 	ID                     uint64    `gorm:"primaryKey;autoIncrement" json:"id"`
 	OrgID                  uint64    `gorm:"not null;index:idx_tasks_org" json:"org_id"`
 	ChannelID              uint64    `gorm:"not null;index:idx_tasks_channel_status,priority:1" json:"channel_id"`
+	// WorkstreamID PR-A 引入:task 主属 workstream 的反向引用;NULL = ad-hoc(临时
+	// 直接在 channel 创建,不挂工作切片)。在 pm.workstreams 表中查得到归属。
+	WorkstreamID           *uint64   `gorm:"column:workstream_id;index:idx_tasks_workstream" json:"workstream_id,omitempty"`
 	Title                  string    `gorm:"size:256;not null" json:"title"`
 	Description            string    `gorm:"type:text" json:"description,omitempty"`
 	// CreatedByPrincipalID 任务发起人(意图所有者)。

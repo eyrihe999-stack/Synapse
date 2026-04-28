@@ -3,7 +3,7 @@ package repository
 import (
 	"context"
 
-	"github.com/eyrihe999-stack/Synapse/internal/channel/model"
+	"github.com/eyrihe999-stack/Synapse/internal/pm/model"
 )
 
 // CreateProject 插入新 project。GORM 自动填 CreatedAt / UpdatedAt。
@@ -25,6 +25,22 @@ func (r *gormRepository) FindProjectByID(ctx context.Context, id uint64) (*model
 func (r *gormRepository) ListProjectsByOrg(ctx context.Context, orgID uint64, limit, offset int) ([]model.Project, error) {
 	var ps []model.Project
 	q := r.db.WithContext(ctx).Where("org_id = ?", orgID).Order("created_at DESC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if offset > 0 {
+		q = q.Offset(offset)
+	}
+	if err := q.Find(&ps).Error; err != nil {
+		return nil, err
+	}
+	return ps, nil
+}
+
+// ListAllProjects 不限 org,migration 阶段回填用(数据量受限,可全量)。
+func (r *gormRepository) ListAllProjects(ctx context.Context, limit, offset int) ([]model.Project, error) {
+	var ps []model.Project
+	q := r.db.WithContext(ctx).Order("id ASC")
 	if limit > 0 {
 		q = q.Limit(limit)
 	}

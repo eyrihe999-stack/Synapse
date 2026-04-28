@@ -47,13 +47,15 @@ type PrincipalOrgResolver interface {
 }
 
 // Service 聚合 channel 模块所有业务接口。
+//
+// Project / Version 已物理迁到 internal/pm 模块,channel.Service 不再持有这两个
+// 子服务;前端 / MCP 直接调 pm 模块的 /api/v2/projects / /api/v2/versions 路由。
 type Service struct {
-	Project    ProjectService
-	Version    VersionService
 	Channel    ChannelService
 	Member     MemberService
 	Message    MessageService
-	KBRef      KBRefService
+	// KBRef 已退役 —— 老 channel_kb_refs 表 + per-channel KB 挂载概念整体废弃,
+	// 改由 pm.ProjectKBRefService 在 project 维度管理。
 	KBQuery    KBQueryService
 	Document   DocumentService
 	Attachment AttachmentService
@@ -99,12 +101,9 @@ func New(
 		kbQuery = NewKBQueryService(repo, docRepo, oss, embedder, log)
 	}
 	return &Service{
-		Project:    newProjectService(repo, orgChecker, publisher, cfg.ChannelEventStream, log),
-		Version:    newVersionService(repo, orgChecker, log),
 		Channel:    newChannelService(repo, orgChecker, publisher, cfg.ChannelEventStream, log),
 		Member:     newMemberService(repo, orgChecker, principalResolver, publisher, cfg.ChannelEventStream, log),
 		Message:    newMessageService(repo, publisher, cfg.ChannelEventStream, log),
-		KBRef:      newKBRefService(repo, orgChecker, publisher, cfg.ChannelEventStream, log),
 		KBQuery:    kbQuery,
 		Document:   newDocumentService(repo, oss, publisher, cfg.ChannelEventStream, cfg.OSSPathPrefix, uploadSigner, log),
 		Attachment: newAttachmentService(repo, oss, cfg.OSSPathPrefix, uploadSigner, log),
