@@ -111,8 +111,34 @@ func RunPostMigrations(ctx context.Context, db *gorm.DB, log logger.LoggerInterf
 	if err := dropDeprecatedChannelKBRefs(ctx, db, log); err != nil {
 		return fmt.Errorf("pm post-migration drop channel_kb_refs: %w: %w", err, ErrPMInternal)
 	}
+	if err := dropDeprecatedChannelVersions(ctx, db, log); err != nil {
+		return fmt.Errorf("pm post-migration drop channel_versions: %w: %w", err, ErrPMInternal)
+	}
 
 	log.InfoCtx(ctx, "pm: post-migrations completed", nil)
+	return nil
+}
+
+// dropDeprecatedChannelVersions DROP 老 channel_versions 多对多表(PR-C)。
+//
+// 安全前提:channel ↔ version 关联早在 PR-A 改成 channel.workstream_id →
+// workstream.version_id 单向引用。channel_versions 表代码引用已全部清理,
+// 数据无业务消费者。第一次跑真 DROP,后续 IF EXISTS 兜底 no-op。
+func dropDeprecatedChannelVersions(ctx context.Context, db *gorm.DB, log logger.LoggerInterface) error {
+	var exists int
+	err := db.WithContext(ctx).Raw(
+		"SELECT 1 FROM information_schema.TABLES WHERE table_schema = DATABASE() AND table_name = 'channel_versions' LIMIT 1",
+	).Scan(&exists).Error
+	if err != nil {
+		return fmt.Errorf("check channel_versions table: %w", err)
+	}
+	if exists == 0 {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec("DROP TABLE `channel_versions`").Error; err != nil {
+		return fmt.Errorf("drop channel_versions: %w", err)
+	}
+	log.InfoCtx(ctx, "pm: dropped deprecated channel_versions table", nil)
 	return nil
 }
 

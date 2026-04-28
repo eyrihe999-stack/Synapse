@@ -75,6 +75,9 @@ func RegisterRoutes(
 		// project 级 KB 挂载
 		projects.POST("/:id/kb-refs", h.AttachProjectKBRef)
 		projects.GET("/:id/kb-refs", h.ListProjectKBRefs)
+
+		// roadmap 聚合视图(initiatives + versions + workstreams 一次拉)
+		projects.GET("/:id/roadmap", h.GetProjectRoadmap)
 	}
 
 	initiatives := router.Group("/api/v2/initiatives")
