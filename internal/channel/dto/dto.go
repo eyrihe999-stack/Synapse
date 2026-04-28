@@ -47,22 +47,25 @@ type PostMessageRequest struct {
 // ─── 响应 DTO ────────────────────────────────────────────────────────────────
 
 type ChannelResponse struct {
-	ID         uint64     `json:"id"`
-	OrgID      uint64     `json:"org_id"`
-	ProjectID  uint64     `json:"project_id"`
-	Name       string     `json:"name"`
-	Purpose    string     `json:"purpose,omitempty"`
-	Status     string     `json:"status"`
-	CreatedBy  uint64     `json:"created_by"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
-	ArchivedAt *time.Time `json:"archived_at,omitempty"`
+	ID           uint64     `json:"id"`
+	OrgID        uint64     `json:"org_id"`
+	ProjectID    uint64     `json:"project_id"`
+	Name         string     `json:"name"`
+	Purpose      string     `json:"purpose,omitempty"`
+	Status       string     `json:"status"`
+	Kind         string     `json:"kind"`
+	WorkstreamID *uint64    `json:"workstream_id,omitempty"`
+	CreatedBy    uint64     `json:"created_by"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	ArchivedAt   *time.Time `json:"archived_at,omitempty"`
 }
 
 func ToChannelResponse(c *model.Channel) ChannelResponse {
 	return ChannelResponse{
 		ID: c.ID, OrgID: c.OrgID, ProjectID: c.ProjectID, Name: c.Name, Purpose: c.Purpose,
-		Status: c.Status, CreatedBy: c.CreatedBy, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt,
+		Status: c.Status, Kind: c.Kind, WorkstreamID: c.WorkstreamID,
+		CreatedBy: c.CreatedBy, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt,
 		ArchivedAt: c.ArchivedAt,
 	}
 }

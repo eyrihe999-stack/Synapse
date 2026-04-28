@@ -68,6 +68,8 @@ func (h *Handler) sendServiceError(c *gin.Context, err error) {
 		c.JSON(http.StatusOK, response.BaseResponse{Code: pm.CodeWorkstreamInitiativeInvalid, Message: "workstream initiative invalid"})
 	case errors.Is(err, pm.ErrWorkstreamVersionInvalid):
 		c.JSON(http.StatusOK, response.BaseResponse{Code: pm.CodeWorkstreamVersionInvalid, Message: "workstream version invalid"})
+	case errors.Is(err, pm.ErrWorkstreamNameDup):
+		c.JSON(http.StatusOK, response.BaseResponse{Code: pm.CodeWorkstreamNameDuplicated, Message: "workstream name duplicated"})
 
 	// ProjectKBRef
 	case errors.Is(err, pm.ErrProjectKBRefInvalid):

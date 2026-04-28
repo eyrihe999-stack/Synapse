@@ -41,6 +41,7 @@ const (
 	CodeWorkstreamStatusInvalid     = 400290051
 	CodeWorkstreamInitiativeInvalid = 400290052 // initiative 不存在或不属于同 project
 	CodeWorkstreamVersionInvalid    = 400290053 // version 不存在或不属于同 project
+	CodeWorkstreamNameDuplicated    = 409290054 // (initiative_id, name) 撞 active 重名
 
 	// ProjectKBRef
 	CodeProjectKBRefInvalid    = 400290060 // source_id / doc_id 二选一约束不满足
@@ -100,6 +101,7 @@ var (
 	ErrWorkstreamStatusInvalid     = errors.New("pm: workstream status invalid")
 	ErrWorkstreamInitiativeInvalid = errors.New("pm: workstream initiative invalid")
 	ErrWorkstreamVersionInvalid    = errors.New("pm: workstream version invalid")
+	ErrWorkstreamNameDup           = errors.New("pm: workstream name duplicated")
 
 	ErrProjectKBRefInvalid    = errors.New("pm: project kb ref invalid")
 	ErrProjectKBRefNotFound   = errors.New("pm: project kb ref not found")

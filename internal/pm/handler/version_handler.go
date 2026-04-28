@@ -29,7 +29,7 @@ func (h *Handler) CreateVersion(c *gin.Context) {
 		})
 		return
 	}
-	v, err := h.svc.Version.Create(c.Request.Context(), projectID, userID, req.Name, req.Status)
+	v, err := h.svc.Version.Create(c.Request.Context(), projectID, userID, req.Name, req.Status, req.TargetDate)
 	if err != nil {
 		h.sendServiceError(c, err)
 		return

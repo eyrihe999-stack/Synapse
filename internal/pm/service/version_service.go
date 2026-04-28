@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -18,7 +19,8 @@ import (
 
 // VersionService version 子领域业务接口。
 type VersionService interface {
-	Create(ctx context.Context, projectID, actorUserID uint64, name, status string) (*model.Version, error)
+	// targetDate 为 nil 表示未指定目标日期(model.TargetDate 留 NULL,后续 PATCH 可补)。
+	Create(ctx context.Context, projectID, actorUserID uint64, name, status string, targetDate *time.Time) (*model.Version, error)
 	Get(ctx context.Context, id uint64) (*model.Version, error)
 	List(ctx context.Context, projectID uint64) ([]model.Version, error)
 	Update(ctx context.Context, id, actorUserID uint64, updates map[string]any) error
@@ -40,7 +42,7 @@ func newVersionService(repo repository.Repository, orgChecker OrgMembershipCheck
 //
 // 调用者必须是 project 所属 org 成员。is_system version(Backlog)由 migration
 // 阶段建,不允许人工手动建同名;名字撞 UNIQUE 走 ErrVersionNameDup 友好返回。
-func (s *versionService) Create(ctx context.Context, projectID, actorUserID uint64, name, status string) (*model.Version, error) {
+func (s *versionService) Create(ctx context.Context, projectID, actorUserID uint64, name, status string, targetDate *time.Time) (*model.Version, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > pm.VersionNameMaxLen {
 		return nil, pm.ErrVersionNameInvalid
@@ -78,10 +80,11 @@ func (s *versionService) Create(ctx context.Context, projectID, actorUserID uint
 	}
 
 	v := &model.Version{
-		ProjectID: projectID,
-		Name:      name,
-		Status:    status,
-		CreatedBy: actorUserID,
+		ProjectID:  projectID,
+		Name:       name,
+		Status:     status,
+		TargetDate: targetDate,
+		CreatedBy:  actorUserID,
 	}
 	if err := s.repo.CreateVersion(ctx, v); err != nil {
 		if isUniqueViolation(err) {

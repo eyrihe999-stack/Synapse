@@ -54,6 +54,12 @@ func RunMigrations(ctx context.Context, db *gorm.DB, log logger.LoggerInterface,
 	if err := ensureInitiativeNameActiveUnique(ctx, db, log); err != nil {
 		return fmt.Errorf("pm ensure initiative name_active unique: %w: %w", err, ErrPMInternal)
 	}
+	if err := ensureWorkstreamNameActiveColumn(ctx, db, log); err != nil {
+		return fmt.Errorf("pm ensure workstream name_active column: %w: %w", err, ErrPMInternal)
+	}
+	if err := ensureWorkstreamNameActiveUnique(ctx, db, log); err != nil {
+		return fmt.Errorf("pm ensure workstream name_active unique: %w: %w", err, ErrPMInternal)
+	}
 	if err := ensureVersionStatusBackfill(ctx, db, log); err != nil {
 		return fmt.Errorf("pm ensure version status backfill: %w: %w", err, ErrPMInternal)
 	}
@@ -107,6 +113,12 @@ func RunPostMigrations(ctx context.Context, db *gorm.DB, log logger.LoggerInterf
 	}
 	if err := ensureTaskWorkstreamBackfill(ctx, db, log); err != nil {
 		return fmt.Errorf("pm post-migration ensure task workstream backfill: %w: %w", err, ErrPMInternal)
+	}
+	if err := ensureTaskTitleActiveColumn(ctx, db, log); err != nil {
+		return fmt.Errorf("pm post-migration ensure task title_active column: %w: %w", err, ErrPMInternal)
+	}
+	if err := ensureTaskTitleActiveUnique(ctx, db, log); err != nil {
+		return fmt.Errorf("pm post-migration ensure task title_active unique: %w: %w", err, ErrPMInternal)
 	}
 	if err := dropDeprecatedChannelKBRefs(ctx, db, log); err != nil {
 		return fmt.Errorf("pm post-migration drop channel_kb_refs: %w: %w", err, ErrPMInternal)
@@ -481,5 +493,103 @@ func ensureVersionStatusBackfill(ctx context.Context, db *gorm.DB, log logger.Lo
 		})
 	}
 
+	return nil
+}
+
+// ensureWorkstreamNameActiveColumn 在 workstreams 表加 name_active 生成列。
+// 同 initiative 模式:archived 后名字释放。
+func ensureWorkstreamNameActiveColumn(ctx context.Context, db *gorm.DB, log logger.LoggerInterface) error {
+	var n int
+	err := db.WithContext(ctx).Raw(
+		"SELECT 1 FROM information_schema.COLUMNS WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ? LIMIT 1",
+		"workstreams", "name_active",
+	).Scan(&n).Error
+	if err != nil {
+		return fmt.Errorf("check workstreams.name_active column: %w", err)
+	}
+	if n == 1 {
+		return nil
+	}
+
+	ddl := "ALTER TABLE `workstreams` ADD COLUMN `name_active` VARCHAR(128) " +
+		"GENERATED ALWAYS AS (IF(`archived_at` IS NULL, `name`, NULL)) STORED"
+	if err := db.WithContext(ctx).Exec(ddl).Error; err != nil {
+		return fmt.Errorf("add workstreams.name_active column: %w", err)
+	}
+	log.InfoCtx(ctx, "pm: added workstreams.name_active generated column", nil)
+	return nil
+}
+
+// ensureWorkstreamNameActiveUnique 在 workstreams(initiative_id, name_active) 建唯一索引。
+// 维度选 initiative_id 而非 project_id:不同 initiative 下同名 ws 是合理的(两个独立工作主题
+// 都有"Schema 设计"很正常),只在同一个 initiative 内禁止重复。
+func ensureWorkstreamNameActiveUnique(ctx context.Context, db *gorm.DB, log logger.LoggerInterface) error {
+	var n int
+	err := db.WithContext(ctx).Raw(
+		"SELECT 1 FROM information_schema.STATISTICS WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1",
+		"workstreams", "uk_workstreams_initiative_name_active",
+	).Scan(&n).Error
+	if err != nil {
+		return fmt.Errorf("check workstreams.name_active unique index: %w", err)
+	}
+	if n == 1 {
+		return nil
+	}
+
+	ddl := "CREATE UNIQUE INDEX `uk_workstreams_initiative_name_active` ON `workstreams` (`initiative_id`, `name_active`)"
+	if err := db.WithContext(ctx).Exec(ddl).Error; err != nil {
+		return fmt.Errorf("create workstreams.name_active unique index: %w", err)
+	}
+	log.InfoCtx(ctx, "pm: created uk_workstreams_initiative_name_active unique index", nil)
+	return nil
+}
+
+// ensureTaskTitleActiveColumn 在 tasks 表加 title_active 生成列。
+// active 定义:closed_at IS NULL 时 title_active=title,否则 NULL。
+// 关闭(approved/rejected/cancelled)的 task 标题立即释放,可重开同名 task —— 符合"任务做完了再来一遍"的直觉。
+//
+// 注:tasks 表由 task 模块的 AutoMigrate 建,本函数必须在 RunPostMigrations 阶段跑。
+func ensureTaskTitleActiveColumn(ctx context.Context, db *gorm.DB, log logger.LoggerInterface) error {
+	var n int
+	err := db.WithContext(ctx).Raw(
+		"SELECT 1 FROM information_schema.COLUMNS WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ? LIMIT 1",
+		"tasks", "title_active",
+	).Scan(&n).Error
+	if err != nil {
+		return fmt.Errorf("check tasks.title_active column: %w", err)
+	}
+	if n == 1 {
+		return nil
+	}
+
+	ddl := "ALTER TABLE `tasks` ADD COLUMN `title_active` VARCHAR(256) " +
+		"GENERATED ALWAYS AS (IF(`closed_at` IS NULL, `title`, NULL)) STORED"
+	if err := db.WithContext(ctx).Exec(ddl).Error; err != nil {
+		return fmt.Errorf("add tasks.title_active column: %w", err)
+	}
+	log.InfoCtx(ctx, "pm: added tasks.title_active generated column", nil)
+	return nil
+}
+
+// ensureTaskTitleActiveUnique 在 tasks(channel_id, title_active) 建唯一索引。
+// 维度 channel_id:同一 ws channel 下不允许同标题 active task,跨 channel 自由。
+func ensureTaskTitleActiveUnique(ctx context.Context, db *gorm.DB, log logger.LoggerInterface) error {
+	var n int
+	err := db.WithContext(ctx).Raw(
+		"SELECT 1 FROM information_schema.STATISTICS WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1",
+		"tasks", "uk_tasks_channel_title_active",
+	).Scan(&n).Error
+	if err != nil {
+		return fmt.Errorf("check tasks.title_active unique index: %w", err)
+	}
+	if n == 1 {
+		return nil
+	}
+
+	ddl := "CREATE UNIQUE INDEX `uk_tasks_channel_title_active` ON `tasks` (`channel_id`, `title_active`)"
+	if err := db.WithContext(ctx).Exec(ddl).Error; err != nil {
+		return fmt.Errorf("create tasks.title_active unique index: %w", err)
+	}
+	log.InfoCtx(ctx, "pm: created uk_tasks_channel_title_active unique index", nil)
 	return nil
 }

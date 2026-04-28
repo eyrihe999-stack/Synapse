@@ -1,4 +1,5 @@
-# syntax=docker/dockerfile:1.7
+# 临时去掉 # syntax=docker/dockerfile:1.7 — auth.docker.io 在国内不通,无法拉远程 frontend image。
+# BuildKit 自带 frontend 已支持 cache mount(本文件用到的全部 1.4+ 语法),网络恢复后再加回这行。
 # ── Build stage ────────────────────────────────────────────────
 FROM golang:1.25-alpine AS builder
 

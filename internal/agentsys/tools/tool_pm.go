@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/eyrihe999-stack/Synapse/internal/agentsys/scoped"
 	"github.com/eyrihe999-stack/Synapse/internal/common/llm"
@@ -28,7 +29,22 @@ const (
 	ToolSplitWorkstreamIntoTasks = "split_workstream_into_tasks"
 	ToolInviteToWorkstream       = "invite_to_workstream"
 	ToolGetProjectRoadmap        = "get_project_roadmap"
+	// PR-B' Architect 增强:让 LLM 能基于 KB 理解需求 + 看 org 成员名册让用户分配 task。
+	ToolListProjectKBRefs     = "list_project_kb_refs"
+	ToolGetKBDocumentContent  = "get_kb_document_content"
+	ToolListOrgMembers        = "list_org_members"
 )
+
+// kbDocContentMaxBytes Architect get_kb_document_content 单次返回上限。
+// Architect 只需要 PRD 类摘要级文档,50KB 够长(约 20-30 页 markdown);超过的截断 + 提示。
+const kbDocContentMaxBytes = 50 * 1024
+
+// requiredTaskDescSections split_workstream_into_tasks 的 description 必须包含的 5 段标题。
+// 由 dispatchSplitWorkstreamIntoTasks 强制校验,缺一拒批。Prompt 里也写了模板,
+// 这是双层保险 —— LLM 不可能偷懒只填一句话。
+var requiredTaskDescSections = []string{
+	"【背景】", "【目标】", "【产出物】", "【参考】", "【验收标准】",
+}
 
 // pmToolSchema 返回 6 个 PM tool 的 LLM-facing JSON schema。
 //
@@ -144,6 +160,46 @@ func pmToolSchema() []llm.ToolDef {
 				"properties":           map[string]any{},
 			},
 		},
+		{
+			Name: ToolListProjectKBRefs,
+			Description: "列出当前 project 挂载的全部 KB(source 或 document)。Architect 用这个" +
+				"看项目下挂了哪些参考材料(PRD / 设计文档 / 数据源);如果有 PRD 类 doc,接下来用 " +
+				"get_kb_document_content 读全文,理解用户意图后再做规划。",
+			ParametersJSONSchema: map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"properties":           map[string]any{},
+			},
+		},
+		{
+			Name: ToolGetKBDocumentContent,
+			Description: "读 KB 中某个 document 的全文(text/markdown)。doc 必须是当前 project 挂载的(否则" +
+				"权限拒绝)。返回值:title + content 字符串(content 上限 50KB,超出截断并标记 truncated:true)。" +
+				"用法:先 list_project_kb_refs 拿到 doc id,再调本 tool 读全文。",
+			ParametersJSONSchema: map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"required":             []string{"doc_id"},
+				"properties": map[string]any{
+					"doc_id": map[string]any{
+						"type": "integer", "minimum": 1,
+						"description": "KB 文档 id(从 list_project_kb_refs 返回的 kb_document_id 拿)",
+					},
+				},
+			},
+		},
+		{
+			Name: ToolListOrgMembers,
+			Description: "列出当前 project 所属 org 的全部活跃 user 成员(不含 agent / banned 用户)。" +
+				"Architect 在分配 task assignee 时**必查**,把名单展示给用户,让用户告诉你'前端谁、" +
+				"后端谁、测试谁',然后再用对应的 principal_id 去 split_workstream_into_tasks。" +
+				"**绝对不要**自己决定谁干哪个 task。",
+			ParametersJSONSchema: map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"properties":           map[string]any{},
+			},
+		},
 	}
 }
 
@@ -169,11 +225,17 @@ func dispatchPMTool(ctx context.Context, s *scoped.ScopedServices, toolName, raw
 	case ToolCreateWorkstream:
 		return dispatchCreateWorkstream(ctx, s, actorUserID, rawArgs)
 	case ToolSplitWorkstreamIntoTasks:
-		return dispatchSplitWorkstreamIntoTasks(ctx, s, rawArgs)
+		return dispatchSplitWorkstreamIntoTasks(ctx, s, actorUserID, rawArgs)
 	case ToolInviteToWorkstream:
 		return dispatchInviteToWorkstream(ctx, s, actorUserID, rawArgs)
 	case ToolGetProjectRoadmap:
 		return dispatchGetProjectRoadmap(ctx, s, projectID)
+	case ToolListProjectKBRefs:
+		return dispatchListProjectKBRefs(ctx, s, projectID)
+	case ToolGetKBDocumentContent:
+		return dispatchGetKBDocumentContent(ctx, s, rawArgs)
+	case ToolListOrgMembers:
+		return dispatchListOrgMembers(ctx, s, projectID)
 	}
 	return encodeError(fmt.Sprintf("unknown pm tool %q", toolName))
 }
@@ -236,7 +298,7 @@ func dispatchCreateVersion(ctx context.Context, s *scoped.ScopedServices, projec
 	if err := json.Unmarshal([]byte(rawArgs), &a); err != nil {
 		return encodeError(fmt.Sprintf("invalid arguments: %s", err.Error()))
 	}
-	v, err := s.PM().Version.Create(ctx, projectID, actorUserID, a.Name, a.Status)
+	v, err := s.PM().Version.Create(ctx, projectID, actorUserID, a.Name, a.Status, nil)
 	if err != nil {
 		return encodeError(err.Error())
 	}
@@ -265,7 +327,7 @@ func dispatchCreateWorkstream(ctx context.Context, s *scoped.ScopedServices, act
 	})
 }
 
-func dispatchSplitWorkstreamIntoTasks(ctx context.Context, s *scoped.ScopedServices, rawArgs string) string {
+func dispatchSplitWorkstreamIntoTasks(ctx context.Context, s *scoped.ScopedServices, actorUserID uint64, rawArgs string) string {
 	var a splitTasksArgs
 	if err := json.Unmarshal([]byte(rawArgs), &a); err != nil {
 		return encodeError(fmt.Sprintf("invalid arguments: %s", err.Error()))
@@ -274,12 +336,80 @@ func dispatchSplitWorkstreamIntoTasks(ctx context.Context, s *scoped.ScopedServi
 		return encodeError("workstream_id and tasks are required")
 	}
 
+	// 硬约束:任何 task 带 assignee_principal_id 时,本 turn 必须先调过 list_org_members。
+	// 这保证 LLM "看过" org 名册才能分配人,不能凭空想当然写 principal_id。
+	// 如果 EnableProjectPreScan=true,handler.buildProjectPreScan 已经预先 mark 过,放行。
+	hasAssignee := false
+	for _, t := range a.Tasks {
+		if t.AssigneePrincipalID != 0 {
+			hasAssignee = true
+			break
+		}
+	}
+	if hasAssignee && !s.HasToolBeenCalled(ToolListOrgMembers) {
+		return encodeError("assignee guard: 本 turn 必须先调 list_org_members 拿 org 成员名册," +
+			"再用对应的 principal_id 做 assignee。" +
+			"流程:list_org_members → post_message 把名单展示给用户 → 等用户回复'前端谁/后端谁/测试谁' → 再 split 带 assignee。" +
+			"如果不想现在分配,可以先创建 task 时省略 assignee_principal_id 字段。")
+	}
+
+	// 硬约束:每个 task 的 description 必须包含 5 段上下文(背景/目标/产出物/参考/验收标准)。
+	// LLM 不能偷懒输出一句话 description —— 任何一段缺失都拒绝整批,具体错误回喂 LLM 让它重试。
+	// 这是 prompt 之外的 hardness 层,不依赖 LLM 自觉。
+	var formatErrors []string
+	for i, t := range a.Tasks {
+		var missing []string
+		for _, sec := range requiredTaskDescSections {
+			if !strings.Contains(t.Description, sec) {
+				missing = append(missing, sec)
+			}
+		}
+		if len(missing) > 0 {
+			formatErrors = append(formatErrors,
+				fmt.Sprintf("task[%d] %q missing required section(s): %s",
+					i, t.Title, strings.Join(missing, ", ")))
+		}
+	}
+	if len(formatErrors) > 0 {
+		return encodeError(fmt.Sprintf(
+			"task description format check failed (each task description MUST contain all 5 sections: %s):\n%s\n\n"+
+				"请重新生成 split_workstream_into_tasks 调用,每个 task.description 必须按这个模板填(缺哪段补哪段):\n"+
+				"【背景】\n[1-3 句:为什么做这个 task,关联 PRD / 上游需求,引用具体 KB doc 标题]\n\n"+
+				"【目标】\n[1-2 句:这个 task 要交付什么,具体到产物形态]\n\n"+
+				"【产出物】\n- [文件 / 接口 / UI 截图 / 文档,逐项列出]\n\n"+
+				"【参考】\n- [KB doc 标题 / 关联代码位置]\n\n"+
+				"【验收标准】\n- [可勾选的具体条件]",
+			strings.Join(requiredTaskDescSections, " "),
+			strings.Join(formatErrors, "\n"),
+		))
+	}
+
 	w, err := s.PM().Workstream.Get(ctx, a.WorkstreamID)
 	if err != nil {
 		return encodeError(err.Error())
 	}
 	if w.ChannelID == nil || *w.ChannelID == 0 {
 		return encodeError("workstream channel not yet created (consumer is async); retry in a few seconds")
+	}
+
+	// 幂等把 Architect + 所有 assignee 一并加入 ws channel:
+	//   - Architect 自身:否则 task service 的 requireChannelMember(creator=architect_pid)
+	//     会拒绝创建 task,报 "task: forbidden"
+	//   - assignee:否则 task service 的 IsChannelMember(assignee_pid) 校验失败,报
+	//     "task: assignee not in channel" —— 用户给的成员分配只覆盖 ws "成员",
+	//     不一定包含每个 task 的 assignee(实测确实有人指 ws 成员外的 principal)
+	// InviteToChannel 走 INSERT IGNORE,已是成员的不重复加。一次调用比每个 task
+	// 失败后再补 invite 节省 round-trip,也避免 LLM 看到 partial fail 后乱重试。
+	pidsToInvite := []uint64{s.ActorPrincipalID()}
+	seen := map[uint64]bool{s.ActorPrincipalID(): true}
+	for _, t := range a.Tasks {
+		if t.AssigneePrincipalID != 0 && !seen[t.AssigneePrincipalID] {
+			seen[t.AssigneePrincipalID] = true
+			pidsToInvite = append(pidsToInvite, t.AssigneePrincipalID)
+		}
+	}
+	if _, _, err := s.PM().Workstream.InviteToChannel(ctx, a.WorkstreamID, actorUserID, pidsToInvite); err != nil {
+		return encodeError(fmt.Sprintf("ensure ws channel membership (architect+assignees): %s", err.Error()))
 	}
 
 	// Architect 在 console channel,但 task 要落到 workstream channel。
@@ -384,5 +514,76 @@ func dispatchGetProjectRoadmap(ctx context.Context, s *scoped.ScopedServices, pr
 		"initiatives": initSlim,
 		"versions":    verSlim,
 		"workstreams": wsSlim,
+	})
+}
+
+// ── PR-B' Architect 增强 dispatcher ────────────────────────────────────────
+
+func dispatchListProjectKBRefs(ctx context.Context, s *scoped.ScopedServices, projectID uint64) string {
+	refs, err := s.ListProjectKBRefs(ctx, projectID)
+	if err != nil {
+		return encodeError(err.Error())
+	}
+	return encodeOK(map[string]any{
+		"project_id": projectID,
+		"refs":       refs,
+		"hint": "如果 refs 里有 kb_document_id != 0 的条目,接下来用 get_kb_document_content " +
+			"读 doc 全文(每个 doc 一次调用);kb_source_id 是整源挂载,目前 LLM 不读全源," +
+			"知道挂了什么源即可。",
+	})
+}
+
+type getKBDocContentArgs struct {
+	DocID uint64 `json:"doc_id"`
+}
+
+func dispatchGetKBDocumentContent(ctx context.Context, s *scoped.ScopedServices, rawArgs string) string {
+	var a getKBDocContentArgs
+	if err := json.Unmarshal([]byte(rawArgs), &a); err != nil {
+		return encodeError(fmt.Sprintf("invalid arguments: %s", err.Error()))
+	}
+	if a.DocID == 0 {
+		return encodeError("doc_id is required")
+	}
+	doc, err := s.GetKBDocument(ctx, a.DocID)
+	if err != nil {
+		return encodeError(err.Error())
+	}
+	content := doc.FullText
+	truncated := doc.Truncated
+	if len(content) > kbDocContentMaxBytes {
+		content = content[:kbDocContentMaxBytes]
+		truncated = true
+	}
+	title := ""
+	fileName := ""
+	if doc.Document != nil {
+		title = doc.Document.Title
+		fileName = doc.Document.FileName
+	}
+	return encodeOK(map[string]any{
+		"doc_id":           a.DocID,
+		"title":            title,
+		"file_name":        fileName,
+		"content":          content,
+		"truncated":        truncated,
+		"chunk_count":      doc.ChunkCount,
+		"full_text_source": doc.FullTextSource,
+	})
+}
+
+func dispatchListOrgMembers(ctx context.Context, s *scoped.ScopedServices, projectID uint64) string {
+	rows, err := s.ListProjectOrgMembers(ctx, projectID)
+	if err != nil {
+		return encodeError(err.Error())
+	}
+	// 标记本 turn 已调过 list_org_members,后续 split_workstream_into_tasks 带 assignee 才允许放行
+	s.MarkToolCalled(ToolListOrgMembers)
+	return encodeOK(map[string]any{
+		"project_id": projectID,
+		"members":    rows,
+		"hint": "把这份名单展示给用户,问'前端谁/后端谁/测试谁/产品谁'。" +
+			"用户告诉你后,用对应的 principal_id 调 split_workstream_into_tasks 的 assignee_principal_id。" +
+			"绝对不要自己决定谁干哪个 task。",
 	})
 }

@@ -320,6 +320,12 @@ func (s *taskService) CreateByPrincipal(ctx context.Context, in CreateByPrincipa
 		return nil
 	})
 	if err != nil {
+		// (channel_id, title_active) UNIQUE 撞库 → 友好错误回 LLM/前端,
+		// LLM 拿到 dup 自然知道这个 task 已存在,跳过重复 split。
+		// 关闭(approved/rejected/cancelled)的 task 标题已释放,不会撞这里。
+		if isUniqueViolation(err) {
+			return nil, nil, taskerr.ErrTaskTitleDup
+		}
 		return nil, nil, fmt.Errorf("create task tx: %w: %w", err, taskerr.ErrTaskInternal)
 	}
 
@@ -806,6 +812,12 @@ func (s *taskService) Create(ctx context.Context, in CreateInput) (*model.Task, 
 		return nil
 	})
 	if err != nil {
+		// (channel_id, title_active) UNIQUE 撞库 → 友好错误回 LLM/前端,
+		// LLM 拿到 dup 自然知道这个 task 已存在,跳过重复 split。
+		// 关闭(approved/rejected/cancelled)的 task 标题已释放,不会撞这里。
+		if isUniqueViolation(err) {
+			return nil, nil, taskerr.ErrTaskTitleDup
+		}
 		return nil, nil, fmt.Errorf("create task tx: %w: %w", err, taskerr.ErrTaskInternal)
 	}
 

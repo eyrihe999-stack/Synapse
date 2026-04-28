@@ -87,7 +87,8 @@ func Schema() []llm.ToolDef {
 					},
 					"output_spec_kind": map[string]any{
 						"type":        "string",
-						"description": "期望的产物形态(如 markdown / json / file);留空走默认",
+						"enum":        []string{"markdown", "text"},
+						"description": "期望的产物形态:markdown(默认) 或 text。留空 = markdown。",
 					},
 					"reviewer_principal_ids": map[string]any{
 						"type":        "array",
@@ -207,7 +208,8 @@ func Dispatch(ctx context.Context, s *scoped.ScopedServices, call llm.ToolCall) 
 	case ToolGetKBDocument:
 		return dispatchGetKBDocument(ctx, s, call.ArgumentsJSON)
 	case ToolCreateInitiative, ToolCreateVersion, ToolCreateWorkstream,
-		ToolSplitWorkstreamIntoTasks, ToolInviteToWorkstream, ToolGetProjectRoadmap:
+		ToolSplitWorkstreamIntoTasks, ToolInviteToWorkstream, ToolGetProjectRoadmap,
+		ToolListProjectKBRefs, ToolGetKBDocumentContent, ToolListOrgMembers:
 		return dispatchPMTool(ctx, s, call.Name, call.ArgumentsJSON)
 	default:
 		return encodeError(fmt.Sprintf("unknown tool %q", call.Name))

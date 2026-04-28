@@ -45,6 +45,7 @@ const (
 
 const (
 	CodeTaskAlreadyClaimed = 409280010 // open→in_progress 时已被别人 claim
+	CodeTaskTitleDuplicated = 409280020 // 同 channel 下 active(未关闭)task 标题撞库
 )
 
 // ─── 500 ──────────────────────────────────────────────────────────────────
@@ -67,6 +68,7 @@ var (
 	ErrTaskLightweightHasContent = errors.New("task: lightweight task does not accept content (use inline_summary)")
 	ErrTaskNotFound           = errors.New("task: task not found")
 	ErrTaskAlreadyClaimed     = errors.New("task: task already claimed")
+	ErrTaskTitleDup           = errors.New("task: title duplicated in channel")
 
 	ErrSubmissionEmpty       = errors.New("task: submission empty")
 	ErrSubmissionTooLarge    = errors.New("task: submission too large")

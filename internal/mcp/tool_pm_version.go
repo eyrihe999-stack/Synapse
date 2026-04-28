@@ -61,7 +61,7 @@ func (s *Server) handleCreateVersion(ctx context.Context, req mcp.CallToolReques
 	if projectID == 0 || name == "" || status == "" {
 		return mcp.NewToolResultError("project_id, name and status are required"), nil
 	}
-	v, err := s.deps.PMSvc.Version.Create(ctx, projectID, auth.UserID, name, status)
+	v, err := s.deps.PMSvc.Version.Create(ctx, projectID, auth.UserID, name, status, nil)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

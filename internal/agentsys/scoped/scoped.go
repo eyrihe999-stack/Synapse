@@ -58,6 +58,12 @@ type ScopedServices struct {
 	pm       *pmsvc.Service // PR-B B2:Architect 调 PM tool 用;可 nil(top-orch 不需要)
 	db       *gorm.DB       // 反查 channel.project_id / projects.created_by 等;可 nil
 	logger   logger.LoggerInterface
+
+	// calledTools per-turn(单次 handleMention 内)已调过哪些 tool。
+	// 用于 hardness 校验:例如 split_workstream_into_tasks 带 assignee 时,要求
+	// 本 turn 必须先调过 list_org_members(让 LLM "看过" org 名册才能分配人)。
+	// dispatcher 串行执行,无需锁。
+	calledTools map[string]bool
 }
 
 // Deps 构造 ScopedServices 所需的底层依赖(运行期全局单例,不随 scope 变)。
@@ -159,6 +165,66 @@ func (s *ScopedServices) ListMembersWithProfile(ctx context.Context) ([]channelr
 	return s.members.ListWithProfile(ctx, s.channelID)
 }
 
+// OrgMemberRow Architect 用 LLM tool list_org_members 返回的简化成员行。
+// 不暴露 user.status / role 等字段 —— Architect 只需要"谁在这个 org,principal_id 是多少"
+// 用于让用户分配任务 assignee。
+type OrgMemberRow struct {
+	UserID      uint64 `json:"user_id"`
+	PrincipalID uint64 `json:"principal_id"`
+	Email       string `json:"email"`
+	DisplayName string `json:"display_name"`
+}
+
+// ListProjectOrgMembers 列 project 所属 org 的全部 active 用户成员。
+// Architect 拿这个名单后,**不自己决定**谁干哪个 task,而是把名单输出给用户,让用户分配。
+// 设计上故意只返 active user(不返 banned / deleted),且不含 agent —— task assignee 通常是人。
+func (s *ScopedServices) ListProjectOrgMembers(ctx context.Context, projectID uint64) ([]OrgMemberRow, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("scoped.db not configured")
+	}
+	rows := []OrgMemberRow{}
+	if err := s.db.WithContext(ctx).Raw(`
+		SELECT u.id AS user_id, u.principal_id, u.email, u.display_name
+		  FROM org_members om
+		  JOIN projects p ON p.org_id = om.org_id
+		  JOIN users u ON u.id = om.user_id
+		 WHERE p.id = ? AND u.status = 1
+		 ORDER BY u.display_name, u.email
+	`, projectID).Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("list org members for project %d: %w", projectID, err)
+	}
+	return rows, nil
+}
+
+// ListProjectKBRefs 列 project 挂载的 KB ref(source / doc 二选一);委托 PM service。
+// Architect 用此 tool 看项目挂了哪些 KB,再决定要不要进一步 GetKBDocument 读全文。
+func (s *ScopedServices) ListProjectKBRefs(ctx context.Context, projectID uint64) ([]ProjectKBRefRow, error) {
+	if s.pm == nil {
+		return nil, fmt.Errorf("scoped.pm not configured")
+	}
+	refs, err := s.pm.ProjectKBRef.List(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ProjectKBRefRow, 0, len(refs))
+	for _, r := range refs {
+		out = append(out, ProjectKBRefRow{
+			ID: r.ID, KBSourceID: r.KBSourceID, KBDocumentID: r.KBDocumentID,
+			AttachedBy: r.AttachedBy, AttachedAt: r.AttachedAt.Unix(),
+		})
+	}
+	return out, nil
+}
+
+// ProjectKBRefRow LLM-friendly 简化形态:Architect 只关心 "挂的是 source 还是 doc + id"。
+type ProjectKBRefRow struct {
+	ID           uint64 `json:"id"`
+	KBSourceID   uint64 `json:"kb_source_id,omitempty"`
+	KBDocumentID uint64 `json:"kb_document_id,omitempty"`
+	AttachedBy   uint64 `json:"attached_by"`
+	AttachedAt   int64  `json:"attached_at_unix"`
+}
+
 // ChannelID 仅供 runtime handler 内部写 audit_events.channel_id 字段使用。
 //
 // **不要**基于这个 getter 去调任何带 channelID 参数的底层 service —— 那会破坏
@@ -171,6 +237,20 @@ func (s *ScopedServices) OperatingOrgID() uint64 { return s.orgID }
 
 // ActorPrincipalID 同上,仅供 runtime handler 写审计的 actor_principal_id 字段。
 func (s *ScopedServices) ActorPrincipalID() uint64 { return s.actorPrincipalID }
+
+// MarkToolCalled per-turn 状态:dispatcher 在某个 tool 成功路径末尾标记。
+// 后续 hardness 校验(如 split 必须先 list_org_members)读这个标记。
+func (s *ScopedServices) MarkToolCalled(toolName string) {
+	if s.calledTools == nil {
+		s.calledTools = make(map[string]bool, 4)
+	}
+	s.calledTools[toolName] = true
+}
+
+// HasToolBeenCalled 同上,读取标记。未标记 → false。
+func (s *ScopedServices) HasToolBeenCalled(toolName string) bool {
+	return s.calledTools[toolName]
+}
 
 // ─── LLM 可调的 tool 实现 ───────────────────────────────────────────────────
 //
@@ -259,6 +339,10 @@ type TaskCreateOut struct {
 //
 // Architect 在 console channel 触发,但要把 task 落到对应 workstream 的 channel。
 // 不能复用 CreateTask(它会写到 s.channelID = console channel)。
+//
+// output_spec_kind 兜底为 "markdown":底层 service 强校验空值非法
+// (taskerr.ErrTaskOutputKindInvalid),而 split tool schema 没暴露这个字段给 LLM,
+// 不在这里默认就一定炸。和 MCP 那条路径(mcp/tool_pm_workstream.go)行为对齐。
 func (s *ScopedServices) CreateTaskInChannel(
 	ctx context.Context, channelID uint64, title, description string,
 	assigneePrincipalID uint64, isLightweight bool,
@@ -269,7 +353,9 @@ func (s *ScopedServices) CreateTaskInChannel(
 		InitiatorPrincipalID: s.triggerAuthorPID,
 		Title:                title,
 		Description:          description,
+		OutputSpecKind:       "markdown",
 		AssigneePrincipalID:  assigneePrincipalID,
+		IsLightweight:        isLightweight,
 	})
 	return task, err
 }
@@ -280,14 +366,21 @@ func (s *ScopedServices) CreateTaskInChannel(
 // 消息有 author(triggerAuthorPID 非 0),把 author 作为 Initiator 传给
 // service —— service 会把 created_by 记作发起人、created_via 记作 agent,并在
 // LLM 没给 reviewer 时自动 fallback 为发起人。详见 task.service.CreateByPrincipal。
+//
+// OutputSpecKind 兜底为 "markdown":底层 service 强校验空值非法,而 LLM 可能
+// 不传该字段(tools.go schema 标 optional)。和 CreateTaskInChannel / MCP 路径行为对齐。
 func (s *ScopedServices) CreateTask(ctx context.Context, in CreateTaskArgs) (*TaskCreateOut, error) {
+	outputKind := in.OutputSpecKind
+	if outputKind == "" {
+		outputKind = "markdown"
+	}
 	task, reviewers, err := s.tasks.CreateByPrincipal(ctx, tasksvc.CreateByPrincipalInput{
 		ChannelID:            s.channelID,
 		CreatorPrincipalID:   s.actorPrincipalID,
 		InitiatorPrincipalID: s.triggerAuthorPID,
 		Title:                in.Title,
 		Description:          in.Description,
-		OutputSpecKind:       in.OutputSpecKind,
+		OutputSpecKind:       outputKind,
 		AssigneePrincipalID:  in.AssigneePrincipalID,
 		ReviewerPrincipalIDs: in.ReviewerPrincipalIDs,
 		RequiredApprovals:    in.RequiredApprovals,

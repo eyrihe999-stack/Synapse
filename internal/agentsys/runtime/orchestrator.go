@@ -56,6 +56,12 @@ type Config struct {
 	// ChannelKindFilter 空 = 任意 channel;非空 = 只对这些 kind 的 channel 响应。
 	// Architect 用 ["project_console"];top-orch 留空(任意 channel)。
 	ChannelKindFilter []string
+
+	// EnableProjectPreScan Architect 专用硬化:每次 LLM 调用前,在 system prompt 后
+	// 自动追加"项目预扫描"段(get_project_roadmap + list_project_kb_refs + 各 doc 全文 +
+	// list_org_members)。LLM 拿到上下文时**已经看到** KB 内容 + 现有结构 + 成员名单,
+	// 物理上不可能跳过这些只读步骤。top-orchestrator 关闭即可。
+	EnableProjectPreScan bool
 }
 
 // Orchestrator 顶级系统 agent 的运行时。

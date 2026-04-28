@@ -31,6 +31,8 @@ func (h *Handler) sendServiceError(c *gin.Context, err error) {
 		c.JSON(http.StatusOK, response.BaseResponse{Code: taskerr.CodeTaskNotFound, Message: "task not found"})
 	case errors.Is(err, taskerr.ErrTaskAlreadyClaimed):
 		c.JSON(http.StatusOK, response.BaseResponse{Code: taskerr.CodeTaskAlreadyClaimed, Message: "task already claimed"})
+	case errors.Is(err, taskerr.ErrTaskTitleDup):
+		c.JSON(http.StatusOK, response.BaseResponse{Code: taskerr.CodeTaskTitleDuplicated, Message: "task title duplicated in channel"})
 
 	case errors.Is(err, taskerr.ErrSubmissionEmpty):
 		c.JSON(http.StatusOK, response.BaseResponse{Code: taskerr.CodeSubmissionEmpty, Message: "submission empty"})

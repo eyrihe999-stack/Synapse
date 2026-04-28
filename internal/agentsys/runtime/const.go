@@ -15,10 +15,11 @@ const (
 	// MaxToolRounds 单次事件处理里 LLM tool-call loop 的最大轮数。
 	// 每轮 = 1 次 LLM 调用 + 可能的 1 次 tool 执行。
 	//
-	// 8 轮:加 search_kb / get_kb_document 后,典型路径变成"听→列成员→搜 KB→
-	// 看几篇文档→派任务→回用户",轻松吃 5-7 轮。8 轮给检索-推理留余量,真到 8
-	// 仍没收敛说明 LLM 在绕圈,应该停下来回用户。
-	MaxToolRounds = 8
+	// 144 轮:给 Architect 长链路充分余量 —— Step 1 只读(2)+ 批量建结构
+	// (create_initiative/version + create_workstream × N + invite × N +
+	// split_workstream_into_tasks × N)+ 总结。LLM 真要绕死这么多轮 还有
+	// 预算上限和上层 ctx timeout 兜底,不依赖此常量截断。
+	MaxToolRounds = 144
 
 	// RecentMessageWindow 组 prompt 时回灌多少条最近消息作为上下文。
 	// 20 条 ≈ 几轮对话,平衡"有足够上下文"和"token 成本"。

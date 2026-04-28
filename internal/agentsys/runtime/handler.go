@@ -42,6 +42,11 @@ func (o *Orchestrator) handleMention(ctx context.Context, s *scoped.ScopedServic
 
 	tools := agentsystools.Schema()
 	posted := false
+	// exitReason 区分两种 break:""=正常发完最终消息;"empty_response"=LLM 返回
+	// 空 content + 空 tool_calls 提前空返(常见于 reasoning 模型撞 max_output_tokens
+	// 上限把 token 全花在 thinking 上);""=循环跑满 MaxToolRounds 也不收敛。
+	// 兜底文案按 reason 分支,避免把"提前空返"误报成"思考轮数用完"。
+	exitReason := "max_tool_rounds_exceeded"
 
 	for round := 0; round < MaxToolRounds; round++ {
 		req := llm.Request{
@@ -50,7 +55,14 @@ func (o *Orchestrator) handleMention(ctx context.Context, s *scoped.ScopedServic
 			// Temperature 不显式设:gpt-5 / o1 系列新模型**只接受默认 temperature=1.0**,
 			// 传其他值(如 0.3)会 400 "Unsupported parameter"。零值走 omitempty 不发送,
 			// provider 自己用默认。未来如果要支持老模型再按 provider 分支调度。
-			MaxOutputTokens: 2048,
+			//
+			// MaxOutputTokens=16384:reasoning 模型(gpt-5 / o 系)的 thinking token
+			// **跟 visible output 共用 max_output_tokens 预算**。Architect 一轮里
+			// 要规划 6 个 workstream / 18 个 task,reasoning 链能轻松吃 4k–8k token,
+			// 之前 2048 会被 reasoning 全用光导致 content 和 tool_call 全空(实测
+			// completion_tokens 卡 2048 / latency 39s / finish=empty),触发兜底误报。
+			// 16384 给 reasoning 留 8k+ 余量,visible 部分一句总结也够。
+			MaxOutputTokens: 16384,
 		}
 		llmStart := time.Now()
 		resp, err := o.llm.Completions(ctx, req)
@@ -85,7 +97,9 @@ func (o *Orchestrator) handleMention(ctx context.Context, s *scoped.ScopedServic
 		// 没有 tool_calls → 这是最终文本回复
 		if len(resp.ToolCalls) == 0 {
 			if resp.Content == "" {
-				// LLM 什么都没说还不调 tool —— 视为 loop 结束(最后一轮可能空 content 也可能就结束)
+				// LLM 既没回内容也没调工具 —— 多半是 reasoning 把 max_output_tokens
+				// 烧光了(finish=empty,completion_tokens 卡顶)。标记原因供兜底分流。
+				exitReason = "empty_response"
 				break
 			}
 			if _, perr := s.PostMessage(ctx, resp.Content, nil); perr != nil {
@@ -179,11 +193,20 @@ func (o *Orchestrator) handleMention(ctx context.Context, s *scoped.ScopedServic
 	}
 
 	if !posted {
-		// 走完 MaxToolRounds 一句话没回(LLM 绕死在 tool 里,或者最后一轮空)
-		// —— 兜底告诉用户
+		// 没发出最终消息 —— 按退出原因兜底:
+		//   - empty_response:LLM 提前空返(常见于 reasoning 撞 max_output_tokens),
+		//     提示用户切小任务而不是误报"轮数用完"
+		//   - max_tool_rounds_exceeded:真的循环跑满还没收敛,绕死在 tool 里
+		var fallbackMsg string
+		switch exitReason {
+		case "empty_response":
+			fallbackMsg = "我没想清楚就退场了(LLM 空返),把任务切小一点再试?"
+		default:
+			fallbackMsg = "我思考的轮数用完了,没办法给出明确答案,换种问法再试试?"
+		}
 		//sayso-lint:ignore err-swallow
-		_, _ = s.PostMessage(ctx, "我思考的轮数用完了,没办法给出明确答案,换种问法再试试?", nil)
-		o.writeAuditErr(ctx, s, model.ActionLLMError, map[string]any{"reason": "max_tool_rounds_exceeded"})
+		_, _ = s.PostMessage(ctx, fallbackMsg, nil)
+		o.writeAuditErr(ctx, s, model.ActionLLMError, map[string]any{"reason": exitReason})
 	}
 	return nil
 }
@@ -239,10 +262,162 @@ func (o *Orchestrator) buildInitialPrompt(ctx context.Context, s *scoped.ScopedS
 			m.Message.ID, m.Message.AuthorPrincipalID, mentionStr, replyStr, m.Message.Body))
 	}
 
-	return []llm.Message{
+	msgs2 := []llm.Message{
 		{Role: llm.RoleSystem, Content: o.systemPrompt},
-		{Role: llm.RoleUser, Content: historyBuf.String()},
-	}, nil
+	}
+	// EnableProjectPreScan(Architect 专用):把 roadmap + KB + 成员名册预拉 + 拼到 system prompt 后,
+	// LLM 物理上看到这些上下文,不可能跳过。失败不阻塞,降级提示 LLM "预扫失败,自己用 tool 补"。
+	if o.cfg.EnableProjectPreScan {
+		preScan := o.buildProjectPreScan(ctx, s)
+		if preScan != "" {
+			msgs2 = append(msgs2, llm.Message{Role: llm.RoleSystem, Content: preScan})
+		}
+	}
+	msgs2 = append(msgs2, llm.Message{Role: llm.RoleUser, Content: historyBuf.String()})
+	return msgs2, nil
+}
+
+// buildProjectPreScan Architect 专用:在 LLM 调用前预拉 (roadmap + KB doc 全文 + org 成员名册),
+// 渲染成 markdown 拼到 system prompt 后。返空表示预扫失败 —— 调用方 fallback 让 LLM 自己用 tool 拉。
+//
+// 失败策略:不阻塞 LLM 调用 —— 任一步失败只 log warn,把已成功的部分返回。
+func (o *Orchestrator) buildProjectPreScan(ctx context.Context, s *scoped.ScopedServices) string {
+	projectID, err := s.LookupProjectIDForChannel(ctx)
+	if err != nil {
+		o.logger.WarnCtx(ctx, "agentsys: prescan lookup project_id failed", map[string]any{
+			"err": err.Error(),
+		})
+		return ""
+	}
+
+	var buf strings.Builder
+	buf.WriteString("=== 项目预扫描(后台已为你拉好,不需要再调对应只读 tool;mutate tool 仍要调) ===\n\n")
+	buf.WriteString(fmt.Sprintf("project_id = %d\n\n", projectID))
+
+	// 1. roadmap
+	if s.PM() != nil {
+		inits, _ := s.PM().Initiative.List(ctx, projectID, 200, 0)
+		vers, _ := s.PM().Version.List(ctx, projectID)
+		wss, _ := s.PM().Workstream.ListByProject(ctx, projectID, 500, 0)
+		buf.WriteString("--- Initiatives(active 全部)---\n")
+		anyInit := false
+		for _, i := range inits {
+			if i.ArchivedAt != nil {
+				continue
+			}
+			anyInit = true
+			buf.WriteString(fmt.Sprintf("- id=%d name=%q status=%s is_system=%v target_outcome=%q\n",
+				i.ID, i.Name, i.Status, i.IsSystem, i.TargetOutcome))
+		}
+		if !anyInit {
+			buf.WriteString("(无)\n")
+		}
+		buf.WriteString("\n--- Versions ---\n")
+		anyVer := false
+		for _, v := range vers {
+			if v.Status == "cancelled" {
+				continue
+			}
+			anyVer = true
+			td := ""
+			if v.TargetDate != nil {
+				td = v.TargetDate.Format("2006-01-02")
+			}
+			buf.WriteString(fmt.Sprintf("- id=%d name=%q status=%s is_system=%v target_date=%s\n",
+				v.ID, v.Name, v.Status, v.IsSystem, td))
+		}
+		if !anyVer {
+			buf.WriteString("(无)\n")
+		}
+		buf.WriteString("\n--- Workstreams(active 全部)---\n")
+		anyWs := false
+		for _, w := range wss {
+			if w.ArchivedAt != nil {
+				continue
+			}
+			anyWs = true
+			vid := uint64(0)
+			if w.VersionID != nil {
+				vid = *w.VersionID
+			}
+			cid := uint64(0)
+			if w.ChannelID != nil {
+				cid = *w.ChannelID
+			}
+			buf.WriteString(fmt.Sprintf("- id=%d name=%q status=%s init_id=%d version_id=%d channel_id=%d\n",
+				w.ID, w.Name, w.Status, w.InitiativeID, vid, cid))
+		}
+		if !anyWs {
+			buf.WriteString("(无)\n")
+		}
+	}
+
+	// 2. KB refs + doc 全文(每个 doc 上限 50KB,总量上限 200KB,超出停止读)
+	const totalKBBudget = 200 * 1024
+	const perDocBudget = 50 * 1024
+	if s.PM() != nil {
+		refs, _ := s.ListProjectKBRefs(ctx, projectID)
+		buf.WriteString("\n--- KB 挂载 ---\n")
+		if len(refs) == 0 {
+			buf.WriteString("(项目没挂任何 KB。如果用户引用了 PRD / 文档,先反问让用户挂上。)\n")
+		}
+		used := 0
+		for _, r := range refs {
+			if r.KBSourceID != 0 {
+				buf.WriteString(fmt.Sprintf("- source ref id=%d kb_source_id=%d (整源挂载,LLM 不预读全源)\n",
+					r.ID, r.KBSourceID))
+				continue
+			}
+			if r.KBDocumentID == 0 {
+				continue
+			}
+			if used >= totalKBBudget {
+				buf.WriteString(fmt.Sprintf("- doc ref id=%d kb_document_id=%d **跳过(总预算已满,如需查全文再调 get_kb_document_content)**\n",
+					r.ID, r.KBDocumentID))
+				continue
+			}
+			doc, err := s.GetKBDocument(ctx, r.KBDocumentID)
+			if err != nil {
+				buf.WriteString(fmt.Sprintf("- doc ref id=%d kb_document_id=%d **读取失败:%s**\n",
+					r.ID, r.KBDocumentID, err.Error()))
+				continue
+			}
+			content := doc.FullText
+			truncated := doc.Truncated
+			if len(content) > perDocBudget {
+				content = content[:perDocBudget]
+				truncated = true
+			}
+			title := ""
+			if doc.Document != nil {
+				title = doc.Document.Title
+			}
+			buf.WriteString(fmt.Sprintf("\n#### 📄 doc id=%d 「%s」(truncated=%v, source=%s)\n",
+				r.KBDocumentID, title, truncated, doc.FullTextSource))
+			buf.WriteString(content)
+			buf.WriteString("\n\n")
+			used += len(content)
+		}
+	}
+
+	// 3. org 成员名册(让 LLM 后续问用户分配 assignee 时直接列出)
+	members, err := s.ListProjectOrgMembers(ctx, projectID)
+	if err == nil {
+		buf.WriteString("\n--- Org 成员名册(用于 task assignee;**不要自己猜分配**) ---\n")
+		if len(members) == 0 {
+			buf.WriteString("(无)\n")
+		}
+		for _, m := range members {
+			buf.WriteString(fmt.Sprintf("- principal_id=%d user_id=%d email=%s display_name=%q\n",
+				m.PrincipalID, m.UserID, m.Email, m.DisplayName))
+		}
+		// 预扫已经把名册塞给 LLM 了 —— 等同于 LLM 已经"调过"list_org_members,
+		// 让后续 hardness 校验(split 带 assignee 必须先 list)直接通过。
+		s.MarkToolCalled("list_org_members")
+	}
+
+	buf.WriteString("\n=== 预扫描结束 ===\n")
+	return buf.String()
 }
 
 // ─── 审计 + 计费辅助 ────────────────────────────────────────────────────────

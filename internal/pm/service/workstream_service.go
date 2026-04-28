@@ -113,6 +113,11 @@ func (s *workstreamService) Create(ctx context.Context, initiativeID, actorUserI
 		CreatedBy:    actorUserID,
 	}
 	if err := s.repo.CreateWorkstream(ctx, w); err != nil {
+		// (initiative_id, name_active) UNIQUE 撞库 → 友好错误回 LLM/前端,
+		// LLM 拿到 dup 自然知道"这个 ws 已经存在",跳过重复 create。
+		if isUniqueViolation(err) {
+			return nil, pm.ErrWorkstreamNameDup
+		}
 		return nil, fmt.Errorf("create workstream: %w: %w", err, pm.ErrPMInternal)
 	}
 	s.logger.InfoCtx(ctx, "pm: workstream created", map[string]any{

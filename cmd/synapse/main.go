@@ -725,6 +725,7 @@ func main() {
 			SystemPrompt:         prompts.ProjectArchitect,
 			AgentDisplayName:     "project-architect",
 			ChannelKindFilter:    []string{"project_console"},
+			EnableProjectPreScan: true, // 让 Architect 在 LLM 调用前预拉项目上下文(roadmap + KB doc + 成员名册)
 		},
 		eventBusConsumer,
 		llmClient,
