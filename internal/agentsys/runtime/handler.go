@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/eyrihe999-stack/Synapse/internal/agentsys/model"
-	"github.com/eyrihe999-stack/Synapse/internal/agentsys/prompts"
 	"github.com/eyrihe999-stack/Synapse/internal/agentsys/repository"
 	"github.com/eyrihe999-stack/Synapse/internal/agentsys/scoped"
 	agentsystools "github.com/eyrihe999-stack/Synapse/internal/agentsys/tools"
@@ -207,11 +206,9 @@ func (o *Orchestrator) reportLLMFailure(ctx context.Context, s *scoped.ScopedSer
 //
 // 每条消息带 `mentions=...` 字段,LLM 看到谁被 @ 后,调 list_channel_members 拿名字。
 func (o *Orchestrator) buildInitialPrompt(ctx context.Context, s *scoped.ScopedServices) ([]llm.Message, error) {
-	// KB refs 提示(失败降级)
-	kbRefsNote := ""
-	if refs, err := s.ListChannelKBRefs(ctx); err == nil && len(refs) > 0 {
-		kbRefsNote = fmt.Sprintf("\n\n当前 channel 挂载了 %d 份知识库引用。需要时可调用 list_channel_kb_refs 查看详情。", len(refs))
-	}
+	// KB refs 预告提示已退役 —— channel_kb_refs 表 + per-channel KB 挂载概念整体
+	// 废弃。LLM 想看 KB 直接调 list_kb_documents / search_kb tool(底层走
+	// channel.project_id JOIN project_kb_refs 算可见集)。
 
 	// 历史消息 + 每条的 mentions(让 LLM 知道谁 @ 了谁,再决定是否调 list_channel_members 查名字)
 	// ListRecentMessages 底层按 id DESC 返(最新在前),这里倒着遍历,喂给 LLM 按"旧 → 新"阅读顺序。
@@ -243,7 +240,7 @@ func (o *Orchestrator) buildInitialPrompt(ctx context.Context, s *scoped.ScopedS
 	}
 
 	return []llm.Message{
-		{Role: llm.RoleSystem, Content: prompts.TopOrchestrator + kbRefsNote},
+		{Role: llm.RoleSystem, Content: o.systemPrompt},
 		{Role: llm.RoleUser, Content: historyBuf.String()},
 	}, nil
 }
@@ -325,7 +322,7 @@ func (o *Orchestrator) isOverBudget(ctx context.Context, orgID uint64) (bool, er
 // handleBudgetExceeded 预算超限时:回 channel 一条消息 + 写 audit(action=skip.budget)。
 func (o *Orchestrator) handleBudgetExceeded(ctx context.Context, orgID, channelID uint64) {
 	// 这里需要一个 scoped 实例去 post,直接现场构造即可(不进 LLM,没 tool-loop)
-	s := scoped.New(orgID, channelID, o.topOrchestratorPID, o.scopedDeps)
+	s := scoped.New(orgID, channelID, o.agentPrincipalID, o.scopedDeps)
 	//sayso-lint:ignore err-swallow
 	_, _ = s.PostMessage(ctx, "今日本组织的 LLM 预算已用完,我先休息一下,明天继续。", nil)
 	o.writeAuditErr(ctx, s, model.ActionSkipBudget, map[string]any{"reason": "daily_budget_exceeded"})
@@ -378,13 +375,6 @@ func summarizeToolResult(toolName, result string) string {
 		//sayso-lint:ignore err-swallow
 		_ = json.Unmarshal(payload.Data, &d)
 		return fmt.Sprintf("%d messages", len(d.Messages))
-	case agentsystools.ToolListChannelKBRefs:
-		var d struct {
-			KBRefs []json.RawMessage `json:"kb_refs"`
-		}
-		//sayso-lint:ignore err-swallow
-		_ = json.Unmarshal(payload.Data, &d)
-		return fmt.Sprintf("%d kb_refs", len(d.KBRefs))
 	}
 	return ""
 }

@@ -57,13 +57,18 @@ func TestIsErrorResult(t *testing.T) {
 // LLM 侧如果 tool 改名会让旧的 prompt 示例失效,需要刻意改。
 func TestSchema_ExpectedToolNames(t *testing.T) {
 	want := map[string]bool{
-		ToolPostMessage:        true,
-		ToolCreateTask:         true,
-		ToolListRecentMessages: true,
-		ToolListChannelKBRefs:  true,
-		ToolListChannelMembers: true,
-		ToolSearchKB:           true,
-		ToolGetKBDocument:      true,
+		ToolPostMessage:              true,
+		ToolCreateTask:               true,
+		ToolListRecentMessages:       true,
+		ToolListChannelMembers:       true,
+		ToolSearchKB:                 true,
+		ToolGetKBDocument:            true,
+		ToolCreateInitiative:         true,
+		ToolCreateVersion:            true,
+		ToolCreateWorkstream:         true,
+		ToolSplitWorkstreamIntoTasks: true,
+		ToolInviteToWorkstream:       true,
+		ToolGetProjectRoadmap:        true,
 	}
 	for _, tool := range Schema() {
 		if !want[tool.Name] {

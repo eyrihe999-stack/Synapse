@@ -19,11 +19,14 @@ package scoped
 import (
 	"context"
 	"errors"
+	"fmt"
 
-	channelmodel "github.com/eyrihe999-stack/Synapse/internal/channel/model"
+	"gorm.io/gorm"
+
 	channelrepo "github.com/eyrihe999-stack/Synapse/internal/channel/repository"
 	channelsvc "github.com/eyrihe999-stack/Synapse/internal/channel/service"
 	"github.com/eyrihe999-stack/Synapse/internal/common/logger"
+	pmsvc "github.com/eyrihe999-stack/Synapse/internal/pm/service"
 	taskmodel "github.com/eyrihe999-stack/Synapse/internal/task/model"
 	tasksvc "github.com/eyrihe999-stack/Synapse/internal/task/service"
 )
@@ -47,9 +50,13 @@ type ScopedServices struct {
 
 	messages channelsvc.MessageService
 	tasks    tasksvc.TaskService
-	kbRefs   channelsvc.KBRefService
+	// channelsvc.KBRefService 已退役(channel_kb_refs 表 + per-channel KB 挂载概念
+	// 整体废弃)。LLM 看 KB 走 KBQuery 提供的 list_kb_documents / get_kb_document /
+	// search_kb,可见集由 channels.project_id JOIN project_kb_refs 计算。
 	kbQuery  channelsvc.KBQueryService // 可 nil(PG / embedder 缺失时);tool dispatcher 内做空值检查
 	members  channelsvc.MemberService
+	pm       *pmsvc.Service // PR-B B2:Architect 调 PM tool 用;可 nil(top-orch 不需要)
+	db       *gorm.DB       // 反查 channel.project_id / projects.created_by 等;可 nil
 	logger   logger.LoggerInterface
 }
 
@@ -60,10 +67,15 @@ type ScopedServices struct {
 type Deps struct {
 	Messages channelsvc.MessageService
 	Tasks    tasksvc.TaskService
-	KBRefs   channelsvc.KBRefService
 	KBQuery  channelsvc.KBQueryService
 	Members  channelsvc.MemberService
-	Logger   logger.LoggerInterface
+	// PM PR-B B2:Architect 调用 PM 编排 tool(create_initiative / create_workstream
+	// 等)用。top-orchestrator 不需要,装配时可 nil。
+	PM     *pmsvc.Service
+	// DB PR-B B2:dispatcher 反查 channel.project_id / projects.created_by 等元数据
+	// (Architect 用 project owner 的 user_id 作为 PM 调用 actor)。可 nil。
+	DB     *gorm.DB
+	Logger logger.LoggerInterface
 }
 
 // Trigger 触发本次 agent 处理的消息上下文。AuthorPrincipalID 非 0 时,
@@ -91,11 +103,52 @@ func NewForTrigger(orgID, channelID, actorPrincipalID uint64, trigger Trigger, d
 		triggerMessageID: trigger.MessageID,
 		messages:         deps.Messages,
 		tasks:            deps.Tasks,
-		kbRefs:           deps.KBRefs,
 		kbQuery:          deps.KBQuery,
 		members:          deps.Members,
+		pm:               deps.PM,
+		db:               deps.DB,
 		logger:           deps.Logger,
 	}
+}
+
+// PM 暴露给 PM tool dispatcher。返 nil 时 dispatcher 应返"PM tool unavailable"
+// (top-orchestrator 路径不装配 PM)。
+func (s *ScopedServices) PM() *pmsvc.Service { return s.pm }
+
+// LookupProjectIDForChannel 通过 channel.id 反查 project_id。
+// Architect dispatch 用 —— PM 操作必须知道 project_id 但 LLM 不一定提供。
+func (s *ScopedServices) LookupProjectIDForChannel(ctx context.Context) (uint64, error) {
+	if s.db == nil {
+		return 0, fmt.Errorf("scoped.db not configured")
+	}
+	var pid uint64
+	if err := s.db.WithContext(ctx).Raw(
+		"SELECT project_id FROM channels WHERE id = ?", s.channelID,
+	).Scan(&pid).Error; err != nil {
+		return 0, fmt.Errorf("lookup project_id for channel %d: %w", s.channelID, err)
+	}
+	return pid, nil
+}
+
+// LookupProjectOwnerUserID 反查 project.created_by(user.id)。
+//
+// Architect 调用 PM tool 时,**借 project owner 身份**通过 pm.Service 的
+// org membership 校验(Architect 自己是 system agent,不是 org 成员)。
+// v0 简化方案;后续如有需要,加 pm.ByPrincipalAgent 接口让 system agent 直接调。
+func (s *ScopedServices) LookupProjectOwnerUserID(ctx context.Context, projectID uint64) (uint64, error) {
+	if s.db == nil {
+		return 0, fmt.Errorf("scoped.db not configured")
+	}
+	var uid uint64
+	if err := s.db.WithContext(ctx).Raw(
+		"SELECT created_by FROM projects WHERE id = ?", projectID,
+	).Scan(&uid).Error; err != nil {
+		return 0, fmt.Errorf("lookup project owner for %d: %w", projectID, err)
+	}
+	if uid == 0 {
+		return 0, fmt.Errorf("project %d has no creator", projectID)
+	}
+	return uid, nil
 }
 
 // ListMembersWithProfile 给 handler 组 LLM prompt 的"成员名册"用。
@@ -160,11 +213,9 @@ func (s *ScopedServices) ListRecentMessages(ctx context.Context, limit int) ([]c
 	return s.messages.ListForPrincipal(ctx, s.channelID, s.actorPrincipalID, 0, limit)
 }
 
-// ListChannelKBRefs 列出本 channel 挂载的 KB 引用(文档/代码库片段)。
-// LLM 组 prompt 时会用这个告诉模型"手头有哪些资料可引"。
-func (s *ScopedServices) ListChannelKBRefs(ctx context.Context) ([]channelmodel.ChannelKBRef, error) {
-	return s.kbRefs.ListForPrincipal(ctx, s.channelID, s.actorPrincipalID)
-}
+// ListChannelKBRefs 已退役(channel 不再持有 KB ref 概念)。LLM 想知道"手头有哪些资料"
+// 改调 list_kb_documents tool(它内部用 kbQuery,经由 channel.project_id 反查
+// project_kb_refs 算可见集)。
 
 // SearchKB 在本 channel 可见 KB 上做语义检索。kbQuery 未注入时返 ErrKBUnavailable
 // (而不是 panic),让 dispatcher 把人读错误回喂 LLM。
@@ -201,6 +252,26 @@ type CreateTaskArgs struct {
 type TaskCreateOut struct {
 	Task      *taskmodel.Task
 	Reviewers []taskmodel.TaskReviewer
+}
+
+// CreateTaskInChannel PR-B B2 给 split_workstream_into_tasks 用 —— 在**指定 channel**
+// (workstream channel,非 scoped 绑定的 console channel)创建 task。
+//
+// Architect 在 console channel 触发,但要把 task 落到对应 workstream 的 channel。
+// 不能复用 CreateTask(它会写到 s.channelID = console channel)。
+func (s *ScopedServices) CreateTaskInChannel(
+	ctx context.Context, channelID uint64, title, description string,
+	assigneePrincipalID uint64, isLightweight bool,
+) (*taskmodel.Task, error) {
+	task, _, err := s.tasks.CreateByPrincipal(ctx, tasksvc.CreateByPrincipalInput{
+		ChannelID:            channelID,
+		CreatorPrincipalID:   s.actorPrincipalID,
+		InitiatorPrincipalID: s.triggerAuthorPID,
+		Title:                title,
+		Description:          description,
+		AssigneePrincipalID:  assigneePrincipalID,
+	})
+	return task, err
 }
 
 // CreateTask 在绑定的 channel 派发一个 task。

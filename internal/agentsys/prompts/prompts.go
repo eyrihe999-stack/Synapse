@@ -13,3 +13,11 @@ import _ "embed"
 //
 //go:embed top_orchestrator.md
 var TopOrchestrator string
+
+// ProjectArchitect 项目编排 agent(Synapse Architect)的 system prompt。
+//
+// 角色定位:不是聊天助手,是"项目级编排者" —— 在 Project Console channel 内
+// 听用户描述需求 → 拆 initiative + workstream + task → 直接调 PM tool 落实。
+//
+//go:embed project_architect.md
+var ProjectArchitect string

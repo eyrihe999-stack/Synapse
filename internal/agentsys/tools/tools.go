@@ -31,7 +31,6 @@ const (
 	ToolPostMessage        = "post_message"
 	ToolCreateTask         = "create_task"
 	ToolListRecentMessages = "list_recent_messages"
-	ToolListChannelKBRefs  = "list_channel_kb_refs"
 	ToolListChannelMembers = "list_channel_members"
 	ToolSearchKB           = "search_kb"
 	ToolGetKBDocument      = "get_kb_document"
@@ -42,7 +41,7 @@ const (
 // JSON Schema 是 draft-07 的常用子集(OpenAI / Azure 均支持),不用高级特性。
 // 更改此函数必须同步更新 dispatcher 的 switch case;两处漂移 LLM 就会调不通。
 func Schema() []llm.ToolDef {
-	return []llm.ToolDef{
+	base := []llm.ToolDef{
 		{
 			Name:        ToolPostMessage,
 			Description: "在当前 channel 回复一条文本消息给用户。这通常是你对用户问题的最终答复。",
@@ -118,15 +117,9 @@ func Schema() []llm.ToolDef {
 				},
 			},
 		},
-		{
-			Name:        ToolListChannelKBRefs,
-			Description: "列出当前 channel 挂载的知识库引用(文档 / 代码库 / 其它)。用于判断手头有哪些外部资料可参考。",
-			ParametersJSONSchema: map[string]any{
-				"type":                 "object",
-				"additionalProperties": false,
-				"properties":           map[string]any{},
-			},
-		},
+		// ToolListChannelKBRefs 已退役 —— channel_kb_refs 表 + per-channel KB 挂载概念
+		// 整体废弃。LLM 想看 KB 直接调 list_kb_documents tool(走 channel.project_id
+		// JOIN project_kb_refs 算可见集)。
 		{
 			Name: ToolListChannelMembers,
 			Description: "列出当前 channel 的所有成员及其 principal_id、display_name、kind(user/agent_system/agent_user)、role(owner/member/observer)。\n" +
@@ -187,6 +180,8 @@ func Schema() []llm.ToolDef {
 			},
 		},
 	}
+	// PR-B B2:把 PM 编排 tool 追加到 schema 末尾。
+	return append(base, pmToolSchema()...)
 }
 
 // Dispatch 按 tool name 派发到 scoped 的对应方法。
@@ -205,14 +200,15 @@ func Dispatch(ctx context.Context, s *scoped.ScopedServices, call llm.ToolCall) 
 		return dispatchCreateTask(ctx, s, call.ArgumentsJSON)
 	case ToolListRecentMessages:
 		return dispatchListRecentMessages(ctx, s, call.ArgumentsJSON)
-	case ToolListChannelKBRefs:
-		return dispatchListChannelKBRefs(ctx, s)
 	case ToolListChannelMembers:
 		return dispatchListChannelMembers(ctx, s)
 	case ToolSearchKB:
 		return dispatchSearchKB(ctx, s, call.ArgumentsJSON)
 	case ToolGetKBDocument:
 		return dispatchGetKBDocument(ctx, s, call.ArgumentsJSON)
+	case ToolCreateInitiative, ToolCreateVersion, ToolCreateWorkstream,
+		ToolSplitWorkstreamIntoTasks, ToolInviteToWorkstream, ToolGetProjectRoadmap:
+		return dispatchPMTool(ctx, s, call.Name, call.ArgumentsJSON)
 	default:
 		return encodeError(fmt.Sprintf("unknown tool %q", call.Name))
 	}
@@ -341,22 +337,7 @@ func dispatchListChannelMembers(ctx context.Context, s *scoped.ScopedServices) s
 	return encodeOK(map[string]any{"members": slim})
 }
 
-func dispatchListChannelKBRefs(ctx context.Context, s *scoped.ScopedServices) string {
-	refs, err := s.ListChannelKBRefs(ctx)
-	if err != nil {
-		return encodeError(err.Error())
-	}
-	slim := make([]map[string]any, 0, len(refs))
-	for _, r := range refs {
-		slim = append(slim, map[string]any{
-			"id":              r.ID,
-			"kb_source_id":    r.KBSourceID,
-			"kb_document_id":  r.KBDocumentID,
-			"added_at":        r.AddedAt,
-		})
-	}
-	return encodeOK(map[string]any{"kb_refs": slim})
-}
+// dispatchListChannelKBRefs 已删除(对应 ToolListChannelKBRefs 退役)。
 
 func dispatchSearchKB(ctx context.Context, s *scoped.ScopedServices, rawArgs string) string {
 	var args searchKBArgs
