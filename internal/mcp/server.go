@@ -30,6 +30,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/eyrihe999-stack/Synapse/internal/common/logger"
+	pmsvc "github.com/eyrihe999-stack/Synapse/internal/pm/service"
 )
 
 // sessionIdleTTL mcp-go session sweeper 的 idle 清理阈值。
@@ -67,7 +68,11 @@ type Deps struct {
 	DocumentSvc   DocumentFacade
 	AttachmentSvc AttachmentFacade
 	IdentitySvc   IdentityFacade
-	Log           logger.LoggerInterface
+	// PMSvc PR-B 新加:Project / Initiative / Version / Workstream / KBRef 的 CRUD
+	// 直接复用 pm.Service struct(不绕 facade,因为 PM 工具是机械 CRUD 包装,
+	// 没有 channel/task 那种"by user vs by principal"的双轨复杂度)。
+	PMSvc *pmsvc.Service
+	Log   logger.LoggerInterface
 }
 
 // Server 是一个 MCP server + Streamable HTTP transport 的组合体。
@@ -105,6 +110,11 @@ func New(cfg Config, deps Deps) *Server {
 	s.registerAttachmentTools()
 	s.registerMentionTools()
 	s.registerDashboardTools()
+	// PR-B PM 工具组
+	s.registerInitiativeTools()
+	s.registerVersionTools()
+	s.registerWorkstreamTools()
+	s.registerProjectKBTools()
 
 	// Streamable HTTP 本体
 	s.streamable = server.NewStreamableHTTPServer(s.mcp,

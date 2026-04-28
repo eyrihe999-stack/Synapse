@@ -131,7 +131,9 @@ type ReviewTaskByPrincipalInput struct {
 //
 // 业务逻辑都在 channelsvc.KBQueryService;Facade 实现(KBAdapter)直接 delegate。
 type KBFacade interface {
-	ListChannelKBRefsForPrincipal(ctx context.Context, channelID, principalID uint64) ([]channelmodel.ChannelKBRef, error)
+	// 注:list_channel_kb_refs 老方法已退役 —— channel_kb_refs 表 + per-channel
+	// KB 挂载概念整体废弃。LLM 看 KB 走 list_kb_documents / get_kb_document /
+	// search_kb,可见集由 channels.project_id JOIN project_kb_refs 计算。
 
 	// ListKBDocumentsByPrincipal 列 channel 经由 source 挂载范围内的 KB 文档元数据(分页)。
 	// query 为 keyword(LIKE on title/file_name),空串不过滤;beforeID 为上一页最末 doc.id。

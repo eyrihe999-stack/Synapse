@@ -3,7 +3,6 @@ package mcp
 import (
 	"context"
 
-	channelmodel "github.com/eyrihe999-stack/Synapse/internal/channel/model"
 	channelsvc "github.com/eyrihe999-stack/Synapse/internal/channel/service"
 	docmodel "github.com/eyrihe999-stack/Synapse/internal/document/model"
 )
@@ -15,16 +14,11 @@ import (
 // 职责拆分:
 //   - 成员校验 / channel 可见集合判定 / OSS-vs-chunks 文本来源 / 检索逻辑
 //     → 全部在 channelsvc.KBQueryService(下沉到 channel 模块的 service 层,系统 agent 也用)
-//   - list_channel_kb_refs 仍直接 delegate 到 channelsvc.KBRefService.ListForPrincipal
-//     (它本身就只做"列挂载关系",和"读 KB 内容"是两件事;不强行融到 KBQueryService)
+//
+// 历史:list_channel_kb_refs 老 tool + KBRefService 已退役(channel_kb_refs 表
+// + per-channel KB 挂载概念整体废弃),改由 pm.ProjectKBRefService 在 project 维度管理。
 type KBAdapter struct {
-	KBRefSvc   channelsvc.KBRefService
 	KBQuerySvc channelsvc.KBQueryService
-}
-
-// ListChannelKBRefsForPrincipal 直接 delegate KBRefService。
-func (a *KBAdapter) ListChannelKBRefsForPrincipal(ctx context.Context, channelID, principalID uint64) ([]channelmodel.ChannelKBRef, error) {
-	return a.KBRefSvc.ListForPrincipal(ctx, channelID, principalID)
 }
 
 // ListKBDocumentsByPrincipal delegate 到 KBQueryService。
@@ -39,9 +33,6 @@ func (a *KBAdapter) ListKBDocumentsByPrincipal(
 }
 
 // GetKBDocumentByPrincipal delegate 到 KBQueryService。
-//
-// 返回的 *KBDocumentContent 是 channelsvc.KBDocumentContent 的别名,
-// FullTextSource ("oss" | "chunks_join") + Truncated 字段由 service 决定。
 func (a *KBAdapter) GetKBDocumentByPrincipal(
 	ctx context.Context,
 	channelID, docID, callerPrincipalID uint64,

@@ -12,20 +12,18 @@ import (
 // registerKBTools 注册 KB 相关 tool。
 //
 // Tools:
-//   - list_channel_kb_refs   列 channel 挂的 KB 资源关联(source / document)
-//   - list_kb_documents      列 channel 经由 source 挂载范围内的可见 KB 文档(LIKE 关键词过滤 + keyset 分页)
+//   - list_kb_documents      列 channel 视角可见的 KB 文档(走 channel.project_id JOIN project_kb_refs)
 //   - get_kb_document        拉单文档元数据 + 文本(text 类走 OSS 原文,二进制回退到 chunks 拼接)
 //   - search_kb              语义检索(query → embedding → HNSW),返 top-K chunks
+//
+// 历史:list_channel_kb_refs 老 tool 已退役 —— channel_kb_refs 表 + per-channel
+// KB 挂载概念整体废弃,改由 pm 模块 list_project_kb_refs / attach_kb_to_project /
+// detach_kb_from_project 在 project 维度管理。LLM 看 KB 的可见集仍按 channel 维度
+// 计算,只是底层 SQL 走 channels.project_id JOIN project_kb_refs。
 func (s *Server) registerKBTools() {
 	if s.deps.KBSvc == nil {
 		return
 	}
-
-	s.mcp.AddTool(mcp.NewTool("list_channel_kb_refs",
-		mcp.WithDescription("List KB (knowledge base) resources attached to a channel. "+
-			"Current agent must be a channel member."),
-		mcp.WithNumber("channel_id", mcp.Required()),
-	), s.handleListChannelKBRefs)
 
 	s.mcp.AddTool(mcp.NewTool("list_kb_documents",
 		mcp.WithDescription("List KB documents visible in a channel (via the channel's mounted KB sources). "+
@@ -186,35 +184,4 @@ func (s *Server) handleSearchKB(ctx context.Context, req mcp.CallToolRequest) (*
 	return jsonResult(out)
 }
 
-func (s *Server) handleListChannelKBRefs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	auth, ok := oauthmw.AuthFromContext(ctx)
-	if !ok {
-		return mcp.NewToolResultError("authentication required"), nil
-	}
-	channelID := uint64Arg(req, "channel_id", 0)
-	if channelID == 0 {
-		return mcp.NewToolResultError("channel_id is required"), nil
-	}
-
-	rows, err := s.deps.KBSvc.ListChannelKBRefsForPrincipal(ctx, channelID, auth.AgentPrincipalID)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("list_channel_kb_refs: %s", err.Error())), nil
-	}
-	out := make([]map[string]any, 0, len(rows))
-	for _, r := range rows {
-		item := map[string]any{
-			"id":         r.ID,
-			"channel_id": r.ChannelID,
-			"added_by":   r.AddedBy,
-			"added_at":   r.AddedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
-		}
-		if r.KBSourceID != 0 {
-			item["kb_source_id"] = r.KBSourceID
-		}
-		if r.KBDocumentID != 0 {
-			item["kb_document_id"] = r.KBDocumentID
-		}
-		out = append(out, item)
-	}
-	return jsonResult(out)
-}
+// handleListChannelKBRefs 已删除(对应 list_channel_kb_refs tool 退役)。
