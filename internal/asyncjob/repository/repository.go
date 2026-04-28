@@ -44,6 +44,17 @@ type Repository interface {
 	// 唯一索引保证"同 (org_id, kind, key) 至多一条",所以直接 Take 即可。
 	FindByIdempotencyKey(ctx context.Context, orgID uint64, kind, key string) (*model.Job, error)
 
+	// FindLatestByKeyPrefix 按"幂等键前缀"找最近一条 job(不论状态)。
+	//
+	// 用途:GitLab sync 场景,同一 source 的多次同步 idempotency_key 形如
+	// "gitlab:<source_id>:full" / "gitlab:<source_id>:incr:<after_sha>",共享前缀
+	// "gitlab:<source_id>:"。前端轮询"该 source 当前最近一次 sync 的状态/进度"时调。
+	//
+	// 实现走 (org_id, kind, created_at desc) 现有索引 + LIKE 前缀过滤。
+	// keyPrefix 空串 → 退化等价 FindLatest(by org+kind),返该 org 该 kind 最新 job。
+	// 无匹配返 (nil, nil)。
+	FindLatestByKeyPrefix(ctx context.Context, orgID uint64, kind, keyPrefix string) (*model.Job, error)
+
 	// MarkRunning queued → running,填 StartedAt + 首次 HeartbeatAt。幂等:状态不是 queued 返 error。
 	MarkRunning(ctx context.Context, id uint64) error
 
@@ -124,6 +135,40 @@ func (r *gormRepo) FindLatest(ctx context.Context, userID uint64, kind string) (
 		return nil, fmt.Errorf("async job find latest: %w", err)
 	}
 	return &row, nil
+}
+
+func (r *gormRepo) FindLatestByKeyPrefix(ctx context.Context, orgID uint64, kind, keyPrefix string) (*model.Job, error) {
+	q := r.db.WithContext(ctx).Where("org_id = ? AND kind = ?", orgID, kind)
+	if keyPrefix != "" {
+		// LIKE 走 (org_id, kind, created_at desc) 索引取前 N 行后逐条 filter;
+		// 数据规模小(单 org 一种 kind 的 job 通常 < 1k 行),全表扫也可接受。
+		// 用 ESCAPE 防止用户传含 % / _ 的 key prefix 时被当通配符。
+		escaped := likeEscape(keyPrefix)
+		q = q.Where("idempotency_key LIKE ? ESCAPE '\\\\'", escaped+"%")
+	}
+	var row model.Job
+	err := q.Order("id DESC").Take(&row).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("async job find latest by key prefix: %w", err)
+	}
+	return &row, nil
+}
+
+// likeEscape 把 % / _ / \ 转义,让传入的 keyPrefix 在 LIKE 里只作字面量匹配。
+// 配合 LIKE ... ESCAPE '\\' 使用。
+func likeEscape(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '%' || c == '_' || c == '\\' {
+			out = append(out, '\\')
+		}
+		out = append(out, c)
+	}
+	return string(out)
 }
 
 func (r *gormRepo) FindByIdempotencyKey(ctx context.Context, orgID uint64, kind, key string) (*model.Job, error) {

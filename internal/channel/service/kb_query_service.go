@@ -72,6 +72,12 @@ type KBDocumentContent struct {
 }
 
 // KBSearchHit 单条检索命中。LLM 拿到的最小信息集 —— 知道命中了哪个文档的哪段、相关性多高。
+//
+// 代码场景下额外暴露:
+//   - ExternalRef* 来自 documents.external_ref_*(GitLab 同步源 = blob URL / commit / repo / path)
+//   - SymbolName / Signature / Language / LineStart / LineEnd 来自 chunks.metadata jsonb
+//
+// 非代码 chunk(纯文档 / 上传 markdown 等)这些字段为零值;LLM 基于 doc_mime_type 决定是否使用。
 type KBSearchHit struct {
 	DocID       uint64
 	DocTitle    string
@@ -81,6 +87,18 @@ type KBSearchHit struct {
 	Content     string
 	HeadingPath []string
 	Distance    float32 // cosine 距离: 0 = 一致, 2 = 反向
+
+	// ExternalRefKind: "git" / "upload" / "url" / ...
+	// ExternalRefURI: 可点回源链(GitLab blob URL / OSS 预签名等);URI 已是完整 URL,LLM 直接交给用户即可
+	ExternalRefKind string
+	ExternalRefURI  string
+
+	// 代码切片专属(非代码 chunk 留零值)
+	SymbolName string
+	Signature  string
+	Language   string
+	LineStart  int
+	LineEnd    int
 }
 
 const (
@@ -284,18 +302,50 @@ func (s *kbQueryService) SearchByPrincipal(
 
 	hits := make([]KBSearchHit, 0, len(rows))
 	for _, r := range rows {
-		hits = append(hits, KBSearchHit{
-			DocID:       r.DocID,
-			DocTitle:    r.DocTitle,
-			DocFileName: r.DocFileName,
-			DocMIMEType: r.DocMIMEType,
-			ChunkIdx:    r.ChunkIdx,
-			Content:     r.Content,
-			HeadingPath: r.HeadingPath,
-			Distance:    r.Distance,
-		})
+		h := KBSearchHit{
+			DocID:           r.DocID,
+			DocTitle:        r.DocTitle,
+			DocFileName:     r.DocFileName,
+			DocMIMEType:     r.DocMIMEType,
+			ChunkIdx:        r.ChunkIdx,
+			Content:         r.Content,
+			HeadingPath:     r.HeadingPath,
+			Distance:        r.Distance,
+			ExternalRefKind: r.ExternalRefKind,
+			ExternalRefURI:  r.ExternalRefURI,
+		}
+		// chunks.metadata jsonb 含 code chunker 写的 symbol_name / signature / language / line_*
+		// 字段。LLM 拿这些拼"path:line_start-line_end"做精确引用,价值远高于让它自己数行。
+		fillCodeFieldsFromMetadata(&h, r.Metadata)
+		hits = append(hits, h)
 	}
 	return hits, nil
+}
+
+// fillCodeFieldsFromMetadata 从 chunks.metadata jsonb 提代码字段填到 hit 上。
+// metadata nil / 缺字段都 OK —— 留零值即可,非代码 chunk 本就该为空。
+//
+// 兼容:line_* 在 jsonb 里是 JSON number,反序列化后是 float64,需要类型转换。
+func fillCodeFieldsFromMetadata(h *KBSearchHit, md map[string]any) {
+	if len(md) == 0 {
+		return
+	}
+	if v, _ := md["symbol_name"].(string); v != "" {
+		h.SymbolName = v
+	}
+	if v, _ := md["signature"].(string); v != "" {
+		h.Signature = v
+	}
+	if v, _ := md["language"].(string); v != "" {
+		h.Language = v
+	}
+	// line_start / line_end:JSON number → float64;JSON int 也走这路径
+	if v, ok := md["line_start"].(float64); ok {
+		h.LineStart = int(v)
+	}
+	if v, ok := md["line_end"].(float64); ok {
+		h.LineEnd = int(v)
+	}
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────

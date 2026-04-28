@@ -117,6 +117,17 @@ type ServerConfig struct {
 	// 生产:填 ingress / LB 的 IP 段,如 ["10.0.0.0/8", "172.16.0.0/12"]。
 	// 直接暴露公网时务必保持空。
 	TrustedProxies []string `yaml:"trusted_proxies"`
+
+	// PublicBaseURL 服务对外可达的根 URL(无尾 "/")。用于拼对外暴露的回调 / webhook URL,
+	// 例如 GitLab webhook URL = `<PublicBaseURL>/api/v2/webhooks/gitlab/<source_id>`。
+	//
+	// 取值优先级(运行时):
+	//   1) Server.PublicBaseURL 显式配置
+	//   2) OAuth.Issuer(已是 AS 公网根 URL,本地 dev 通常已配 ngrok URL)
+	//   3) 空串 → 创建 GitLab source 时不返完整 URL,前端走自拼 + 警告 fallback
+	//
+	// 本地 dev:你为 Claude Desktop 测 OAuth 时配的 ngrok URL 同时也满足此字段语义,无需重复配。
+	PublicBaseURL string `yaml:"public_base_url"`
 }
 
 type DatabaseConfig struct {

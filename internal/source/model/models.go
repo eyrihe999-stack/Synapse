@@ -12,12 +12,14 @@ const (
 
 // ─── Kind 枚举 ────────────────────────────────────────────────────────────────
 //
-// 当前两类:
+// 当前三类:
 //   - manual_upload:用户手动上传的默认收件箱,每用户每 org 一条(lazy 创建)
 //   - custom:      用户自建的命名"数据源",每用户可建多条,靠 Name 区分
+//   - gitlab_repo: GitLab 仓库同步源,external_ref = "<gitlab_project_id>";
+//                  owner_user_id 同时是凭据持有人(sync runner 用 user_integrations
+//                  下该 owner 的 GitLab 凭据调外部 API)
 //
 // 后续扩展:
-//   - gitlab_repo:GitLab 仓库同步源,external_ref = repo_id
 //   - feishu_space:飞书空间同步源,external_ref = space_token
 const (
 	// KindManualUpload 用户默认收件箱:每用户每 org 一条,external_ref 为空
@@ -25,10 +27,29 @@ const (
 	// KindCustom 用户自建的命名数据源:Name 必填,external_ref 为空;
 	// 唯一性由 (org_id, owner_user_id, name) 保证,owner 可以建任意多条。
 	KindCustom = "custom"
+	// KindGitLabRepo GitLab 仓库同步源。external_ref = GitLab project_id 字符串;
+	// 创建走 RequirePerm(integration.gitlab.manage),默认只 org owner 拿到此 perm。
+	KindGitLabRepo = "gitlab_repo"
 
 	// DefaultManualUploadName manual_upload 的回显名,migration 把历史行补成这个;
 	// 新建 manual_upload(EnsureManualUpload)也用它初始化。
 	DefaultManualUploadName = "我的上传"
+)
+
+// ─── GitLab sync 状态 ────────────────────────────────────────────────────────
+//
+// 写入 sources.last_sync_status,前端按值展示"从未同步 / 同步中 / 成功 / 凭据失效 / 失败"等。
+const (
+	// SyncStatusNever 创建后尚未触发过同步
+	SyncStatusNever = ""
+	// SyncStatusRunning 一轮同步进行中(asyncjob queued/running)
+	SyncStatusRunning = "running"
+	// SyncStatusSucceeded 上一轮全量/增量成功
+	SyncStatusSucceeded = "succeeded"
+	// SyncStatusAuthFailed PAT/OAuth 凭据失效或被撤销;owner 需重新授权
+	SyncStatusAuthFailed = "auth_failed"
+	// SyncStatusFailed 其他失败(GitLab 5xx / 网络 / runner 抛错)
+	SyncStatusFailed = "failed"
 )
 
 // ─── Visibility 枚举 ──────────────────────────────────────────────────────────
@@ -55,7 +76,7 @@ func IsValidVisibility(v string) bool {
 // IsValidKind 判断 kind 取值是否合法。
 func IsValidKind(k string) bool {
 	switch k {
-	case KindManualUpload, KindCustom:
+	case KindManualUpload, KindCustom, KindGitLabRepo:
 		return true
 	}
 	return false
@@ -80,12 +101,39 @@ type Source struct {
 	Kind        string `gorm:"size:32;not null;uniqueIndex:uk_sources_full,priority:2;index:idx_sources_kind"`
 	OwnerUserID uint64 `gorm:"not null;uniqueIndex:uk_sources_full,priority:3;index:idx_sources_owner"`
 	ExternalRef string `gorm:"size:255;not null;default:'';uniqueIndex:uk_sources_full,priority:4"`
-	// Name 用户可读名称。manual_upload 由 migration 回填为 "我的上传";custom 由用户创建时指定。
+	// Name 用户可读名称。manual_upload 由 migration 回填为 "我的上传";custom 由用户创建时指定;
+	// gitlab_repo 创建时填 GitLab path_with_namespace(如 "team/sub/repo")。
 	// 唯一性由额外的 uk_sources_owner_name 约束(org_id+owner_user_id+name)保证,允许不同人重名。
 	Name       string `gorm:"size:128;not null;default:''"`
 	Visibility string `gorm:"size:16;not null;default:org;index:idx_sources_visibility"`
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+
+	// ─── GitLab 同步源专属字段(其他 kind 留默认值)──────────────────────────
+	//
+	// 这些字段对 manual_upload/custom 是无效字段,业务侧不写不读。统一放在主表里避免
+	// 多开 sources_gitlab 子表 — kind 一多就成 EAV,得不偿失;字段稀疏成本可控。
+
+	// GitLabIntegrationID 指向 user_integrations.id —— 创建时 owner 选哪条 GitLab 凭据。
+	// runner 严格用此 id 反查凭据;owner 删除该 integration → sync 会标 auth_failed,不 fallback。
+	GitLabIntegrationID uint64 `gorm:"not null;default:0"`
+
+	// GitLabBranch 同步分支。默认 "main",创建时 owner 可指定。
+	GitLabBranch string `gorm:"size:255;not null;default:''"`
+
+	// GitLabWebhookSecretHash webhook secret 的 SHA-256 hex(防写日志泄露明文)。
+	// 创建时返一次明文给 owner 粘到 GitLab Project → Webhooks 里;DB 只留 hash。
+	GitLabWebhookSecretHash string `gorm:"size:64;not null;default:''"`
+
+	// LastSyncStatus 上一次 sync 终态。取值见 SyncStatus* 常量;空串 = 从未同步。
+	LastSyncStatus string `gorm:"size:32;not null;default:''"`
+	// LastSyncedAt 上一次 sync 完成时刻(成功/失败均更新);nil = 从未同步。
+	LastSyncedAt *time.Time
+	// LastSyncError 上一次失败的 root cause 摘要(<= 512 字符,防 log fan-out)。成功时清空。
+	LastSyncError string `gorm:"size:512;not null;default:''"`
+	// LastSyncedCommit 上一次成功同步指向的 commit SHA。增量 sync 用它作 from。
+	LastSyncedCommit string `gorm:"size:64;not null;default:''"`
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // TableName 返回 source 表名。

@@ -48,6 +48,12 @@ type Repository interface {
 	// 调用方应先校验 newVisibility 合法 + 与当前值不同(no-op 时本方法直接返回 nil 不写 audit)。
 	UpdateSourceVisibility(ctx context.Context, sourceID uint64, newVisibility string) error
 
+	// UpdateGitLabSyncStatus 在 sync runner 终态时回写 last_sync_* 字段。
+	// status 见 model.SyncStatus*;commitSHA 仅 status=succeeded 有值(失败时调用方传空串即可,
+	// 本方法只覆盖非空 commitSHA,保留上次成功的 commit 作增量起点);errSummary 失败时摘要,
+	// 成功时传空串即清空。本方法不写 audit —— sync 终态高频,审计走 async_jobs 表 + eventbus。
+	UpdateGitLabSyncStatus(ctx context.Context, sourceID uint64, status, commitSHA, errSummary string) error
+
 	// DeleteSource 按主键删 source,同事务写一条 source.delete audit(before=snapshot, after=null)。
 	// 不负责清理 resource_acl 行 —— 调用方(service 层)需先通过 ACLOps.BulkRevokeACLsByResource 清掉。
 	// 不存在或已被删 → 返回 gorm.ErrRecordNotFound,由 service 层翻译。
@@ -74,6 +80,12 @@ type Repository interface {
 
 	// ListSourceIDsByVisibility 列指定 visibility 的 source id(用于"全 org 可见"过滤)。
 	ListSourceIDsByVisibility(ctx context.Context, orgID uint64, visibility string) ([]uint64, error)
+
+	// ListSourceIDsByKindsInIDs 在给定 ID 集合里再按 kind 白名单过滤,只返 ID。
+	// 给"知识库文档列表只展示 manual_upload"等场景用 —— documents 在 PG / sources 在
+	// MySQL 跨库查不了,handler 拿 visible 集后必须独立来这边求交集。
+	// kinds 空 → 直接返 ids;ids 空 → 短路返空。
+	ListSourceIDsByKindsInIDs(ctx context.Context, orgID uint64, kinds []string, ids []uint64) ([]uint64, error)
 }
 
 // gormRepository 基于 GORM 的统一实现。

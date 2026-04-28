@@ -105,6 +105,34 @@ func (r *gormRepository) EnsureManualUploadSource(ctx context.Context, orgID, ow
 	return nil, false, fmt.Errorf("ensure manual_upload source: create=%v, refind=%v", createErr, findErr)
 }
 
+// UpdateGitLabSyncStatus 在 sync runner 终态时回写 last_sync_* 字段。
+//
+// commitSHA 非空 → 覆盖 last_synced_commit(成功时);空串 → 不动该字段(失败时保留上次起点)。
+// last_synced_at 总是设置为 now() —— 含义是"上一次尝试同步的时间",成功失败都更新。
+func (r *gormRepository) UpdateGitLabSyncStatus(ctx context.Context, sourceID uint64, status, commitSHA, errSummary string) error {
+	now := time.Now().UTC()
+	updates := map[string]any{
+		"last_sync_status": status,
+		"last_synced_at":   now,
+		"last_sync_error":  errSummary,
+		"updated_at":       now,
+	}
+	if commitSHA != "" {
+		updates["last_synced_commit"] = commitSHA
+	}
+	res := r.db.WithContext(ctx).Model(&model.Source{}).
+		Where("id = ?", sourceID).
+		Updates(updates)
+	if res.Error != nil {
+		return fmt.Errorf("update gitlab sync status: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		// source 已被删 — runner 在跑时 source 没了,不致命,只 warn(调用方 swallow)
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
 // UpdateSourceVisibility 更新 visibility,同事务写 source.visibility_change audit。
 //
 // 若 newVisibility == 当前值则 no-op,不写 audit。
@@ -243,6 +271,29 @@ func (r *gormRepository) ListSourceIDsByVisibility(ctx context.Context, orgID ui
 		return nil, fmt.Errorf("list source ids by visibility: %w", err)
 	}
 	return ids, nil
+}
+
+// ListSourceIDsByKindsInIDs 在 ids 集合里再按 kind 白名单过滤。
+// kinds 空 → 直接回传 ids(无过滤);ids 空 → 短路返空(可见集为空)。
+func (r *gormRepository) ListSourceIDsByKindsInIDs(ctx context.Context, orgID uint64, kinds []string, ids []uint64) ([]uint64, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if len(kinds) == 0 {
+		out := make([]uint64, len(ids))
+		copy(out, ids)
+		return out, nil
+	}
+	var out []uint64
+	err := r.db.WithContext(ctx).
+		Table("sources").
+		Select("id").
+		Where("org_id = ? AND kind IN ? AND id IN ?", orgID, kinds, ids).
+		Scan(&out).Error
+	if err != nil {
+		return nil, fmt.Errorf("list source ids by kinds in ids: %w", err)
+	}
+	return out, nil
 }
 
 // ─── snapshot 辅助 ────────────────────────────────────────────────────────────

@@ -23,6 +23,15 @@ const (
 	CodeSourceNameExists = 409210010
 	// CodeSourceHasDocuments 删除 source 时该 source 下仍有 doc 引用
 	CodeSourceHasDocuments = 409210020
+
+	// CodeSourceGitLabIntegrationMissing external_account_id 在 user_integrations 下找不到 active 凭据
+	CodeSourceGitLabIntegrationMissing = 400210020
+	// CodeSourceGitLabRepoNotFound GitLab API 返 404,owner 凭据看不到该 project
+	CodeSourceGitLabRepoNotFound = 400210021
+	// CodeSourceGitLabAuthFailed PAT/OAuth expired/revoked,GitLab API 返 401
+	CodeSourceGitLabAuthFailed = 401210010
+	// CodeSourceGitLabUpstream GitLab API 5xx / 网络错(暂时性)
+	CodeSourceGitLabUpstream = 502210010
 )
 
 // ─── 403 段:权限 ─────────────────────────────────────────────────────────────
@@ -70,4 +79,15 @@ var (
 
 	// ErrSourceInternal 内部基础设施错误
 	ErrSourceInternal = errors.New("source: internal error")
+
+	// ─── GitLab 集成专属(给 service / runner 抛,handler 翻成对应 Code* 返前端) ───
+
+	// ErrSourceGitLabIntegrationMissing 调用方传的 external_account_id 在 user_integrations 下找不到 active 凭据
+	ErrSourceGitLabIntegrationMissing = errors.New("source: gitlab integration missing")
+	// ErrSourceGitLabRepoNotFound 凭据有效但看不到该 project(404 或 403)
+	ErrSourceGitLabRepoNotFound = errors.New("source: gitlab repo not found")
+	// ErrSourceGitLabAuthFailed PAT/OAuth 失效(GitLab 返 401);触发 last_sync_status=auth_failed
+	ErrSourceGitLabAuthFailed = errors.New("source: gitlab auth failed")
+	// ErrSourceGitLabUpstream GitLab API 5xx / 网络错;runner 标 last_sync_status=failed,允许重试
+	ErrSourceGitLabUpstream = errors.New("source: gitlab upstream error")
 )

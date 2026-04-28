@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -32,12 +33,15 @@ import (
 	asynchandler "github.com/eyrihe999-stack/Synapse/internal/asyncjob/handler"
 	asyncrepo "github.com/eyrihe999-stack/Synapse/internal/asyncjob/repository"
 	"github.com/eyrihe999-stack/Synapse/internal/asyncjob/runners/docupload"
+	"github.com/eyrihe999-stack/Synapse/internal/asyncjob/runners/gitlabsync"
 	asyncsvc "github.com/eyrihe999-stack/Synapse/internal/asyncjob/service"
 	"github.com/eyrihe999-stack/Synapse/internal/document"
 	dochandler "github.com/eyrihe999-stack/Synapse/internal/document/handler"
 	docrepo "github.com/eyrihe999-stack/Synapse/internal/document/repository"
 	docservice "github.com/eyrihe999-stack/Synapse/internal/document/service"
 	"github.com/eyrihe999-stack/Synapse/internal/ingestion"
+	codechunker "github.com/eyrihe999-stack/Synapse/internal/ingestion/chunker/code"
+	gocodebackend "github.com/eyrihe999-stack/Synapse/internal/ingestion/chunker/code/golang"
 	mdchunker "github.com/eyrihe999-stack/Synapse/internal/ingestion/chunker/markdown"
 	plainchunker "github.com/eyrihe999-stack/Synapse/internal/ingestion/chunker/plaintext"
 	docpersister "github.com/eyrihe999-stack/Synapse/internal/ingestion/persister/document"
@@ -87,7 +91,9 @@ import (
 	"github.com/eyrihe999-stack/Synapse/internal/transport"
 	transporthandler "github.com/eyrihe999-stack/Synapse/internal/transport/handler"
 	transportsvc "github.com/eyrihe999-stack/Synapse/internal/transport/service"
+	gitlabclient "github.com/eyrihe999-stack/Synapse/internal/integration/gitlab"
 	"github.com/eyrihe999-stack/Synapse/internal/user_integration"
+	uirepo "github.com/eyrihe999-stack/Synapse/internal/user_integration/repository"
 	"github.com/eyrihe999-stack/Synapse/internal/common/async"
 	"github.com/eyrihe999-stack/Synapse/internal/common/database"
 	"github.com/eyrihe999-stack/Synapse/internal/common/email"
@@ -276,9 +282,16 @@ func main() {
 		}
 		mdCk := mdchunker.New(0)
 		plainCk := plainchunker.New(0)
+		// code chunker:按 Language 路由到对应 backend(一期只 Go;其他语言走 plaintext 兜底)。
+		// 一个进程内 Chunker 实例线程安全(无状态);backend 也是。
+		codeCk := codechunker.New(0, gocodebackend.New())
 		selector := func(d *ingestion.NormalizedDoc) ingestion.Chunker {
 			if d.SourceType != ingestion.SourceTypeDocument {
 				return nil
+			}
+			// Language 非空(GitLab fetcher 按扩展名填)且 backend 已注册 → code chunker
+			if d.Language != "" && codeCk.Supports(d.Language) {
+				return codeCk
 			}
 			if isMarkdownDoc(d.MIMEType, d.FileName) {
 				return mdCk
@@ -309,6 +322,8 @@ func main() {
 	//     runners 列表依赖 pipeline —— pipeline 没装配成功(PG 缺失)时 runners 空起,
 	//     Schedule 会返 ErrUnknownKind,document handler 会给 500,语义可接受(向用户明示"PG 未配置")。
 	asyncJobRepo := asyncrepo.New(db)
+	userIntegrationRepo := uirepo.New(db)
+	sourceRepoForRunner := srcrepo.New(db) // gitlabsync runner 独立实例,避免循环依赖到 sourceSvc
 	var runners []asyncsvc.Runner
 	if pipeline != nil {
 		uploadRunner, err := docupload.New(pipeline, ossClient, appLogger)
@@ -316,6 +331,12 @@ func main() {
 			appLogger.Fatal("docupload runner init failed", err, nil)
 		}
 		runners = append(runners, uploadRunner)
+
+		gitlabRunner, err := gitlabsync.New(pipeline, sourceRepoForRunner, userIntegrationRepo, documentRepo, appLogger)
+		if err != nil {
+			appLogger.Fatal("gitlabsync runner init failed", err, nil)
+		}
+		runners = append(runners, gitlabRunner)
 	}
 	asyncJobSvc := asyncsvc.NewService(
 		asyncsvc.Config{CompletionStream: cfg.EventBus.AsyncJobStream},
@@ -421,6 +442,21 @@ func main() {
 	//   - permFilter:permJudgeSvc 实现 VisibleSourceFilter,给 ListSources(visible) 用
 	sourceSubjectVal := sourceSubjectValidator{permRepo: permRepo, isMember: orgService.IsMember}
 	sourceSvc := srcsvc.NewSourceService(sourceRepo, permRepo, &sourceSubjectVal, permJudgeSvc, appLogger)
+
+	// GitLab 集成依赖晚绑定:asyncJobSvc / userIntegrationRepo 已构造完成,这里把三件套接进去。
+	// gitlabFactory 用 closure 把 service.GitLabClient 接口绑到具体 client.New;装配测试时可注入 mock。
+	gitlabFactory := func(baseURL, pat string) srcsvc.GitLabClient {
+		return gitlabclient.New(baseURL, pat)
+	}
+	sourceSvc.SetGitLabDeps(userIntegrationRepo, gitlabSyncEnqueuer{svc: asyncJobSvc, log: appLogger}, gitlabFactory)
+	// PublicBaseURL 优先用 Server.PublicBaseURL,空则 fallback 到 OAuth.Issuer
+	// (本地 dev 接 Claude Desktop 已经给 OAuth 配过 ngrok URL,免重复)。
+	publicBaseURL := cfg.Server.PublicBaseURL
+	if publicBaseURL == "" {
+		publicBaseURL = cfg.OAuth.Issuer
+	}
+	sourceSvc.SetPublicBaseURL(publicBaseURL)
+	sourceSvc.SetAsyncJobLookup(asyncJobLookupAdapter{repo: asyncJobRepo})
 
 	// 10e. Channel(collaboration Phase 1 PR #2 + PR #4' 扩展:messages / kb_refs)
 	//
@@ -703,7 +739,7 @@ func main() {
 	userhandler.RegisterRoutes(r, userH, jwtManager, sessionStore, cfg.JWT.AbsoluteSessionTTL)
 	orghandler.RegisterRoutes(r, orgH, jwtManager, sessionStore, orgService, permCtxMW, requirePerm, appLogger)
 	permhandler.RegisterRoutes(r, permH, auditH, jwtManager, sessionStore, orgService, permCtxMW, requirePerm, appLogger)
-	srchandler.RegisterRoutes(r, sourceH, jwtManager, sessionStore, orgService, appLogger)
+	srchandler.RegisterRoutes(r, sourceH, jwtManager, sessionStore, orgService, permCtxMW, requirePerm, appLogger)
 	asynchandler.RegisterRoutes(r, asyncJobH, jwtManager, sessionStore)
 	if docH != nil {
 		dochandler.RegisterRoutes(r, docH, jwtManager, sessionStore, orgService, permJudgeSvc, appLogger)
@@ -934,6 +970,97 @@ func (a *sourceLookupAdapter) ListSourceIDsByOwner(ctx context.Context, orgID, o
 
 func (a *sourceLookupAdapter) ListSourceIDsByVisibility(ctx context.Context, orgID uint64, visibility string) ([]uint64, error) {
 	return a.repo.ListSourceIDsByVisibility(ctx, orgID, visibility)
+}
+
+// asyncJobLookupAdapter 把 asyncjob/repository.Repository 适配成 source.service.AsyncJobLookup。
+// model.Job 的字段 → service 关心的精简结构(防 model 包穿透到 source service 接口里)。
+type asyncJobLookupAdapter struct {
+	repo asyncrepo.Repository
+}
+
+func (a asyncJobLookupAdapter) FindLatestByKeyPrefix(ctx context.Context, orgID uint64, kind, keyPrefix string) (*srcsvc.AsyncJobInfo, error) {
+	job, err := a.repo.FindLatestByKeyPrefix(ctx, orgID, kind, keyPrefix)
+	if err != nil {
+		return nil, err
+	}
+	if job == nil {
+		return nil, nil
+	}
+	out := &srcsvc.AsyncJobInfo{
+		ID:             job.ID,
+		Kind:           job.Kind,
+		Status:         string(job.Status),
+		IdempotencyKey: job.IdempotencyKey,
+		Payload:        []byte(job.Payload),
+		ProgressDone:   job.ProgressDone,
+		ProgressTotal:  job.ProgressTotal,
+		ProgressFailed: job.ProgressFailed,
+		Error:          job.Error,
+	}
+	if job.StartedAt != nil {
+		out.StartedAt = job.StartedAt.Unix()
+	}
+	if job.FinishedAt != nil {
+		out.FinishedAt = job.FinishedAt.Unix()
+	}
+	if job.HeartbeatAt != nil {
+		out.HeartbeatAt = job.HeartbeatAt.Unix()
+	}
+	return out, nil
+}
+
+// gitlabSyncEnqueuer 把 asyncJobSvc.Schedule 适配成 source.service.GitLabSyncEnqueuer +
+// service.GitLabIncrementalEnqueuer 两个接口。
+//
+// 幂等键策略:
+//   - 全量:"gitlab:<source_id>:full"   — 同 source 并发全量复用
+//   - 增量:"gitlab:<source_id>:incr:<after_sha>" — 同 push 重发不重跑
+//
+// ErrDuplicateJob:已有 active 任务 → 视为成功,复用现有 jobID。
+type gitlabSyncEnqueuer struct {
+	svc *asyncsvc.Service
+	log logger.LoggerInterface
+}
+
+func (e gitlabSyncEnqueuer) EnqueueFullSync(ctx context.Context, orgID, userID, sourceID uint64) (uint64, error) {
+	return e.enqueue(ctx, asyncsvc.ScheduleInput{
+		OrgID:          orgID,
+		UserID:         userID,
+		Kind:           gitlabsync.Kind,
+		Payload:        gitlabsync.Input{SourceID: sourceID, Mode: gitlabsync.ModeFull},
+		IdempotencyKey: fmt.Sprintf("gitlab:%d:full", sourceID),
+	}, sourceID)
+}
+
+func (e gitlabSyncEnqueuer) EnqueueIncrementalSync(ctx context.Context, orgID, userID, sourceID uint64, beforeSHA, afterSHA string) (uint64, error) {
+	return e.enqueue(ctx, asyncsvc.ScheduleInput{
+		OrgID:  orgID,
+		UserID: userID,
+		Kind:   gitlabsync.Kind,
+		Payload: gitlabsync.Input{
+			SourceID:  sourceID,
+			Mode:      gitlabsync.ModeIncremental,
+			BeforeSHA: beforeSHA,
+			AfterSHA:  afterSHA,
+		},
+		IdempotencyKey: fmt.Sprintf("gitlab:%d:incr:%s", sourceID, afterSHA),
+	}, sourceID)
+}
+
+// enqueue 共用的"调 Schedule + ErrDuplicateJob 翻译"。
+func (e gitlabSyncEnqueuer) enqueue(ctx context.Context, in asyncsvc.ScheduleInput, sourceID uint64) (uint64, error) {
+	job, err := e.svc.Schedule(ctx, in)
+	if err != nil {
+		if errors.Is(err, asyncjob.ErrDuplicateJob) && job != nil {
+			e.log.InfoCtx(ctx, "gitlabsync: reusing existing active job", map[string]any{
+				"source_id": sourceID, "job_id": job.ID, "kind": in.Kind,
+				"idempotency_key": in.IdempotencyKey,
+			})
+			return job.ID, nil
+		}
+		return 0, err
+	}
+	return job.ID, nil
 }
 
 // ─── OAuth adapters ──────────────────────────────────────────────────────────

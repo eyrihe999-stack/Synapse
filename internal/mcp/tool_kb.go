@@ -54,6 +54,8 @@ func (s *Server) registerKBTools() {
 		mcp.WithDescription("Semantic search across the channel's visible KB chunks. "+
 			"Returns top-K chunks ranked by cosine similarity to `query`. "+
 			"Each hit includes the chunk text, heading_path, the owning doc_id/title, and a 'distance' score (0 = identical, 2 = opposite). "+
+			"For code chunks (synced from GitLab) hits additionally carry symbol_name / signature / language / line_start / line_end / url so you can cite "+
+			"like `repo/path:120-145` and follow the URL straight to the GitLab blob. "+
 			"Use `get_kb_document` to fetch the full document after locating relevant chunks. "+
 			"Caller must be a channel member; channels with no KB attached return an empty result."),
 		mcp.WithNumber("channel_id", mcp.Required(), mcp.Description("Channel id used for permission scoping.")),
@@ -146,16 +148,40 @@ func (s *Server) handleSearchKB(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 	out := make([]map[string]any, 0, len(hits))
 	for _, h := range hits {
-		out = append(out, map[string]any{
-			"doc_id":       h.DocID,
-			"doc_title":    h.DocTitle,
+		item := map[string]any{
+			"doc_id":        h.DocID,
+			"doc_title":     h.DocTitle,
 			"doc_file_name": h.DocFileName,
-			"mime_type":    h.DocMIMEType,
-			"chunk_idx":    h.ChunkIdx,
-			"content":      h.Content,
-			"heading_path": h.HeadingPath,
-			"distance":     h.Distance,
-		})
+			"mime_type":     h.DocMIMEType,
+			"chunk_idx":     h.ChunkIdx,
+			"content":       h.Content,
+			"heading_path":  h.HeadingPath,
+			"distance":      h.Distance,
+		}
+		// 回源链(任何 source 类型都可能有 — GitLab 同步给 git blob URL,upload 给 OSS 预签等)
+		if h.ExternalRefURI != "" {
+			item["url"] = h.ExternalRefURI
+		}
+		if h.ExternalRefKind != "" {
+			item["source_kind"] = h.ExternalRefKind
+		}
+		// 代码 chunk 专属字段(非代码 chunk 这几个都是零值,omit 不影响 LLM)
+		if h.SymbolName != "" {
+			item["symbol_name"] = h.SymbolName
+		}
+		if h.Signature != "" {
+			item["signature"] = h.Signature
+		}
+		if h.Language != "" {
+			item["language"] = h.Language
+		}
+		if h.LineStart > 0 {
+			item["line_start"] = h.LineStart
+		}
+		if h.LineEnd > 0 {
+			item["line_end"] = h.LineEnd
+		}
+		out = append(out, item)
 	}
 	return jsonResult(out)
 }

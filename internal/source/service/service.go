@@ -7,6 +7,7 @@ import (
 	permmodel "github.com/eyrihe999-stack/Synapse/internal/permission/model"
 	"github.com/eyrihe999-stack/Synapse/internal/source/dto"
 	"github.com/eyrihe999-stack/Synapse/internal/source/model"
+	uimodel "github.com/eyrihe999-stack/Synapse/internal/user_integration/model"
 )
 
 // ─── 跨模块依赖接口 ───────────────────────────────────────────────────────────
@@ -47,6 +48,49 @@ type VisibleSourceFilter interface {
 	VisibleSourceIDsInOrg(ctx context.Context, orgID, userID uint64, minPerm string) ([]uint64, error)
 }
 
+// GitLabSyncEnqueuer 触发一次 gitlab_repo 全量同步任务。装配侧由 cmd/synapse 用
+// asyncjob.Service.Schedule 适配注入 —— source.service 不直接 import asyncjob/service
+// 是为了避免后续往 asyncjob 加 ingestion 依赖(已经依赖 document/PG)时把 source 层一并污染。
+//
+// 实现方约定:
+//   - 内部用 idempotencyKey = "gitlab:<source_id>:full" 防止重复 enqueue 全量任务
+//   - 已有 active 全量 job → 复用现有 jobID(不视为错)
+type GitLabSyncEnqueuer interface {
+	EnqueueFullSync(ctx context.Context, orgID, userID, sourceID uint64) (jobID uint64, err error)
+}
+
+// UserIntegrationStore source.service 需要的 user_integration 子集。
+// 装配侧用 user_integration/repository.Repository 适配注入(签名一致直接传)。
+type UserIntegrationStore interface {
+	Upsert(ctx context.Context, ui *uimodel.UserIntegration) error
+	GetByUserProvider(ctx context.Context, userID uint64, provider, externalAccountID string) (*uimodel.UserIntegration, error)
+}
+
+// AsyncJobLookup source.service 查 GitLab sync 任务状态用的 asyncjob 子集。
+//
+// 装配侧用 asyncjob/repository.Repository 适配注入。声明本接口而不是直接 import
+// asyncjob 包,是为了避免 source ↔ asyncjob 之间的循环依赖隐患。
+type AsyncJobLookup interface {
+	FindLatestByKeyPrefix(ctx context.Context, orgID uint64, kind, keyPrefix string) (*AsyncJobInfo, error)
+}
+
+// AsyncJobInfo source.service 关心的 async_jobs 行子集。装配侧 adapter 把
+// asyncjob model 翻译成本结构,避免 service 直接依赖 asyncjob model。
+type AsyncJobInfo struct {
+	ID             uint64
+	Kind           string
+	Status         string // 直接用 asyncjob model.Status 的字符串值
+	IdempotencyKey string
+	Payload        []byte
+	ProgressDone   int
+	ProgressTotal  int
+	ProgressFailed int
+	Error          string
+	StartedAt      int64 // unix seconds;0 = 未开始
+	FinishedAt     int64
+	HeartbeatAt    int64
+}
+
 // ListScope 列表请求的可见范围。
 //   - visible(默认):只列 user 能读的 source(owner / org-vis / ACL hit)
 //   - all:           列出 org 下所有 source(管理员 / 审计场景用)
@@ -68,8 +112,11 @@ func ParseListScope(s string) ListScope {
 // ─── model → dto 转换 ────────────────────────────────────────────────────────
 
 // sourceToDTO 把 Source 模型转为 SourceResponse。
+//
+// GitLab 专属字段(gitlab_branch / last_sync_*)只对 KindGitLabRepo 有意义,但这里统一拷贝
+// —— 其他 kind 的零值会因 omitempty 不出现在 JSON 里。
 func sourceToDTO(s *model.Source) dto.SourceResponse {
-	return dto.SourceResponse{
+	resp := dto.SourceResponse{
 		ID:          s.ID,
 		OrgID:       s.OrgID,
 		Kind:        s.Kind,
@@ -80,6 +127,16 @@ func sourceToDTO(s *model.Source) dto.SourceResponse {
 		CreatedAt:   s.CreatedAt.Unix(),
 		UpdatedAt:   s.UpdatedAt.Unix(),
 	}
+	if s.Kind == model.KindGitLabRepo {
+		resp.GitLabBranch = s.GitLabBranch
+		resp.LastSyncStatus = s.LastSyncStatus
+		resp.LastSyncedCommit = s.LastSyncedCommit
+		resp.LastSyncError = s.LastSyncError
+		if s.LastSyncedAt != nil {
+			resp.LastSyncedAt = s.LastSyncedAt.Unix()
+		}
+	}
+	return resp
 }
 
 // aclToDTO 把 ResourceACL 转为 SourceACLResponse(source 视角的 ACL 行展示)。

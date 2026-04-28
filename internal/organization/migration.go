@@ -63,6 +63,15 @@ func RunMigrations(ctx context.Context, db *gorm.DB, log logger.LoggerInterface,
 		log.InfoCtx(ctx, "为老 owner/admin 补充 audit.read_all", map[string]any{"rows_updated": affected})
 	}
 
+	// integration.gitlab.manage:仅 owner —— 同步源会消费 owner 自己的凭据,且写入量级 / IO 影响远超
+	// 普通成员的 manual_upload。admin 默认不放,避免"管理员不知情下挂起 owner 凭据持续拉数据"的语义陷阱。
+	if affected, err := ensureSystemRolePerm(ctx, db, []string{SystemRoleSlugOwner}, permission.PermIntegrationGitLabManage); err != nil {
+		log.ErrorCtx(ctx, "ensure integration.gitlab.manage 失败", err, nil)
+		return fmt.Errorf("organization ensure integration.gitlab.manage: %w: %w", err, ErrOrgInternal)
+	} else if affected > 0 {
+		log.InfoCtx(ctx, "为老 owner 补充 integration.gitlab.manage", map[string]any{"rows_updated": affected})
+	}
+
 	affected, err := backfillMemberRoles(ctx, db)
 	if err != nil {
 		log.ErrorCtx(ctx, "组织模块 member.role_id 回填失败", err, nil)

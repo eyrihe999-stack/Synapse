@@ -51,6 +51,10 @@ type ListOptions struct {
 	//   - nil:不过滤(向后兼容/单测使用)
 	//   - 空 slice:返空结果(等于"该用户在该 org 看不到任何 source")
 	//   - 非空:WHERE knowledge_source_id IN (...)
+	//
+	// 注:按 source.kind 过滤(如"知识库文档页只展示 manual_upload")由 handler/service
+	// 层先调 source 模块拿到符合 kind 的 ID 集合,与可见集做交集后再传进来 ——
+	// documents 在 PG / sources 在 MySQL,跨库 subquery 不可行。
 	KnowledgeSourceIDs []uint64
 }
 

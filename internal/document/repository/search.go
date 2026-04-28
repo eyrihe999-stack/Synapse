@@ -18,9 +18,11 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/lib/pq"
+	"gorm.io/datatypes"
 
 	"github.com/eyrihe999-stack/Synapse/internal/document"
 )
@@ -30,6 +32,8 @@ import (
 // 字段语义:
 //   - Chunk* 来自 document_chunks
 //   - Doc* 来自 documents JOIN(给 LLM 显示用,不让调用方再回 docrepo 拼)
+//   - ExternalRef* / Metadata 给代码场景用 —— 让 LLM 拿到回源链(repo + commit + path)
+//     和符号信息(symbol_name / signature / line_start / line_end / language)而不必再绕一圈
 type ChunkSearchHit struct {
 	ChunkID     uint64
 	DocID       uint64
@@ -43,21 +47,36 @@ type ChunkSearchHit struct {
 	DocFileName string
 	DocMIMEType string
 	DocSourceID uint64 // knowledge_source_id
+
+	// ExternalRefKind / URI 来自 documents.external_ref_*。
+	// kind 取值:"git" / "upload" / "url" / ...;url 是 GitLab blob 链接 / OSS 预签 url 等。
+	ExternalRefKind string
+	ExternalRefURI  string
+
+	// Metadata 来自 chunks.metadata jsonb。代码切片场景下含
+	// symbol_name / signature / language / line_start / line_end 等键。
+	// nil 表示该 chunk 无 metadata(老数据 / 非代码 chunk 都常见)。
+	Metadata map[string]any
 }
 
 // chunkSearchRow GORM Scan 用的扁平行结构,仅在本文件可见。
 type chunkSearchRow struct {
-	ChunkID     uint64         `gorm:"column:chunk_id"`
-	DocID       uint64         `gorm:"column:doc_id"`
-	OrgID       uint64         `gorm:"column:org_id"`
-	ChunkIdx    int            `gorm:"column:chunk_idx"`
-	Content     string         `gorm:"column:content"`
-	HeadingPath pq.StringArray `gorm:"column:heading_path"`
-	Distance    float32        `gorm:"column:distance"`
-	DocTitle    string         `gorm:"column:doc_title"`
-	DocFileName string         `gorm:"column:doc_file_name"`
-	DocMIMEType string         `gorm:"column:doc_mime_type"`
-	DocSourceID uint64         `gorm:"column:doc_source_id"`
+	ChunkID         uint64         `gorm:"column:chunk_id"`
+	DocID           uint64         `gorm:"column:doc_id"`
+	OrgID           uint64         `gorm:"column:org_id"`
+	ChunkIdx        int            `gorm:"column:chunk_idx"`
+	Content         string         `gorm:"column:content"`
+	HeadingPath     pq.StringArray `gorm:"column:heading_path"`
+	Distance        float32        `gorm:"column:distance"`
+	DocTitle        string         `gorm:"column:doc_title"`
+	DocFileName     string         `gorm:"column:doc_file_name"`
+	DocMIMEType     string         `gorm:"column:doc_mime_type"`
+	DocSourceID     uint64         `gorm:"column:doc_source_id"`
+	ExternalRefKind string         `gorm:"column:external_ref_kind"`
+	ExternalRefURI  string         `gorm:"column:external_ref_uri"`
+	// Metadata jsonb 列。GORM Raw + Scan 走 datatypes.JSON 比直接 []byte 稳:
+	// 后者在某些 driver 下会得空 []byte 而非 NULL,zero-len 时我们当 nil 处理。
+	Metadata datatypes.JSON `gorm:"column:metadata"`
 }
 
 // SearchByEmbedding 见 Repository 接口注释。
@@ -89,7 +108,7 @@ func (r *gormRepository) SearchByEmbedding(
 
 	sql := fmt.Sprintf(`
 WITH candidates AS (
-    SELECT id, doc_id, org_id, chunk_idx, content, heading_path,
+    SELECT id, doc_id, org_id, chunk_idx, content, heading_path, metadata,
            embedding <=> '%s'::vector AS distance
     FROM %s
     WHERE org_id = ?
@@ -103,11 +122,14 @@ SELECT c.id           AS chunk_id,
        c.chunk_idx    AS chunk_idx,
        c.content      AS content,
        c.heading_path AS heading_path,
+       c.metadata     AS metadata,
        c.distance     AS distance,
        d.title              AS doc_title,
        d.file_name          AS doc_file_name,
        d.mime_type          AS doc_mime_type,
-       d.knowledge_source_id AS doc_source_id
+       d.knowledge_source_id AS doc_source_id,
+       d.external_ref_kind  AS external_ref_kind,
+       d.external_ref_uri   AS external_ref_uri
 FROM candidates c
 JOIN %s d ON d.id = c.doc_id
 WHERE d.knowledge_source_id = ANY(?) OR d.id = ANY(?)
@@ -135,20 +157,38 @@ LIMIT ?
 			hp = []string{}
 		}
 		hits = append(hits, ChunkSearchHit{
-			ChunkID:     r.ChunkID,
-			DocID:       r.DocID,
-			OrgID:       r.OrgID,
-			ChunkIdx:    r.ChunkIdx,
-			Content:     r.Content,
-			HeadingPath: hp,
-			Distance:    r.Distance,
-			DocTitle:    r.DocTitle,
-			DocFileName: r.DocFileName,
-			DocMIMEType: r.DocMIMEType,
-			DocSourceID: r.DocSourceID,
+			ChunkID:         r.ChunkID,
+			DocID:           r.DocID,
+			OrgID:           r.OrgID,
+			ChunkIdx:        r.ChunkIdx,
+			Content:         r.Content,
+			HeadingPath:     hp,
+			Distance:        r.Distance,
+			DocTitle:        r.DocTitle,
+			DocFileName:     r.DocFileName,
+			DocMIMEType:     r.DocMIMEType,
+			DocSourceID:     r.DocSourceID,
+			ExternalRefKind: r.ExternalRefKind,
+			ExternalRefURI:  r.ExternalRefURI,
+			Metadata:        unmarshalMetadata(r.Metadata),
 		})
 	}
 	return hits, nil
+}
+
+// unmarshalMetadata jsonb → map[string]any。空 / 非法 → nil(让上层走"无 metadata"分支)。
+func unmarshalMetadata(raw datatypes.JSON) map[string]any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 // uint64SliceToInt64 pq.Array 不直接支持 []uint64,显式转换。

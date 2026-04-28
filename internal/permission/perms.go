@@ -28,6 +28,13 @@ const (
 	PermSourceCreate    = "source.create"     // 创建 source(M2 只 lazy 创建,占位常量)
 	PermSourceDeleteAny = "source.delete_any" // 删除别人的 source(M5+)
 
+	// ─── 集成 ───
+	// PermIntegrationGitLabManage 配置 / 删除 / 重新同步 gitlab_repo 源。
+	// 默认只 owner 拿到(seed 在 organization migration 里 ensure);owner 想委派可走 role.manage_system 改 custom role。
+	// 选独立常量而非复用 source.create:GitLab 同步源会消费 owner 自己的 PAT/OAuth 凭据,
+	// 且写入位置(repos / chunks)对集群 IO 影响远超 manual_upload,语义上是"基础设施级配置"。
+	PermIntegrationGitLabManage = "integration.gitlab.manage"
+
 	// ─── 权限组 ───
 	PermGroupCreate    = "group.create"     // 创建权限组
 	PermGroupDeleteAny = "group.delete_any" // 删除别人建的组(M5+)
@@ -47,6 +54,7 @@ func AllPermissions() []string {
 		PermSourceCreate, PermSourceDeleteAny,
 		PermGroupCreate, PermGroupDeleteAny,
 		PermAuditReadAll,
+		PermIntegrationGitLabManage,
 	}
 }
 

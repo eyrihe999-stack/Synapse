@@ -24,4 +24,13 @@ const (
 	MaxPageSize = 100
 	// MaxSourceNameLength source.name 字节上限(对齐 Source.Name gorm 声明 size:128)
 	MaxSourceNameLength = 128
+
+	// DefaultGitLabBranch 创建 gitlab_repo source 时未指定 branch 的默认值。
+	// "main" 而非 "master":新 GitLab 14+ 默认即 main;老 repo 用户必须显式指定。
+	DefaultGitLabBranch = "main"
+
+	// MaxGitLabFileBytes 单文件硬上限。超过即 skip(写日志,不入 chunks)。
+	// 5MB:覆盖绝大多数源码 / 配置 / 文档;再大基本是数据 / 二进制 / 生成产物,
+	// 进向量库价值低,且 embed 单条 input 8KB 上限会被反复触发。
+	MaxGitLabFileBytes = 5 * 1024 * 1024
 )

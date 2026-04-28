@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/eyrihe999-stack/Synapse/internal/common/logger"
+	"github.com/eyrihe999-stack/Synapse/internal/integration/gitlab"
 	"github.com/eyrihe999-stack/Synapse/internal/permission"
 	permmodel "github.com/eyrihe999-stack/Synapse/internal/permission/model"
 	"github.com/eyrihe999-stack/Synapse/internal/source"
@@ -69,6 +70,13 @@ type SourceService interface {
 	// ListMySources 列出某 user 在某 org 中作为 owner 的所有 source(不分页)。
 	ListMySources(ctx context.Context, orgID, userID uint64) ([]dto.SourceResponse, error)
 
+	// FilterIDsByKinds 在 ids 集合里按 kind 白名单过滤,只返 ID。
+	// 跨库场景的"中间件":document handler 已经算好可见 source ID 集,要再按 source.kind
+	// 限定(如知识库文档页只展示 manual_upload),documents 在 PG / sources 在 MySQL
+	// 跨库 subquery 不可行 → 走这里求交集再传回 documents repo。
+	// kinds 空 → 不过滤(返回 ids 副本);ids 空 → 短路返空。
+	FilterIDsByKinds(ctx context.Context, orgID uint64, ids []uint64, kinds []string) ([]uint64, error)
+
 	// UpdateVisibility 改 source 的 visibility。仅 source owner 可调用。
 	//
 	// 可能的错误:
@@ -92,6 +100,17 @@ type SourceService interface {
 	// source service,因此走 setter;未设置 → DeleteSource 视作"该 source 下没有 doc"放行。
 	SetDocumentCounter(dc DocumentCounter)
 
+	// SetGitLabDeps 晚绑定注入 GitLab 集成所需的依赖。任一为 nil → GitLab 三方法返 ErrSourceInternal。
+	// 装配顺序:asyncjob.Service / user_integration repo 装好后调一次。
+	SetGitLabDeps(uiStore UserIntegrationStore, enqueuer GitLabSyncEnqueuer, factory GitLabClientFactory)
+
+	// SetPublicBaseURL 服务对外可达根 URL(无尾 "/"),用于在 CreateGitLabSource 响应里拼完整
+	// webhook URL。空串允许 — 前端会 fallback 到 window.location.origin 并显示警告。
+	SetPublicBaseURL(baseURL string)
+
+	// SetAsyncJobLookup 注入 asyncjob 查询能力。GetGitLabSyncStatus 走它。
+	SetAsyncJobLookup(j AsyncJobLookup)
+
 	// ─── ACL 管理(M3) ─────────────────────────────────────────────────────
 
 	// GrantSourceACL 给某 source 加一条 ACL(group/user → read/write)。仅 source owner 可。
@@ -112,6 +131,66 @@ type SourceService interface {
 
 	// RevokeSourceACL 删某条 ACL 行。仅 source owner 可。
 	RevokeSourceACL(ctx context.Context, orgID, sourceID, aclID, callerUserID uint64) error
+
+	// ─── GitLab 同步源(integration.gitlab.manage perm) ──────────────────────
+
+	// CreateGitLabSource 创建一条 kind=gitlab_repo 的同步源,callerUserID 自动成为 owner。
+	//
+	// 流程:
+	//   1. 校验 visibility / branch / project_id 取值
+	//   2. 调 GitLab `/api/v4/user` 验 PAT 有效 → 拿到 GitLab user id 作 external_account_id
+	//   3. upsert user_integrations(provider="gitlab",external_account_id=GitLab user id,access_token=PAT)
+	//   4. 调 GitLab `/api/v4/projects/<project_id>` 校验 owner 凭据可读该 project + 取 path_with_namespace
+	//   5. 生成 webhook secret 明文 + SHA-256 hash
+	//   6. CreateSource(kind=gitlab_repo, external_ref=project_id, name=path_with_namespace, gitlab_*)
+	//   7. EnqueueFullSync(orgID, callerUserID, sourceID) → 拿 job_id
+	//
+	// 响应 webhook secret 明文**只在创建时返一次**;DB 存 hash。
+	//
+	// 可能的错误:
+	//   - ErrSourceInvalidVisibility / ErrSourceInvalidRequest(branch / project_id 校验)
+	//   - ErrSourceGitLabAuthFailed:PAT 401
+	//   - ErrSourceGitLabRepoNotFound:GitLab 凭据看不到该 project
+	//   - ErrSourceGitLabUpstream:GitLab 5xx / 网络
+	//   - ErrSourceNameExists:owner 同 path_with_namespace 已建过同 source
+	//   - ErrSourceInternal
+	CreateGitLabSource(ctx context.Context, orgID, callerUserID uint64, req dto.CreateGitLabSourceRequest) (*dto.CreateGitLabSourceResponse, error)
+
+	// DeleteGitLabSource 删除 gitlab_repo source。注意:perm gate 已在 router 层 RequirePerm 拦住;
+	// 本方法不再做"必须是 owner"硬规则(perm 拥有者即可调,默认只 owner 拿到 perm)。
+	//
+	// 前置守卫:source 下没有 doc 才能删 — 同 manual_upload 走 docCounter。
+	// 删除会顺带清 ACL 行(走现有 DeleteSource 路径)。
+	DeleteGitLabSource(ctx context.Context, orgID, sourceID, callerUserID uint64) error
+
+	// TriggerGitLabResync 重新触发该 source 的全量同步。同 EnqueueFullSync 幂等(同 source 已 active 任务复用)。
+	//
+	// 可能的错误:
+	//   - ErrSourceNotFound:source 不存在 / 不属于该 org / 不是 gitlab_repo
+	//   - ErrSourceInternal:enqueue 失败
+	TriggerGitLabResync(ctx context.Context, orgID, sourceID, callerUserID uint64) (*dto.TriggerResyncResponse, error)
+
+	// GetGitLabSyncStatus 查指定 source 当前 / 最近一次 GitLab sync 任务的状态。
+	// 前端轮询此端点展示进度。从未同步过 → 返 status="never" + 其他字段零值。
+	GetGitLabSyncStatus(ctx context.Context, orgID, sourceID, callerUserID uint64) (*dto.GitLabSyncStatusResponse, error)
+
+	// HandleGitLabWebhook 处理 GitLab webhook 推送。**不**鉴权 user(GitLab 不会发 user token);
+	// 只验签:sha256(headerToken) == source.gitlab_webhook_secret_hash。
+	//
+	// 行为:
+	//   1. 反查 source(sourceID 不存在 → ErrSourceNotFound;非 gitlab_repo → ErrSourceNotFound,
+	//      避免侧信道泄露 source kind)
+	//   2. 校验 X-Gitlab-Token header 的 sha256 hash(常量时间比较)
+	//   3. 解析 payload(只信 ref / before / after / project.id 几个字段)
+	//   4. 仅当 ref 等于 source.gitlab_branch 时入队 incremental sync(其他分支静默 ack)
+	//   5. project.id 必须等于 source.external_ref(防伪)
+	//   6. enqueue 用 IdempotencyKey "gitlab:<source_id>:incr:<after_sha>" — 同一 push 重发不重跑
+	//
+	// 返 (jobID, accepted, err):
+	//   - accepted=true 表示已入队(jobID 是新或复用的 job id)
+	//   - accepted=false + err==nil 表示静默 ack(分支不匹配 / push 删除分支等无操作场景)
+	//   - err != nil:验签失败 / payload 非法 / DB 错
+	HandleGitLabWebhook(ctx context.Context, sourceID uint64, headerToken string, eventBody []byte) (jobID uint64, accepted bool, err error)
 }
 
 // ─── 实现 ────────────────────────────────────────────────────────────────────
@@ -122,7 +201,25 @@ type sourceService struct {
 	subjectVal SubjectValidator    // M3 ACL 授权目标合法性校验
 	permFilter VisibleSourceFilter // ListSources(scope=visible) 用;nil 时降级为 all
 	docCounter DocumentCounter     // DeleteSource 前置守卫;nil → 视作 0 条 doc
+	uiStore    UserIntegrationStore // GitLab 集成(CreateGitLabSource 用);nil → GitLab 端点不可用
+	enqueuer   GitLabSyncEnqueuer  // GitLab 同步任务入队(CreateGitLabSource / Resync 用);nil 同上
+	gitLabFactory GitLabClientFactory // 构造 GitLab REST 客户端;nil → GitLab 端点不可用
+	jobLookup  AsyncJobLookup       // 查 GitLab sync 任务状态;nil → GetGitLabSyncStatus 不可用
+	publicBaseURL string             // 服务对外根 URL(无尾 /),用于拼 webhook URL;空 → 前端 fallback
 	logger     logger.LoggerInterface
+}
+
+// GitLabClientFactory 给 service 层"按 (baseURL, PAT) 拿 GitLab 客户端"的能力。
+// 装配层用 internal/integration/gitlab.New 直接绑;抽 factory 是为了 service 测试时注入 fake。
+type GitLabClientFactory func(baseURL, pat string) GitLabClient
+
+// GitLabClient service 层用到的 GitLab 客户端方法子集。
+//
+// 实际实现 internal/integration/gitlab.Client 是其超集;声明本接口的目的是允许
+// CreateGitLabSource 单测时注入 mock,而不必启 HTTP server。
+type GitLabClient interface {
+	VerifyToken(ctx context.Context) (*gitlab.User, error)
+	GetProject(ctx context.Context, projectID string) (*gitlab.Project, error)
 }
 
 // NewSourceService 构造一个 SourceService 实例。
@@ -131,6 +228,9 @@ type sourceService struct {
 // 可传 nil,但调用 ACL 方法会返 ErrSourceInternal。
 //
 // permFilter 给 visible-scope 列表过滤用;nil 时 visible 自动降级为 all。
+//
+// GitLab 相关依赖(uiStore / enqueuer / gitLabFactory)走 setter 晚绑定,装配顺序:
+// asyncjob.Service / user_integration repo 装好后再调 SetGitLabDeps —— 避免本构造签名继续膨胀。
 func NewSourceService(
 	repo repository.Repository,
 	aclOps ACLOps,
@@ -139,6 +239,24 @@ func NewSourceService(
 	log logger.LoggerInterface,
 ) SourceService {
 	return &sourceService{repo: repo, aclOps: aclOps, subjectVal: subjectVal, permFilter: permFilter, logger: log}
+}
+
+// SetGitLabDeps 装配期注入 GitLab 集成依赖。任何一个为 nil 都会让 GitLab 三方法返 ErrSourceInternal。
+// 调用方在 main.go 装配完 asyncjob.Service / user_integration repo 后调一次。
+func (s *sourceService) SetGitLabDeps(uiStore UserIntegrationStore, enqueuer GitLabSyncEnqueuer, factory GitLabClientFactory) {
+	s.uiStore = uiStore
+	s.enqueuer = enqueuer
+	s.gitLabFactory = factory
+}
+
+// SetPublicBaseURL 装配期注入服务对外根 URL(无尾 "/")。空串允许 — 前端 fallback。
+func (s *sourceService) SetPublicBaseURL(baseURL string) {
+	s.publicBaseURL = strings.TrimRight(baseURL, "/")
+}
+
+// SetAsyncJobLookup 装配期注入 asyncjob 查询能力。
+func (s *sourceService) SetAsyncJobLookup(j AsyncJobLookup) {
+	s.jobLookup = j
 }
 
 // CreateCustomSource 见接口注释。
@@ -263,6 +381,18 @@ func (s *sourceService) ListMySources(ctx context.Context, orgID, userID uint64)
 	out := make([]dto.SourceResponse, 0, len(items))
 	for _, sr := range items {
 		out = append(out, sourceToDTO(sr))
+	}
+	return out, nil
+}
+
+// FilterIDsByKinds 见接口注释。
+func (s *sourceService) FilterIDsByKinds(ctx context.Context, orgID uint64, ids []uint64, kinds []string) ([]uint64, error) {
+	out, err := s.repo.ListSourceIDsByKindsInIDs(ctx, orgID, kinds, ids)
+	if err != nil {
+		s.logger.ErrorCtx(ctx, "filter source ids by kinds 失败", err, map[string]any{
+			"org_id": orgID, "kinds": kinds, "ids_len": len(ids),
+		})
+		return nil, fmt.Errorf("filter ids by kinds: %w: %w", err, source.ErrSourceInternal)
 	}
 	return out, nil
 }

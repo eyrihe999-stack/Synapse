@@ -389,13 +389,16 @@ type DocumentDTO struct {
 
 // List 列出当前 org 下的文档。
 //
-// 路由 GET /api/v2/orgs/:slug/documents?provider=&before_id=&limit=&doc_id=&source_id=&q=
+// 路由 GET /api/v2/orgs/:slug/documents?provider=&before_id=&limit=&doc_id=&source_id=&q=&source_kind=
 // 按 id DESC + keyset 分页;next_cursor 非零时前端可带回继续翻页。
 //
 // 搜索支持三种互斥模式(前端切换):
 //   - q=:       LOWER(title/file_name) LIKE 模糊匹配
 //   - doc_id=:  按 doc.id 精确匹配(仍受 visible source 约束)
 //   - source_id=: 按 doc.knowledge_source_id 精确匹配;source 不在可见集 → 返空
+//
+// source_kind 多值用逗号分隔(如 ?source_kind=manual_upload,custom),空 = 不过滤。
+// 知识库文档页传 manual_upload,把 GitLab 同步进来的代码文件排除。
 //
 // M3:列表只返该 user 在该 org 内 read 权限可见的文档。
 // 通过 permSvc.VisibleSourceIDsInOrg 拿到可见 source_id 集合,作为 IN 过滤项传 repo。
@@ -421,10 +424,37 @@ func (h *Handler) List(c *gin.Context) {
 		return
 	}
 
+	// source_kind 白名单过滤:与可见集求交集后再传给 documents repo。
+	// documents 在 PG / sources 在 MySQL,跨库 subquery 不可行,只能上提到 handler 做。
+	var sourceKinds []string
+	if raw := strings.TrimSpace(c.Query("source_kind")); raw != "" {
+		for k := range strings.SplitSeq(raw, ",") {
+			if k = strings.TrimSpace(k); k != "" {
+				sourceKinds = append(sourceKinds, k)
+			}
+		}
+	}
+	knowledgeSourceIDs := visibleSourceIDs
+	if len(sourceKinds) > 0 {
+		filtered, err := h.sourceSvc.FilterIDsByKinds(c.Request.Context(), org.ID, visibleSourceIDs, sourceKinds)
+		if err != nil {
+			h.log.ErrorCtx(c.Request.Context(), "filter source ids by kinds failed", err, map[string]any{
+				"org_id": org.ID, "user_id": userID, "kinds": sourceKinds,
+			})
+			response.InternalServerError(c, "filter source kinds failed", err.Error())
+			return
+		}
+		// 过滤后即使为空也要传非 nil slice,触发 repo 短路返空(语义:该 user 在此 kind 下没源)
+		if filtered == nil {
+			filtered = []uint64{}
+		}
+		knowledgeSourceIDs = filtered
+	}
+
 	opts := docrepo.ListOptions{
 		Provider:           c.Query("provider"),
 		Query:              c.Query("q"),
-		KnowledgeSourceIDs: visibleSourceIDs, // 空 slice 也传 → repo 走短路返空
+		KnowledgeSourceIDs: knowledgeSourceIDs, // 空 slice 也传 → repo 走短路返空
 	}
 	if raw := c.Query("limit"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil {

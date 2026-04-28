@@ -46,6 +46,20 @@ func (h *SourceHandler) handleServiceError(c *gin.Context, err error) {
 		h.logger.WarnCtx(ctx, "source 不存在", fields)
 		c.JSON(http.StatusOK, response.BaseResponse{Code: source.CodeSourceNotFound, Message: "Source not found"})
 
+	// ─── GitLab 集成错误 ──────────────────────────────────────────────────
+	case errors.Is(err, source.ErrSourceGitLabIntegrationMissing):
+		h.logger.WarnCtx(ctx, "GitLab 凭据不存在", fields)
+		c.JSON(http.StatusOK, response.BaseResponse{Code: source.CodeSourceGitLabIntegrationMissing, Message: "GitLab integration not found for this user"})
+	case errors.Is(err, source.ErrSourceGitLabRepoNotFound):
+		h.logger.WarnCtx(ctx, "GitLab 凭据看不到该 project", fields)
+		c.JSON(http.StatusOK, response.BaseResponse{Code: source.CodeSourceGitLabRepoNotFound, Message: "GitLab repository not found or your token cannot access it"})
+	case errors.Is(err, source.ErrSourceGitLabAuthFailed):
+		h.logger.WarnCtx(ctx, "GitLab PAT 失效", fields)
+		c.JSON(http.StatusOK, response.BaseResponse{Code: source.CodeSourceGitLabAuthFailed, Message: "GitLab token rejected (401). Please reissue and retry."})
+	case errors.Is(err, source.ErrSourceGitLabUpstream):
+		h.logger.WarnCtx(ctx, "GitLab 上游错误", fields)
+		c.JSON(http.StatusOK, response.BaseResponse{Code: source.CodeSourceGitLabUpstream, Message: "GitLab upstream error; please retry"})
+
 	// ─── ACL 相关错误(从 permission 模块透传) ─────
 
 	case errors.Is(err, permission.ErrACLInvalidSubjectType):
